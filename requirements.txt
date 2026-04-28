@@ -1,0 +1,10 @@
+git+https://github.com/cleitonleonel/pyquotex.git
+git+https://github.com/A11ksa/API-Quotex.git
+python-dotenv>=1.0.1
+pandas>=2.2.2
+loguru>=0.7.3
+cloudscraper>=1.2.71
+beautifulsoup4>=4.13.5
+lxml>=6.0.2
+setuptools<81
+websockets<14

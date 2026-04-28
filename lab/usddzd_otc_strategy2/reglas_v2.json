@@ -1,0 +1,56 @@
+{
+  "strategy_name": "S2_SUPPORT_BURST_1M",
+  "asset": "USDDZD_otc",
+  "timeframes": {
+    "structure": "5m",
+    "trigger": "1m",
+    "lookback_5m": 50,
+    "lookback_1m": 30
+  },
+  "support_zone": {
+    "cluster_quantile_low": 0.2,
+    "min_touches": 3,
+    "min_bars_between_touches": 2,
+    "zone_width_mode": "max_pct_or_atr",
+    "zone_width_pct": 0.0008,
+    "zone_width_atr_factor": 0.35,
+    "atr_period_5m": 14
+  },
+  "trigger_1m": {
+    "require_sweep": true,
+    "floor_tolerance_pct": 0.00025,
+    "require_reclaim_close": true,
+    "impulse_body_ratio_min": 1.4,
+    "impulse_body_lookback": 10,
+    "break_local_high_optional": true,
+    "max_bars_after_sweep": 3
+  },
+  "filters": {
+    "min_payout": 80,
+    "block_if_two_5m_closes_below_support": true,
+    "block_if_against_expansion_5m": true
+  },
+  "scoring": {
+    "structure_max": 40,
+    "event_max": 40,
+    "risk_max": 20,
+    "threshold": 68
+  },
+  "execution": {
+    "direction": "call",
+    "duration_sec": 300,
+    "max_concurrent_trades": 1,
+    "if_trade_active": "watch_and_revalidate"
+  },
+  "logging_fields": [
+    "strategy_name",
+    "strategy_family",
+    "s2_state",
+    "s2_score",
+    "s2_support_floor",
+    "s2_support_ceiling",
+    "s2_touch_count_5m",
+    "s2_sweep_detected",
+    "s2_impulse_ratio_1m"
+  ]
+}

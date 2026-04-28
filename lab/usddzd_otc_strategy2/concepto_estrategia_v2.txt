@@ -1,0 +1,83 @@
+ESTRATEGIA ALTERNA S2 - USDDZD_otc (REBOUND EN SOPORTE + DISPARO 1M)
+
+Objetivo
+Capturar entradas de alta probabilidad cuando el precio llega a un soporte de 5 minutos bien definido y aparece una confirmacion de impulso alcista en 1 minuto.
+
+Contexto del caso
+- Par: USDDZD_otc
+- Marco estructural: ultimas 50 velas de 5 minutos
+- Patron observado: el precio vuelve al piso (soporte) y en 1 minuto aparece un disparo alcista fuerte.
+
+Idea central
+1) Estructura (5m): detectar zona de soporte valida.
+2) Evento (1m): detectar barrido/rechazo del piso + vela de impulso.
+3) Ejecucion: entrar CALL solo si el evento confirma rebote y no hay invalidacion.
+
+Definicion operativa de soporte (5m)
+- Ventana fija: 50 velas de 5m.
+- Soporte candidato: percentil bajo de lows (Q15 a Q20) agrupado por cercania.
+- Zona de soporte: [S_floor, S_ceiling] donde:
+  - S_floor = min(low_cluster)
+  - S_ceiling = S_floor + ancho_zona
+- ancho_zona recomendado: max(0.08%, 0.35 * ATR_5m(14)).
+- Validez minima:
+  - >= 3 toques en la zona durante la ventana.
+  - Separacion temporal minima entre toques: 2 velas.
+  - No haber roto y cerrado 2 velas 5m consecutivas por debajo de S_floor.
+
+Definicion de evento de entrada (1m)
+Se arma una entrada CALL cuando, dentro de la zona de soporte, ocurre:
+- Barrido del piso: low_1m <= S_floor + tolerancia_piso.
+- Rechazo: cierre_1m vuelve por encima de S_floor.
+- Impulso: vela actual o siguiente con cuerpo >= 1.4x promedio de cuerpos de ultimas 10 velas 1m.
+- Confirmacion extra (opcional): cierre de impulso supera el maximo de la vela de barrido.
+
+Filtro de calidad (score S2)
+S2_SCORE = Estructura + Evento + Riesgo
+- Estructura (0-40)
+  - toques en soporte (0-18)
+  - compresion de rango previa (0-12)
+  - distancia a resistencia inmediata (0-10)
+- Evento 1m (0-40)
+  - calidad de barrido/rechazo (0-15)
+  - fuerza de impulso (0-15)
+  - confirmacion de ruptura de maximo local (0-10)
+- Riesgo/Filtro (0-20)
+  - payout >= minimo (0-8)
+  - sin vela 5m en expansion en contra (0-6)
+  - spread/latencia aceptable (0-6)
+
+Umbral sugerido inicial
+- Ejecutar solo si S2_SCORE >= 68.
+- Si hay operacion activa, marcar como VIGILADA y revalidar en el siguiente ciclo.
+
+Reglas de invalidacion
+- Cierre 1m por debajo de S_floor - tolerancia.
+- Dos cierres 1m seguidos sin recuperacion del piso tras el barrido.
+- Tiempo maximo desde evento de barrido sin disparo: 3 velas 1m.
+
+Gestion para esta estrategia
+- Direccion: CALL unicamente para este setup base.
+- Duracion recomendada: 5m (coherente con estructura 5m).
+- Riesgo por trade: igual al esquema actual del sistema (monto dinamico ya existente).
+
+Como registrarla como segunda estrategia (cuando se integre)
+Guardar en strategy_json campos dedicados:
+- strategy_name: "S2_SUPPORT_BURST_1M"
+- strategy_family: "reversal_from_support"
+- strategy_asset_scope: "USDDZD_otc"
+- s2_support_floor, s2_support_ceiling
+- s2_touch_count_5m
+- s2_sweep_detected, s2_impulse_ratio_1m
+- s2_score, s2_state (WATCH/ARMED/TRIGGERED/INVALIDATED)
+
+Estado sugerido (maquina simple)
+- WATCH: soporte detectado, esperando visita.
+- ARMED: precio dentro de zona soporte.
+- TRIGGERED: barrido + impulso confirmado.
+- INVALIDATED: ruptura limpia del soporte o timeout.
+
+Ventaja de esta estrategia
+- No persigue el precio en medio del rango.
+- Exige contexto (soporte real) + gatillo (impulso 1m).
+- Permite auditar resultados por separado como "segunda estrategia".

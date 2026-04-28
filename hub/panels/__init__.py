@@ -1,0 +1,1 @@
+"""Paneles del tablero Hub."""

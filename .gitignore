@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+data/
+log-*.txt
+sessions/
+*.log
+session.json
+*.db
+*.db-shm
+*.db-wal

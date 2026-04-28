@@ -1,0 +1,22 @@
+COMO PROBAR ESTRATEGIA S2 (SIN TOCAR EL SISTEMA)
+
+1) Colocar en esta carpeta dos archivos:
+   - sample_usddzd_5m.json (al menos 50 velas)
+   - sample_usddzd_1m.json (idealmente 20-40 velas recientes)
+
+2) Formato de cada vela:
+   {"ts": 1713900000, "open": 1.23456, "high": 1.23500, "low": 1.23410, "close": 1.23490}
+
+3) Ejecutar:
+   python lab/usddzd_otc_strategy2/evaluar_usddzd_v2.py
+
+4) Interpretacion rapida de salida:
+   - WATCH: hay soporte pero falta gatillo 1m.
+   - ARMED: hay gatillo parcial, score aun bajo.
+   - TRIGGERED: setup valido para CALL segun S2.
+   - INVALIDATED: datos insuficientes o soporte roto.
+
+5) Siguiente paso de integracion (mas adelante):
+   - agregar strategy_name="S2_SUPPORT_BURST_1M" al registro de candidates
+   - guardar campos s2_* en strategy_json
+   - habilitar switch por asset para USDDZD_otc
