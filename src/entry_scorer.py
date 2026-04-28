@@ -53,13 +53,7 @@ TREND_EMA_SLOW = 20
 PAYOUT_MIN = 80
 PAYOUT_MAX = 95
 
-# Penalización de antigüedad de zona (minutos → puntos a restar)
-_AGE_PENALTIES: list[tuple[float, float]] = [
-    (30.0,  0.0),   # < 30 min → sin penalización
-    (60.0,  3.0),   # 30-60 min → -3 pts
-    (120.0, 7.0),   # 60-120 min → -7 pts
-    (float("inf"), 12.0),  # > 120 min → -12 pts
-]
+# Ajuste por antigüedad de zona (minutos → puntos: negativos penalizan, positivos bonifican)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -245,17 +239,16 @@ def _score_momentum(candles: List[Candle], weight: int) -> float:
     return round(normalized * weight, 2)
 
 
-def _age_penalty(zone: ConsolidationZone) -> float:
-    """Penalización por antigüedad de zona. Se resta del score final."""
+def _age_adjustment(zone: ConsolidationZone) -> float:
+    """Ajuste por antigüedad de zona. Negativo penaliza, positivo bonifica."""
     age = zone.age_minutes
-    if age < 5.0:
-        return 10.0
     if age < 10.0:
-        return 5.0
-    for threshold, penalty in _AGE_PENALTIES:
-        if age < threshold:
-            return penalty
-    return _AGE_PENALTIES[-1][1]
+        return -12.0
+    if age < 30.0:
+        return -5.0
+    if age <= 90.0:
+        return 0.0
+    return 5.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -281,16 +274,16 @@ def score_candidate(
         s_momentum = _score_momentum(entry.candles, w["momentum"])
         s_trend    = _score_trend(entry.candles, entry.direction, w["trend"])
         s_payout   = _score_payout(entry.payout, w["payout"])
-        penalty    = _age_penalty(entry.zone)
+        age_adj    = _age_adjustment(entry.zone)
 
-        total = s_comp + s_momentum + s_trend + s_payout - penalty
+        total = s_comp + s_momentum + s_trend + s_payout + age_adj
         entry.score = round(total, 1)
         entry.score_breakdown = {
             "compression": s_comp,
             "momentum":    s_momentum,
             "trend":       s_trend,
             "payout":      s_payout,
-            "age_penalty": -penalty,
+            "age_adjustment": age_adj,
             # alias para compatibilidad con código que lee "bounce"
             "bounce":      s_momentum,
         }
@@ -300,16 +293,16 @@ def score_candidate(
         s_bounce  = _score_bounce(entry.candles, entry.zone, entry.direction, w["bounce"])
         s_trend   = _score_trend(entry.candles, entry.direction, w["trend"])
         s_payout  = _score_payout(entry.payout, w["payout"])
-        penalty   = _age_penalty(entry.zone)
+        age_adj   = _age_adjustment(entry.zone)
 
-        total = s_comp + s_bounce + s_trend + s_payout - penalty
+        total = s_comp + s_bounce + s_trend + s_payout + age_adj
         entry.score = round(total, 1)
         entry.score_breakdown = {
             "compression": s_comp,
             "bounce":      s_bounce,
             "trend":       s_trend,
             "payout":      s_payout,
-            "age_penalty": -penalty,
+            "age_adjustment": age_adj,
         }
 
     return entry.score
@@ -335,8 +328,8 @@ def select_best(
 def explain_score(entry: CandidateEntry, threshold: int = SCORE_THRESHOLD) -> str:
     bd = entry.score_breakdown
     mode_label = entry.mode.value.upper()
-    age_penalty = bd.get("age_penalty", 0.0)
-    age_txt = f" (penalización antigüedad zona: {age_penalty:.1f})" if age_penalty < 0 else ""
+    age_adjustment = bd.get("age_adjustment", 0.0)
+    age_txt = f" (ajuste antigüedad zona: {age_adjustment:+.1f})" if age_adjustment != 0 else ""
 
     if entry.mode == SignalMode.BREAKOUT:
         w = WEIGHTS_BREAKOUT
@@ -348,7 +341,7 @@ def explain_score(entry: CandidateEntry, threshold: int = SCORE_THRESHOLD) -> st
             f"| S2 Momentum   : {bd.get('momentum', 0):5.1f} / {w['momentum']}",
             f"| S3 Tendencia  : {bd.get('trend', 0):5.1f} / {w['trend']}",
             f"| S4 Payout     : {bd.get('payout', 0):5.1f} / {w['payout']} (payout={entry.payout}%)",
-            f"| Zona edad     : {entry.zone.age_minutes:.0f} min → penalización {age_penalty:.1f} pts",
+            f"| Zona edad     : {entry.zone.age_minutes:.0f} min → ajuste {age_adjustment:+.1f} pts",
             "+--------------------------------------------",
         ]
     else:
@@ -361,7 +354,7 @@ def explain_score(entry: CandidateEntry, threshold: int = SCORE_THRESHOLD) -> st
             f"| S2 Rebote     : {bd.get('bounce', 0):5.1f} / {w['bounce']}",
             f"| S3 Tendencia  : {bd.get('trend', 0):5.1f} / {w['trend']}",
             f"| S4 Payout     : {bd.get('payout', 0):5.1f} / {w['payout']} (payout={entry.payout}%)",
-            f"| Zona edad     : {entry.zone.age_minutes:.0f} min → penalización {age_penalty:.1f} pts",
+            f"| Zona edad     : {entry.zone.age_minutes:.0f} min → ajuste {age_adjustment:+.1f} pts",
             "+--------------------------------------------",
         ]
     return "\n".join(lines)

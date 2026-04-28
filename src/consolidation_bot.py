@@ -434,6 +434,15 @@ def detect_consolidation(
         if bars_inside < MIN_CONSOLIDATION_BARS:
             continue
 
+        touches_ceiling = sum(
+            1 for c in window if c.high >= ceiling * (1 - TOUCH_TOLERANCE_PCT)
+        )
+        touches_floor = sum(
+            1 for c in window if c.low <= floor * (1 + TOUCH_TOLERANCE_PCT)
+        )
+        if (touches_ceiling + touches_floor) < 2:
+            continue
+
         return ConsolidationZone(
             asset="",
             ceiling=ceiling,
@@ -446,12 +455,20 @@ def detect_consolidation(
     return None
 
 
-def price_at_ceiling(price: float, ceiling: float) -> bool:
-    return abs(price - ceiling) / ceiling <= TOUCH_TOLERANCE_PCT
+def price_at_ceiling(
+    price: float,
+    ceiling: float,
+    tolerance_pct: float = TOUCH_TOLERANCE_PCT,
+) -> bool:
+    return abs(price - ceiling) / ceiling <= tolerance_pct
 
 
-def price_at_floor(price: float, floor: float) -> bool:
-    return abs(price - floor) / floor <= TOUCH_TOLERANCE_PCT
+def price_at_floor(
+    price: float,
+    floor: float,
+    tolerance_pct: float = TOUCH_TOLERANCE_PCT,
+) -> bool:
+    return abs(price - floor) / floor <= tolerance_pct
 
 
 def broke_above(candle: Candle, ceiling: float) -> bool:
@@ -1662,10 +1679,10 @@ class ConsolidationBot:
         
         Retorna (válido, razón_fallo | "").
         """
-        if not candles_1m:
-            return False, "sin datos 1m"
+        if len(candles_1m) < 3:
+            return False, "insuficientes velas 1m"
         
-        last = candles_1m[-1]
+        last = candles_1m[-2]
         rango = last.range
         if rango <= 0:
             return False, "vela sin rango"
@@ -2390,6 +2407,7 @@ class ConsolidationBot:
                     continue
 
                 dynamic_max_range = MAX_RANGE_PCT
+                atr_pct = 0.0
                 if USE_DYNAMIC_ATR_RANGE:
                     atr = compute_atr(candles, ATR_PERIOD)
                     mid = candles[-1].close if candles[-1].close > 0 else 0.0
@@ -2400,6 +2418,9 @@ class ConsolidationBot:
                             MIN_DYNAMIC_RANGE_PCT,
                             MAX_DYNAMIC_RANGE_PCT,
                         )
+                dynamic_touch_tolerance = TOUCH_TOLERANCE_PCT
+                if atr_pct > 0:
+                    dynamic_touch_tolerance = _clamp(atr_pct * 0.12, 0.00015, 0.00080)
 
                 zone = detect_consolidation(candles, max_range_pct=dynamic_max_range)
                 if zone is None:
@@ -2507,10 +2528,10 @@ class ConsolidationBot:
                 entry_mode = "none"
                 breakout_strength_ok = False
 
-                if price_at_ceiling(price, zone.ceiling):
+                if price_at_ceiling(price, zone.ceiling, dynamic_touch_tolerance):
                     direction = "put"
                     entry_mode = "rebound_ceiling"
-                elif price_at_floor(price, zone.floor):
+                elif price_at_floor(price, zone.floor, dynamic_touch_tolerance):
                     direction = "call"
                     entry_mode = "rebound_floor"
                 elif broke_above(last, zone.ceiling) and is_high_volume_break(last, candles):
@@ -2668,10 +2689,7 @@ class ConsolidationBot:
                         )
                         self.stats["skipped"] += 1
                         continue
-                    if direction == "put":
-                        pattern_ok = confirms and strength >= req_strength
-                    else:
-                        pattern_ok = (confirms and strength >= req_strength) or pattern_name == "none"
+                    pattern_ok = confirms and strength >= req_strength
 
                     if not pattern_ok:
                         if STRICT_PATTERN_CHECK and pattern_name != "none" and (not confirms) and strength >= 0.65:
