@@ -74,6 +74,7 @@ from candle_patterns import (
 )
 from strategy_spring_sweep import detect_spring_or_upthrust
 from trade_journal import get_journal
+from martingale_calculator import MartingaleCalculator
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 _stdout_handler = logging.StreamHandler(sys.stdout)
@@ -103,13 +104,14 @@ log = logging.getLogger("consolidation_bot")
 #  PARÁMETROS DE ESTRATEGIA — editar aquí
 # ═══════════════════════════════════════════════════════════════════════════════
 TF_5M                  = 300     # período de vela: 5 min en segundos
+TF_1M                  = 60      # período de vela: 1 min en segundos
 CANDLES_LOOKBACK       = 55      # velas a pedir al broker (55 > 15+buffer)
 MIN_CONSOLIDATION_BARS = 12      # mínimo de velas DENTRO del rango
 MAX_RANGE_PCT          = 0.003   # 0.3% — amplitud máxima del rango
 TOUCH_TOLERANCE_PCT    = 0.00035 # 0.035% — tolerancia para "tocar" techo/piso
 MAX_CONSOLIDATION_MIN  = 0       # 0 = sin límite de tiempo para descartar zona
 MIN_PAYOUT             = 80      # payout mínimo %
-DURATION_SEC           = 120     # duración fija de cada opción binaria (2 min)
+DURATION_SEC           = 30      # duración fija de cada opción binaria (30s)
 AMOUNT_INITIAL         = 1.00    # capital inicial $
 AMOUNT_MARTIN          = 3.00    # martingala $
 SCAN_INTERVAL_SEC      = 60      # segundos entre escaneos completos
@@ -118,7 +120,7 @@ MAX_CONCURRENT_TRADES  = 1       # máximo de operaciones abiertas simultáneas
 COOLDOWN_BETWEEN_ENTRIES = 30    # espera entre órdenes exitosas (segundos)
 ENTRY_SYNC_TO_CANDLE     = True  # alinear entrada al inicio de vela
 ENTRY_MAX_LAG_SEC        = 1.5   # cancelar si se envía tarde respecto a la vela
-ENTRY_REJECT_LAST_SEC    = 60.0  # rechazar entrada cuando quede <= 1 min para cerrar vela 5m
+ENTRY_REJECT_LAST_SEC    = 2.0   # margen mínimo de seguridad sobre vela 1m
 ALIGN_SCAN_TO_CANDLE     = False # escaneo cada 60s (SCAN_INTERVAL_SEC)
 SCAN_LEAD_SEC            = 35.0  # escanear ~35s antes del próximo open de 5m
 MAX_LOSS_SESSION         = 0.20  # detener sesión si drawdown alcanza 20%
@@ -147,6 +149,7 @@ CANDLE_FETCH_1M_TIMEOUT_SEC = 12.0
 FETCH_RETRIES            = 2
 FETCH_RETRY_BACKOFF_SEC  = 0.35
 ORDER_SEND_RETRIES       = 1
+RECONNECT_TIMEOUT_SEC    = 12.0
 SCAN_MAX_ASSETS_PER_CYCLE = 40
 SCAN_PROGRESS_EVERY = 10
 
@@ -168,6 +171,9 @@ REJECTION_PUT_MIN_UPPER_WICK = 0.30
 ZONE_AGE_REBOUND_MIN = 20
 ZONE_AGE_BREAKOUT_MIN = 8
 ZONE_MIN_AGE_MIN = ZONE_AGE_REBOUND_MIN
+# Si está activo, las rupturas fuertes validadas (BROKEN_ABOVE/BELOW)
+# se envían aunque no superen el umbral dinámico de score.
+FORCE_EXECUTE_STRONG_BREAKOUT = True
 GREYLIST_ASSETS = {"USDDZD_otc"}
 PATTERN_PUT_BLACKLIST = {"bearish_engulfing"}
 STRICT_PATTERN_CHECK = True
@@ -217,8 +223,8 @@ MARTIN_RESOLVE_RETRY_SEC = 5.0
 MARTIN_RESOLVE_MAX_ATTEMPTS = 3
 
 # STRAT-B (Spring Sweep) en paralelo (modo espejo por defecto)
-STRAT_B_CAN_TRADE      = False
-STRAT_B_DURATION_SEC   = 120
+STRAT_B_CAN_TRADE      = True
+STRAT_B_DURATION_SEC   = 30
 STRAT_B_MIN_CONFIDENCE = 0.70
 STRAT_B_MIN_CONFIDENCE_EARLY = 0.62
 STRAT_B_ALLOW_WYCKOFF_EARLY = True
@@ -545,6 +551,63 @@ async def fetch_candles_with_retry(
     return []
 
 
+def find_strong_support_2m(
+    candles: List[Candle],
+    lookback: int = 90,
+) -> Tuple[Optional[float], int]:
+    """Devuelve (precio_soporte, toques) usando pivotes de low en 2m."""
+    if len(candles) < 7:
+        return None, 0
+
+    sample = candles[-lookback:] if len(candles) > lookback else candles[:]
+    avg_price = mean([c.close for c in sample]) if sample else 0.0
+    if avg_price <= 0:
+        return None, 0
+
+    # Tolerancia de agrupación: 0.06% del precio medio.
+    tol = max(avg_price * 0.0006, 1e-6)
+
+    pivots: List[float] = []
+    for i in range(2, len(sample) - 2):
+        low = sample[i].low
+        if (
+            low <= sample[i - 1].low
+            and low <= sample[i + 1].low
+            and low <= sample[i - 2].low
+            and low <= sample[i + 2].low
+        ):
+            pivots.append(low)
+
+    if not pivots:
+        return None, 0
+
+    # Clustering simple por proximidad de precio.
+    clusters: List[dict[str, Any]] = []
+    for p in pivots:
+        matched = False
+        for c in clusters:
+            if abs(p - c["center"]) <= tol:
+                c["values"].append(p)
+                c["center"] = mean(c["values"])
+                matched = True
+                break
+        if not matched:
+            clusters.append({"center": p, "values": [p]})
+
+    best_price: Optional[float] = None
+    best_touches = 0
+    for c in clusters:
+        center = float(c["center"])
+        touches = sum(1 for bar in sample if abs(bar.low - center) <= tol)
+        if touches > best_touches:
+            best_touches = touches
+            best_price = center
+
+    if best_price is None:
+        return None, 0
+    return round(best_price, 5), int(best_touches)
+
+
 async def get_open_assets(client: Quotex, min_payout: int = MIN_PAYOUT) -> List[Tuple[str, int]]:
     try:
         instruments = await client.get_instruments()
@@ -568,6 +631,16 @@ async def get_open_assets(client: Quotex, min_payout: int = MIN_PAYOUT) -> List[
     return result
 
 
+def looks_like_connection_issue(reason: str) -> bool:
+    text = (reason or "").lower()
+    conn_hints = (
+        "websocket", "handshake", "403", "connect", "connection",
+        "session", "closed", "disconnect", "network", "socket",
+        "reconnect", "timeout", "remote host was lost",
+    )
+    return any(hint in text for hint in conn_hints)
+
+
 async def place_order(
     client: Quotex, asset: str, direction: str,
     amount: float, duration: int, dry_run: bool,
@@ -589,35 +662,73 @@ async def place_order(
             "aunque aparezca como open.", asset,
         )
 
+    async def _force_reconnect(step_label: str) -> Tuple[bool, str]:
+        log.info("🔌 Reconexión %s: %s %s $%.2f", step_label, asset, direction.upper(), amount)
+        last_reason = ""
+        for attempt in range(1, CONNECT_RETRIES + 1):
+            try:
+                await client.close()
+            except Exception:
+                pass
+
+            await asyncio.sleep(1.0)
+            try:
+                ok_conn, reason_conn = await asyncio.wait_for(
+                    client.connect(),
+                    timeout=RECONNECT_TIMEOUT_SEC,
+                )
+            except asyncio.TimeoutError:
+                last_reason = f"reconnect_timeout_connect_{RECONNECT_TIMEOUT_SEC:.0f}s"
+                log.warning("  Reconexión %s timeout en connect() intento %d/%d", step_label, attempt, CONNECT_RETRIES)
+                continue
+            except Exception as exc:
+                last_reason = f"reconnect_exception_connect:{exc}"
+                log.warning("  Reconexión %s excepción en connect() intento %d/%d: %s", step_label, attempt, CONNECT_RETRIES, exc)
+                continue
+
+            if not ok_conn:
+                last_reason = f"reconnect_failed:{reason_conn}"
+                log.warning("  Reconexión %s fallida intento %d/%d: %s", step_label, attempt, CONNECT_RETRIES, reason_conn)
+                continue
+
+            try:
+                await asyncio.wait_for(
+                    client.change_account(account_type),
+                    timeout=RECONNECT_TIMEOUT_SEC,
+                )
+            except asyncio.TimeoutError:
+                last_reason = f"reconnect_timeout_change_account_{RECONNECT_TIMEOUT_SEC:.0f}s"
+                log.warning("  Reconexión %s timeout en change_account() intento %d/%d", step_label, attempt, CONNECT_RETRIES)
+                continue
+            except Exception as exc:
+                last_reason = f"reconnect_exception_change_account:{exc}"
+                log.warning("  Reconexión %s excepción en change_account() intento %d/%d: %s", step_label, attempt, CONNECT_RETRIES, exc)
+                continue
+
+            await asyncio.sleep(0.6)
+            return True, ""
+
+        return False, last_reason or "reconnect_failed_without_reason"
+
+    async def _log_pre_buy() -> None:
+        try:
+            ws_alive = await client.check_connect()
+        except Exception:
+            ws_alive = False
+        log.info(
+            "🔍 Pre-buy | asset=%s dir=%s amount=%.2f ws_alive=%s account=%s",
+            asset, direction.upper(), amount, ws_alive, account_type,
+        )
+
     # ── RECONEXIÓN AGRESIVA — siempre antes de buy() ──────────────────────────
     # No confiamos en check_connect(): aunque el socket parezca vivo,
     # el estado de sesión con Quotex puede estar degradado.
-    log.info("🔌 Reconexión pre-orden: %s %s $%.2f", asset, direction.upper(), amount)
-    try:
-        await client.close()
-    except Exception:
-        pass
-    await asyncio.sleep(2.0)
-    try:
-        ok_conn, reason_conn = await client.connect()
-        if not ok_conn:
-            log.error("  Reconexión pre-orden fallida: %s", reason_conn)
-            return False, "", 0.0, 0, f"reconnect_failed:{reason_conn}"
-        await client.change_account(account_type)
-    except Exception as exc:
-        log.error("  Excepción en reconexión pre-orden: %s", exc)
-        return False, "", 0.0, 0, f"reconnect_exception:{exc}"
-    await asyncio.sleep(1.0)
+    ok_reconnect, reconnect_reason = await _force_reconnect("pre-orden")
+    if not ok_reconnect:
+        log.error("  Reconexión pre-orden fallida: %s", reconnect_reason)
+        return False, "", 0.0, 0, reconnect_reason
 
-    # Log diagnóstico justo antes de enviar
-    try:
-        ws_alive = await client.check_connect()
-    except Exception:
-        ws_alive = False
-    log.info(
-        "🔍 Pre-buy | asset=%s dir=%s amount=%.2f ws_alive=%s account=%s",
-        asset, direction.upper(), amount, ws_alive, account_type,
-    )
+    await _log_pre_buy()
 
     # ── UN SOLO INTENTO CON TIMEOUT LOCAL DE 30s ───────────────────────────────
     t0 = time.time()
@@ -641,8 +752,41 @@ async def place_order(
         return False, "", 0.0, 0, "buy_timeout_30s"
     except Exception as exc:
         elapsed = time.time() - t0
+        first_reason = f"buy_exception:{exc}"
         log.error("  Excepción en buy() elapsed=%.2fs: %s", elapsed, exc)
-        return False, "", 0.0, 0, f"buy_exception:{exc}"
+        if not looks_like_connection_issue(first_reason):
+            return False, "", 0.0, 0, first_reason
+
+        log.warning("  ↻ Falla de conexión detectada en buy(); reintentando una vez...")
+        ok_reconnect, reconnect_reason = await _force_reconnect("reintento")
+        if not ok_reconnect:
+            log.error("  Reconexión de reintento fallida: %s", reconnect_reason)
+            return False, "", 0.0, 0, f"{first_reason} | {reconnect_reason}"
+        await _log_pre_buy()
+        t0_retry = time.time()
+        try:
+            status, info = await asyncio.wait_for(
+                client.buy(
+                    amount=amount,
+                    asset=asset,
+                    direction=direction,
+                    duration=duration,
+                ),
+                timeout=30.0,
+            )
+            elapsed = time.time() - t0_retry
+        except asyncio.TimeoutError:
+            elapsed_retry = time.time() - t0_retry
+            log.warning(
+                "  ⏱ buy() reintento sin respuesta en 30s (elapsed=%.1fs)",
+                elapsed_retry,
+            )
+            return False, "", 0.0, 0, "buy_timeout_30s_retry"
+        except Exception as retry_exc:
+            elapsed_retry = time.time() - t0_retry
+            retry_reason = f"buy_exception_retry:{retry_exc}"
+            log.error("  Excepción en buy() reintento elapsed=%.2fs: %s", elapsed_retry, retry_exc)
+            return False, "", 0.0, 0, retry_reason
 
     elapsed = time.time() - t0
 
@@ -673,6 +817,65 @@ async def place_order(
         )
     elif info is not None:
         reject_reason = str(info)
+
+    if looks_like_connection_issue(reject_reason):
+        log.warning("  ↻ Rechazo de conexión detectado (%s); reintentando una vez...", reject_reason)
+        ok_reconnect, reconnect_reason = await _force_reconnect("reintento")
+        if not ok_reconnect:
+            log.error("  Reconexión de reintento fallida: %s", reconnect_reason)
+            return False, "", 0.0, 0, f"{reject_reason} | {reconnect_reason}"
+
+        await _log_pre_buy()
+        t0_retry = time.time()
+        try:
+            status_retry, info_retry = await asyncio.wait_for(
+                client.buy(
+                    amount=amount,
+                    asset=asset,
+                    direction=direction,
+                    duration=duration,
+                ),
+                timeout=30.0,
+            )
+        except asyncio.TimeoutError:
+            elapsed_retry = time.time() - t0_retry
+            log.warning(
+                "  ⏱ buy() reintento sin respuesta en 30s (elapsed=%.1fs)",
+                elapsed_retry,
+            )
+            return False, "", 0.0, 0, "buy_timeout_30s_retry"
+        except Exception as retry_exc:
+            elapsed_retry = time.time() - t0_retry
+            retry_reason = f"buy_exception_retry:{retry_exc}"
+            log.error("  Excepción en buy() reintento elapsed=%.2fs: %s", elapsed_retry, retry_exc)
+            return False, "", 0.0, 0, retry_reason
+
+        elapsed_retry = time.time() - t0_retry
+        if status_retry and isinstance(info_retry, dict):
+            log.info("  ✅ Reintento exitoso en broker (%.2fs)", elapsed_retry)
+            order_ref = 0
+            for key in ("id_number", "idNumber", "openOrderId", "ticket"):
+                raw_val = info_retry.get(key)
+                try:
+                    if raw_val is not None:
+                        order_ref = int(raw_val)
+                        break
+                except (TypeError, ValueError):
+                    continue
+            return True, info_retry.get("id", ""), float(info_retry.get("openPrice", 0)), order_ref, ""
+
+        retry_reason = "broker_rejected_retry"
+        if isinstance(info_retry, dict):
+            retry_reason = str(
+                info_retry.get("message")
+                or info_retry.get("reason")
+                or info_retry.get("error")
+                or retry_reason
+            )
+        elif info_retry is not None:
+            retry_reason = str(info_retry)
+        return False, "", 0.0, 0, retry_reason
+
     return False, "", 0.0, 0, reject_reason
 
 
@@ -714,6 +917,7 @@ class ConsolidationBot:
         self.last_closed_outcome:   str   = ""
         self.session_start_balance: Optional[float] = None
         self.current_balance:       Optional[float] = None
+        self.martingale:            MartingaleCalculator = MartingaleCalculator()
         self.session_stop_hit:      bool = False
         self.cycle_id:              int = 1
         self.cycle_ops:             int = 0
@@ -875,6 +1079,7 @@ class ConsolidationBot:
     def set_session_start_balance(self, balance: float) -> None:
         self.session_start_balance = float(balance)
         self.current_balance = float(balance)
+        self.martingale.set_balance(float(balance))
         if self.cycle_start_balance is None:
             self.cycle_start_balance = float(balance)
 
@@ -882,36 +1087,46 @@ class ConsolidationBot:
     def _round_up_to_cents(value: float) -> float:
         return ceil(max(0.0, value) * 100.0) / 100.0
 
-    def _target_profit_for_integer_balance(self, min_profit: float) -> float:
+    def _compute_initial_amount(self, payout_pct: int) -> Tuple[float, float]:
         """
-        Retorna la ganancia neta objetivo para que el balance quede en entero,
-        respetando una ganancia mínima requerida.
-        Ej: balance=67.99, min_profit=1.0 -> target=1.01 (llega a 69.00)
+        Calcula monto inicial usando MartingaleCalculator.
+        Retorna (monto, ganancia_esperada).
         """
-        if self.current_balance is None:
-            return float(min_profit)
-        required = ceil(self.current_balance + float(min_profit)) - self.current_balance
-        return self._round_up_to_cents(max(float(min_profit), required))
+        if self.current_balance is not None:
+            self.martingale.set_balance(self.current_balance)
 
-    def _amount_for_target_profit(self, payout_pct: int, target_profit: float) -> Tuple[float, float]:
-        """
-        Calcula monto (redondeado hacia arriba a centavos) para lograr una
-        ganancia neta objetivo con payout dado. Nunca invierte menos de $1.
-        """
+        amount, status = self.martingale.calculate_investment(payout_pct)
+
+        if status != "OK":
+            log.warning(f"⚠ _compute_initial_amount: {status} | amount={amount:.2f}")
+            return 0.0, 0.0
+
+        # Calcular ganancia esperada
         payout_rate = max(0.01, float(payout_pct) / 100.0)
-        raw_amount = float(target_profit) / payout_rate
-        amount = max(MIN_ORDER_AMOUNT, self._round_up_to_cents(raw_amount))
         expected_profit = self._round_up_to_cents(amount * payout_rate)
+
         return amount, expected_profit
 
-    def _compute_initial_amount(self, payout_pct: int) -> Tuple[float, float]:
-        target = self._target_profit_for_integer_balance(TARGET_MIN_PROFIT)
-        return self._amount_for_target_profit(payout_pct, target)
-
     def _compute_compensation_amount(self, payout_pct: int, base_loss: float) -> Tuple[float, float]:
-        # Recupera pérdida previa y busca +$2 netos cerrando en entero.
-        target = self._target_profit_for_integer_balance(MARTIN_TARGET_PROFIT) + max(0.0, float(base_loss))
-        return self._amount_for_target_profit(payout_pct, target)
+        """
+        Calcula monto de compensación (gale) usando MartingaleCalculator.
+        Retorna (monto, ganancia_esperada).
+        """
+        # Registra pérdida anterior
+        if self.current_balance is not None:
+            self.martingale.set_balance(self.current_balance)
+
+        # Calcula inversión para el próximo gale
+        amount, status = self.martingale.calculate_investment(payout_pct)
+
+        if status != "OK":
+            log.warning(f"⚠ _compute_compensation_amount: {status} | amount={amount:.2f}")
+            return 0.0, 0.0
+
+        payout_rate = max(0.01, float(payout_pct) / 100.0)
+        expected_profit = self._round_up_to_cents(amount * payout_rate)
+
+        return amount, expected_profit
 
     async def _get_asset_payout(self, asset: str, default: int = MIN_PAYOUT) -> int:
         try:
@@ -1479,7 +1694,7 @@ class ConsolidationBot:
                 candidate.zone,
                 f"MARTIN diferido | recuperando ${original_loss:.2f}",
                 "martin",
-                signal_ts=candidate.candles[-1].ts if candidate.candles else None,
+                signal_ts=getattr(candidate, "_signal_ts_1m", candidate.candles[-1].ts if candidate.candles else None),
                 strategy_origin=strategy_origin,
                 duration_sec=DURATION_SEC,
                 payout=candidate.payout,
@@ -1640,7 +1855,7 @@ class ConsolidationBot:
                     chosen.zone,
                     f"MARTIN diferido | recuperando ${pending.original_loss:.2f}",
                     "martin",
-                    signal_ts=chosen.candles[-1].ts if chosen.candles else None,
+                    signal_ts=getattr(chosen, "_signal_ts_1m", chosen.candles[-1].ts if chosen.candles else None),
                     strategy_origin="STRAT-A",
                     duration_sec=DURATION_SEC,
                     payout=chosen.payout,
@@ -1783,6 +1998,7 @@ class ConsolidationBot:
             self.set_session_start_balance(bal)
 
         self.current_balance = bal
+        self.martingale.set_balance(bal)
         if not self.session_start_balance or self.session_start_balance <= 0:
             return False
 
@@ -1964,12 +2180,12 @@ class ConsolidationBot:
 
     async def _sync_to_next_candle_open(self, signal_ts: Optional[int] = None) -> EntryTimingInfo:
         """
-        Sincroniza/valida timing de entrada para STRAT-A en vela de 1m.
+        Sincroniza/valida timing de entrada al inicio de vela de 1m.
 
         Regla operativa:
-        - Se permite entrar en cualquier momento de la vela actual.
-        - Solo se rechaza si faltan <= ENTRY_REJECT_LAST_SEC para cerrar (últimos segundos).
-        - La duración de la orden es fija (DURATION_SEC = 120s).
+        - Esperar siempre al próximo open de vela 1m.
+        - Rechazar si el envío queda tardío (> ENTRY_MAX_LAG_SEC).
+        - La duración de la orden es fija (DURATION_SEC = 30s).
 
         Devuelve un EntryTimingInfo con telemetría de timing.
         """
@@ -1979,36 +2195,44 @@ class ConsolidationBot:
                 lag_sec=0.0,
                 duration_sec=DURATION_SEC,
                 time_since_open_sec=0.0,
-                secs_to_close_sec=float(TF_5M),
+                secs_to_close_sec=float(TF_1M),
                 decision="SYNC_DISABLED",
             )
 
         now = time.time()
-        time_since_open = now % TF_5M
-        secs_to_close = max(0.0, TF_5M - time_since_open)
+        next_open = ((int(now) // TF_1M) + 1) * TF_1M
+        wait_sec = max(0.0, next_open - now)
+        if wait_sec > 0:
+            log.info("⏳ Esperando apertura de vela 1m: %.2fs", wait_sec)
+            await asyncio.sleep(wait_sec)
 
-        if secs_to_close <= ENTRY_REJECT_LAST_SEC:
+        send_ts = time.time()
+        lag_sec = send_ts - next_open
+        time_since_open = send_ts % TF_1M
+        secs_to_close = max(0.0, TF_1M - time_since_open)
+
+        if lag_sec > ENTRY_MAX_LAG_SEC or secs_to_close <= ENTRY_REJECT_LAST_SEC:
             log.info(
-                "⏳ Señal rechazada por timing: faltan %.1fs para cerrar vela 1m "
-                "(límite mínimo %.1fs).",
+                "⏳ Señal rechazada por timing 1m: lag=%.2fs, restante=%.2fs (max_lag=%.2fs)",
+                lag_sec,
                 secs_to_close,
-                ENTRY_REJECT_LAST_SEC,
+                ENTRY_MAX_LAG_SEC,
             )
             return EntryTimingInfo(
                 ok=False,
-                lag_sec=-secs_to_close,
+                lag_sec=lag_sec,
                 duration_sec=DURATION_SEC,
                 time_since_open_sec=time_since_open,
                 secs_to_close_sec=secs_to_close,
-                decision="REJECT_LAST_MINUTE",
+                decision="REJECT_LATE_1M",
             )
 
         duration_dynamic = DURATION_SEC
         dur_min = duration_dynamic // 60
         dur_seg = duration_dynamic % 60
         log.info(
-            "⏱ Entrada dentro de vela 1m: %.1fs transcurridos, %.1fs restantes → duración fija=%dm%02ds (%ds)",
-            time_since_open,
+            "⏱ Entrada sincronizada al open 1m: lag=%.2fs, restante=%.2fs → duración fija=%dm%02ds (%ds)",
+            lag_sec,
             secs_to_close,
             dur_min,
             dur_seg,
@@ -2016,11 +2240,11 @@ class ConsolidationBot:
         )
         return EntryTimingInfo(
             ok=True,
-            lag_sec=0.0,
+            lag_sec=lag_sec,
             duration_sec=duration_dynamic,
             time_since_open_sec=time_since_open,
             secs_to_close_sec=secs_to_close,
-            decision="ACCEPT_IN_CANDLE",
+            decision="SYNCED_1M_OPEN",
         )
 
     async def _process_pending_reversals(
@@ -2102,11 +2326,8 @@ class ConsolidationBot:
                     to_remove.append(sym)
                 continue
 
-            # En PUT exigimos confirmación fuerte; en CALL permitimos pattern=none con vela válida.
-            if pr.proposed_direction == "put":
-                can_enter = candle_valid and confirms and strength >= req_strength
-            else:
-                can_enter = candle_valid and ((confirms and strength >= req_strength) or pattern_name == "none")
+            # Tanto CALL como PUT requieren patrón confirmado con fuerza suficiente.
+            can_enter = candle_valid and confirms and strength >= req_strength
 
             if can_enter:
                 log.info(
@@ -2128,6 +2349,7 @@ class ConsolidationBot:
                 candidate._reversal_strength = strength  # type: ignore[attr-defined]
                 candidate._reversal_confirms = confirms  # type: ignore[attr-defined]
                 candidate._entry_mode = pr.entry_mode  # type: ignore[attr-defined]
+                candidate._signal_ts_1m = candles_1m[-1].ts if candles_1m else None  # type: ignore[attr-defined]
                 amount, _ = self._compute_initial_amount(payout)
                 candidate._amount = amount  # type: ignore[attr-defined]
                 candidate._stage = "initial"  # type: ignore[attr-defined]
@@ -2151,11 +2373,12 @@ class ConsolidationBot:
                     sym, pr.scans_waited,
                 )
                 to_remove.append(sym)
-            elif pr.proposed_direction == "put" and (not confirms or strength < req_strength):
+            elif not confirms or strength < req_strength:
                 if pattern_name == "none":
                     log.info(
-                        "↪ %s: PUT requiere patrón ≥%.2f, detectado %s %.2f (%s)",
+                        "↪ %s: %s requiere patrón ≥%.2f, detectado %s %.2f (%s)",
                         sym,
+                        pr.proposed_direction.upper(),
                         req_strength,
                         pattern_name,
                         strength,
@@ -2163,8 +2386,9 @@ class ConsolidationBot:
                     )
                 else:
                     log.info(
-                        "↪ %s: PUT requiere patrón ≥%.2f, detectado %s %.2f",
+                        "↪ %s: %s requiere patrón ≥%.2f, detectado %s %.2f",
                         sym,
+                        pr.proposed_direction.upper(),
                         req_strength,
                         pattern_name,
                         strength,
@@ -2390,6 +2614,46 @@ class ConsolidationBot:
                         pattern_label = "Wyckoff Early M1+M2 (Spring)"
                     else:
                         pattern_label = "Wyckoff"
+
+                    # Registrar STRAT-B en caja negra (journal) antes de enviar la orden.
+                    b_candidate = CandidateEntry(
+                        asset=sym,
+                        payout=payout,
+                        zone=pseudo_zone,
+                        direction=strat_b_direction,
+                        candles=candles_1m,
+                        score=round(strat_b_conf * 100.0, 1),
+                        score_breakdown={
+                            "compression": 0.0,
+                            "bounce": round(strat_b_conf * 35.0, 2),
+                            "trend": round(strat_b_conf * 25.0, 2),
+                            "payout": round(min(20.0, (payout / 95.0) * 20.0), 2),
+                        },
+                    )
+                    setattr(b_candidate, "_reversal_pattern", strat_b_signal_type or "none")
+                    setattr(b_candidate, "_reversal_strength", strat_b_conf)
+
+                    b_strategy = self._strategy_snapshot()
+                    b_strategy.update(
+                        {
+                            "strategy_origin": "STRAT-B",
+                            "strat_b_signal_type": strat_b_signal_type,
+                            "strat_b_confidence": strat_b_conf,
+                            "strat_b_required_conf": strat_b_required_conf,
+                            "strat_b_reason": strat_b_reason,
+                        }
+                    )
+
+                    b_outcome = "DRY_RUN" if self.dry_run else "PENDING"
+                    b_cid = get_journal().log_candidate(
+                        b_candidate,
+                        decision="ACCEPTED",
+                        amount=b_amount,
+                        stage="initial",
+                        outcome=b_outcome,
+                        strategy=b_strategy,
+                    )
+
                     await self._enter(
                         sym,
                         strat_b_direction,
@@ -2397,8 +2661,12 @@ class ConsolidationBot:
                         pseudo_zone,
                         f"{pattern_label} conf={strat_b_conf*100:.1f}% req={strat_b_required_conf*100:.1f}%",
                         "initial",
+                        journal_cid=b_cid,
+                        signal_ts=candles_1m[-1].ts if candles_1m else None,
                         strategy_origin="STRAT-B",
                         duration_sec=STRAT_B_DURATION_SEC,
+                        payout=payout,
+                        score_original=round(strat_b_conf * 100.0, 1),
                     )
                     await sleep_with_inline_countdown(COOLDOWN_BETWEEN_ENTRIES, "⏳ Cooldown post-orden")
 
@@ -2789,12 +3057,16 @@ class ConsolidationBot:
                 candidate._reversal_strength = strength  # type: ignore[attr-defined]
                 candidate._reversal_confirms = confirms  # type: ignore[attr-defined]
                 candidate._entry_mode = entry_mode  # type: ignore[attr-defined]
+                candidate._signal_ts_1m = candles_1m[-1].ts if candles_1m else None  # type: ignore[attr-defined]
 
                 candidate._amount = amount  # type: ignore[attr-defined]
                 candidate._stage = stage  # type: ignore[attr-defined]
                 candidate._ma_state = ma_state  # type: ignore[attr-defined]
                 candidate._order_blocks = blocks  # type: ignore[attr-defined]
                 candidate._ob_tf = ob_tf_label  # type: ignore[attr-defined]
+                candidate._force_execute = bool(
+                    FORCE_EXECUTE_STRONG_BREAKOUT and stage == "breakout" and breakout_strength_ok
+                )  # type: ignore[attr-defined]
 
                 score_candidate(candidate)
 
@@ -2912,6 +3184,23 @@ class ConsolidationBot:
                     conf * 100,
                     pattern_label,
                 )
+                candles_2m = await fetch_candles_with_retry(
+                    self.client,
+                    sym,
+                    120,
+                    90,
+                    timeout_sec=CANDLE_FETCH_TIMEOUT_SEC,
+                )
+                support_2m, touches = find_strong_support_2m(candles_2m)
+                if support_2m is not None:
+                    log.info(
+                        "[STRAT-B] 📍 %s soporte fuerte 2m=%.5f (toques=%d)",
+                        sym,
+                        support_2m,
+                        touches,
+                    )
+                else:
+                    log.info("[STRAT-B] 📍 %s sin soporte fuerte 2m detectable", sym)
         elif strat_b_nearmiss:
             for sym, payout, conf, reason in sorted(strat_b_nearmiss, key=lambda x: -x[2])[:STRAT_B_LOG_TOP_N]:
                 log.info(
@@ -3014,6 +3303,19 @@ class ConsolidationBot:
 
         # 4) Seleccionar mejores
         selected, rejected = select_best(candidates, threshold=session_threshold)
+
+        forced_breakouts = [c for c in candidates if bool(getattr(c, "_force_execute", False))]
+        if forced_breakouts:
+            existing = {id(c) for c in selected}
+            for c in forced_breakouts:
+                if id(c) not in existing:
+                    selected.append(c)
+                    existing.add(id(c))
+            rejected = [c for c in rejected if id(c) not in {id(x) for x in forced_breakouts}]
+            log.warning(
+                "⚠ Modo FORCE_BREAKOUT: %d ruptura(s) fuerte(s) enviadas aun con score bajo umbral.",
+                len(forced_breakouts),
+            )
 
         # Registrar rechazados por score
         for c in rejected:
@@ -3120,7 +3422,7 @@ class ConsolidationBot:
                 f"en {winner.asset} payout={winner.payout}%",
                 stage,
                 journal_cid=cid,
-                signal_ts=winner.candles[-1].ts if winner.candles else None,
+                signal_ts=getattr(winner, "_signal_ts_1m", winner.candles[-1].ts if winner.candles else None),
                 strategy_origin="STRAT-A",
                 duration_sec=DURATION_SEC,
                 payout=winner.payout,
@@ -3135,16 +3437,27 @@ class ConsolidationBot:
     async def ensure_connection(self) -> bool:
         """Valida websocket activa y reintenta reconectar sin tumbar el loop 24/7."""
         try:
-            if await self.client.check_connect():
+            if await asyncio.wait_for(self.client.check_connect(), timeout=3.0):
                 return True
         except Exception:
             pass
 
         for attempt in range(1, HEALTHCHECK_RECONNECT_RETRIES + 1):
             try:
-                ok, reason = await self.client.connect()
+                try:
+                    await asyncio.wait_for(self.client.close(), timeout=2.0)
+                except Exception:
+                    pass
+
+                ok, reason = await asyncio.wait_for(
+                    self.client.connect(),
+                    timeout=RECONNECT_TIMEOUT_SEC,
+                )
                 if ok:
-                    await self.client.change_account(self.account_type)
+                    await asyncio.wait_for(
+                        self.client.change_account(self.account_type),
+                        timeout=RECONNECT_TIMEOUT_SEC,
+                    )
                     log.warning("🔌 Reconexión exitosa durante loop 24/7")
                     return True
                 reason_txt = str(reason)
@@ -3157,6 +3470,12 @@ class ConsolidationBot:
                     await asyncio.sleep(CF_403_BACKOFF_SEC)
                     continue
                 log.warning("Reconexión fallida (%d/%d): %s", attempt, HEALTHCHECK_RECONNECT_RETRIES, reason)
+            except asyncio.TimeoutError:
+                log.warning(
+                    "Reconexión timeout (%d/%d) en ensure_connection",
+                    attempt,
+                    HEALTHCHECK_RECONNECT_RETRIES,
+                )
             except Exception as exc:
                 log.warning("Excepción en reconexión: %s", exc)
             await asyncio.sleep(2.0)
@@ -3263,11 +3582,15 @@ class ConsolidationBot:
             self.compensation_pending = False
             self.last_closed_outcome  = "WIN"
             self.pending_martin.pop(sym, None)
-            log.info("✅ WIN registrado — próxima entrada usará monto inicial ($%.2f)", AMOUNT_INITIAL)
+            # Registrar ganancia en Martingale Calculator
+            self.martingale.register_win(trade.amount, trade.payout)
+            log.info("✅ WIN registrado — próxima entrada usará monto inicial")
         elif outcome == "LOSS":
             self.compensation_pending = True
             self.last_closed_amount   = trade.amount
             self.last_closed_outcome  = "LOSS"
+            # Registrar pérdida en Martingale Calculator
+            self.martingale.register_loss(trade.amount)
             skip_martin = False
             log.info(
                 "💔 LOSS registrado ($%.2f) — próxima entrada usará monto de compensación ($%.2f)",
@@ -3368,7 +3691,7 @@ class ConsolidationBot:
                 return False
             self.stats["martin_attempts_session"] += 1
 
-        if stage == "initial" and strategy_origin == "STRAT-A":
+        if stage in ("initial", "martin"):
             timing = await self._sync_to_next_candle_open(signal_ts)
             if journal_cid:
                 _j = get_journal()
@@ -3382,10 +3705,7 @@ class ConsolidationBot:
                     )
             if not timing.ok:
                 if journal_cid:
-                    if timing.lag_sec < 0:
-                        reject_reason = f"timing tardío: {-timing.lag_sec:.0f}s para cierre de vela 1m"
-                    else:
-                        reject_reason = f"desfase de entrada +{timing.lag_sec:.2f}s"
+                    reject_reason = f"timing 1m inválido: lag +{timing.lag_sec:.2f}s"
                     _j = get_journal()
                     if _j._conn is not None:
                         _j._conn.execute(
@@ -3668,6 +3988,10 @@ async def main(
                 break
             except Exception as exc:
                 log.error("Error en ciclo: %s", exc, exc_info=True)
+                if looks_like_connection_issue(str(exc)):
+                    log.warning("⚠ Error de conexión en ciclo; intentando reconectar inmediatamente...")
+                    if not await bot.ensure_connection():
+                        log.warning("⚠ Reconexión inmediata fallida; se reintentará en el siguiente ciclo.")
 
             bot.log_stats()
 
