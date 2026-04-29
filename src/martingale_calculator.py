@@ -57,10 +57,11 @@ class MartingaleCalculator:
     def _calculate_objective(self) -> float:
         """
         Calcula el próximo objetivo: próximo número entero par.
+        Siempre devuelve sin decimales (44.0, 46.0, etc.).
         Regla:
         - Si saldo es par exacto (ej: 42.00), objetivo = saldo + 2
-        - Si saldo tiene decimales (ej: 42.59), objetivo = próximo par (ej: 44)
-        Ej: 42.59 → 44, 42.00 → 44, 45.00 → 47
+        - Si saldo tiene decimales (ej: 42.92), objetivo = próximo par (ej: 44)
+        Ej: 42.92 → 44, 42.00 → 44, 45.00 → 47
         """
         if self.current_balance is None:
             return 0
@@ -68,10 +69,11 @@ class MartingaleCalculator:
         # Si es un número par exacto (entero), sumar INCREMENT
         if (self.current_balance == int(self.current_balance) and 
             int(self.current_balance) % 2 == 0):
-            return self.current_balance + self.INCREMENT
+            return float(int(self.current_balance + self.INCREMENT))
 
         # Si no es par exacto, ir al próximo par
-        return ceil(self.current_balance / self.INCREMENT) * self.INCREMENT
+        target = ceil(self.current_balance / self.INCREMENT) * self.INCREMENT
+        return float(int(target))  # Asegura número entero sin decimales
 
     def _round_up_to_cents(self, amount: float) -> float:
         """Redondea hacia arriba a centavos."""
@@ -131,6 +133,7 @@ class MartingaleCalculator:
     def register_win(self, amount_invested: float, payout_pct: int) -> Tuple[float, str]:
         """
         Registra ganancia y cierra ciclo.
+        El saldo se ajusta EXACTAMENTE al objetivo (número par entero, sin decimales).
 
         Args:
             amount_invested: Monto que se invirtió
@@ -142,19 +145,19 @@ class MartingaleCalculator:
         if self.current_balance is None:
             return 0, "ERROR_NO_BALANCE"
 
-        payout_rate = float(payout_pct) / 100.0
-        profit = amount_invested * payout_rate
-
-        # Fuerza el saldo exacto al objetivo (cierre limpio)
         old_balance = self.current_balance
-        self.current_balance = self.cycle_target if self.cycle_target else old_balance + profit
+        cycle_target = self.cycle_target if self.cycle_target else old_balance + 2
+
+        # IMPORTANTE: Fuerza el saldo exacto al objetivo (cierre limpio sin decimales)
+        # Esto asegura que siempre cierre en un número par exacto
+        self.current_balance = round(cycle_target)  # Redondea al entero más cercano
 
         # Resetea ciclo para próxima ronda
         self._reset_cycle()
 
         log.info(
-            "✅ WIN: %s + %.2f profit = %.2f (objetivo: %.2f)",
-            old_balance, profit, self.current_balance, self.cycle_target
+            "✅ WIN: %.2f → %.2f (objetivo: %.2f, ganancia ajustada)",
+            old_balance, self.current_balance, cycle_target
         )
 
         return self.current_balance, "CYCLE_CLOSED"
