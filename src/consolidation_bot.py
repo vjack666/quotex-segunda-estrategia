@@ -185,6 +185,8 @@ ADAPTIVE_THRESHOLD_WINDOW_SCANS = 10
 
 ASSET_LOSS_STREAK_LIMIT = 3
 ASSET_BLACKLIST_DURATION_MIN = 60
+# Máximo de entradas consecutivas sobre el mismo activo (0 = desactivar límite).
+MAX_CONSECUTIVE_ENTRIES_PER_ASSET = 2
 
 ORDER_BLOCK_LOOKBACK = 50
 ORDER_BLOCK_MAX_PER_SIDE = 3
@@ -909,6 +911,7 @@ class ConsolidationBot:
             "martin_attempts_session": 0,
             "martin_wins": 0,
             "martin_losses": 0,
+            "rejected_same_asset_limit": 0,
         }
         # Estado de compensación: si la última operación cerró LOSS,
         # la próxima entrada usará AMOUNT_MARTIN para cubrir esa pérdida.
@@ -943,6 +946,9 @@ class ConsolidationBot:
         # Umbral adaptativo de score basado en aceptación reciente por scan.
         self.accepted_scans_window: Deque[int] = deque(maxlen=ADAPTIVE_THRESHOLD_WINDOW_SCANS)
         self.current_score_threshold: int = ADAPTIVE_THRESHOLD_BASE
+        # Control de repetición de activo para evitar sobre-exposición por momentum.
+        self.last_entry_asset: Optional[str] = None
+        self.last_entry_asset_streak: int = 0
         # Blacklist temporal de activos por racha de pérdidas.
         self.asset_loss_streaks: dict[str, int] = {}
         self.asset_blacklist_until: dict[str, float] = {}
@@ -1227,6 +1233,32 @@ class ConsolidationBot:
             streak,
             ASSET_BLACKLIST_DURATION_MIN,
         )
+
+    def _can_enter_asset_now(self, asset: str, stage: str) -> Tuple[bool, str]:
+        """
+        Limita la sobre-repetición del mismo activo.
+        Nota: martingala queda exenta para no romper recuperación de ciclo.
+        """
+        if stage == "martin":
+            return True, "MARTIN_EXEMPT"
+        if MAX_CONSECUTIVE_ENTRIES_PER_ASSET <= 0:
+            return True, "LIMIT_DISABLED"
+        if self.last_entry_asset != asset:
+            return True, "NEW_ASSET"
+        if self.last_entry_asset_streak < MAX_CONSECUTIVE_ENTRIES_PER_ASSET:
+            return True, "WITHIN_LIMIT"
+        reason = (
+            f"máximo {MAX_CONSECUTIVE_ENTRIES_PER_ASSET} entradas consecutivas "
+            f"en {asset}"
+        )
+        return False, reason
+
+    def _register_successful_entry_asset(self, asset: str) -> None:
+        if self.last_entry_asset == asset:
+            self.last_entry_asset_streak += 1
+        else:
+            self.last_entry_asset = asset
+            self.last_entry_asset_streak = 1
 
     @staticmethod
     def _detect_order_blocks(candles: List[Candle]) -> dict[str, list[OrderBlock]]:
@@ -2141,6 +2173,7 @@ class ConsolidationBot:
             "amount_martin": AMOUNT_MARTIN,
             "max_concurrent_trades": MAX_CONCURRENT_TRADES,
             "cooldown_between_entries": COOLDOWN_BETWEEN_ENTRIES,
+            "max_consecutive_entries_per_asset": MAX_CONSECUTIVE_ENTRIES_PER_ASSET,
             "score_threshold_base": ADAPTIVE_THRESHOLD_BASE,
             "score_threshold_session": self.current_score_threshold,
             "volume_multiplier": VOLUME_MULTIPLIER,
@@ -2175,6 +2208,8 @@ class ConsolidationBot:
             "strat_b_can_trade": STRAT_B_CAN_TRADE,
             "strat_b_duration_sec": STRAT_B_DURATION_SEC,
             "strat_b_min_confidence": STRAT_B_MIN_CONFIDENCE,
+            "last_entry_asset": self.last_entry_asset,
+            "last_entry_asset_streak": self.last_entry_asset_streak,
             "greylist_assets": sorted(self.greylist_assets),
         }
 
@@ -3691,6 +3726,24 @@ class ConsolidationBot:
                 return False
             self.stats["martin_attempts_session"] += 1
 
+        can_enter_asset, same_asset_reason = self._can_enter_asset_now(sym, stage)
+        if not can_enter_asset:
+            self.stats["rejected_same_asset_limit"] += 1
+            log.info("⏭ %s: entrada bloqueada — %s", sym, same_asset_reason)
+            if journal_cid:
+                _j = get_journal()
+                if _j._conn is not None:
+                    _j._conn.execute(
+                        """UPDATE candidates
+                           SET decision='REJECTED_LIMIT',
+                               reject_reason=?,
+                               outcome='LIMIT_SKIPPED'
+                           WHERE id=?""",
+                        (same_asset_reason, journal_cid),
+                    )
+                    _j._conn.commit()
+            return False
+
         if stage in ("initial", "martin"):
             timing = await self._sync_to_next_candle_open(signal_ts)
             if journal_cid:
@@ -3747,6 +3800,8 @@ class ConsolidationBot:
                     )
                     _j._conn.commit()
             return False
+
+        self._register_successful_entry_asset(sym)
 
         self.trades[sym] = TradeState(
             asset=sym, direction=direction, amount=amount,
