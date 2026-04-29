@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from datetime import datetime, timezone
 from typing import List
 
@@ -25,10 +26,25 @@ class HubDashboard:
     TOTAL_WIDTH = 180
     BOX_WIDTH = 89
     BOX_ROWS = 10
+    _screen_initialized = False
 
     @classmethod
     def clear_screen(cls) -> None:
         os.system("cls" if os.name == "nt" else "clear")
+
+    @classmethod
+    def display_text(cls, text: str) -> None:
+        """Refresca en sitio para evitar parpadeo por limpiar pantalla completa."""
+        if not cls._screen_initialized:
+            cls.clear_screen()
+            cls._screen_initialized = True
+
+        # Cursor al origen + limpiar desde cursor hasta el final.
+        sys.stdout.write("\033[H\033[J")
+        sys.stdout.write(text)
+        if not text.endswith("\n"):
+            sys.stdout.write("\n")
+        sys.stdout.flush()
 
     @classmethod
     def _safe_trim(cls, text: str, width: int) -> str:
@@ -196,5 +212,4 @@ class HubDashboard:
 
     @classmethod
     def display(cls, state: HubState, balance: float = 0.0) -> None:
-        cls.clear_screen()
-        print(cls.render_full_dashboard(state, balance))
+        cls.display_text(cls.render_full_dashboard(state, balance))

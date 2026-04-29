@@ -111,8 +111,7 @@ def _apply_runtime_config(args: argparse.Namespace) -> None:
 
 async def _render_hub_once(bot=None) -> None:
     """Renderiza el panel HUB desde bot.hub o desde el log."""
-    import os
-    
+
     # Si tenemos acceso a bot.hub, usar eso directamente
     if bot is not None and hasattr(bot, 'hub'):
         try:
@@ -139,17 +138,32 @@ async def _render_hub_once(bot=None) -> None:
             lines = fh.readlines()
         snap = parser.parse_lines(lines[-600:])
         panel = render_dashboard(snap)
-        os.system("cls" if os.name == "nt" else "clear")
-        print(panel)
+        from hub.hub_dashboard import HubDashboard
+        HubDashboard.display_text(panel)
     except Exception as exc:
         print(f"[HUB] Error al renderizar el panel: {exc}")
 
 
 def _configure_hub_console(cb) -> None:
     """Reduce el ruido del logger en consola para que el dashboard quede visible."""
+    # Handler de consola definido en consolidation_bot.py
     stdout_handler = getattr(cb, "_stdout_handler", None)
     if stdout_handler is not None:
         stdout_handler.setLevel(logging.ERROR)
+
+    # Logger principal del bot
+    bot_log = getattr(cb, "log", None)
+    if bot_log is not None:
+        bot_log.setLevel(logging.ERROR)
+
+    # Root logger y librerias ruidosas
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.ERROR)
+    for handler in root_logger.handlers:
+        if isinstance(handler, logging.StreamHandler):
+            handler.setLevel(logging.ERROR)
+    logging.getLogger("pyquotex").setLevel(logging.CRITICAL)
+    logging.getLogger("websocket").setLevel(logging.CRITICAL)
 
 
 def _render_empty_hub() -> None:
@@ -158,6 +172,65 @@ def _render_empty_hub() -> None:
     from hub.hub_models import HubState
 
     HubDashboard.display(HubState(), balance=0.0)
+
+
+def _render_loading_hub(tick: int) -> None:
+    """Muestra HUB vacio con barra de progreso durante el primer escaneo."""
+    from hub.hub_dashboard import HubDashboard
+    from hub.hub_models import HubState
+
+    width = 28
+    fill = tick % (width + 1)
+    bar = "#" * fill + "." * (width - fill)
+    panel = HubDashboard.render_full_dashboard(HubState(), balance=0.0)
+    HubDashboard.display_text(panel + f"\nPrimer escaneo en progreso [{bar}]\n")
+
+
+async def _run_cycle_with_loading(cb, *, dry_run: bool, real_account: bool):
+    """Ejecuta un ciclo y muestra barra de carga hasta que termine."""
+    task = asyncio.create_task(
+        cb.main(
+            dry_run=dry_run,
+            real_account=real_account,
+            loop_forever=False,
+            on_cycle_end=_on_cycle_end,
+        )
+    )
+
+    tick = 0
+    while not task.done():
+        _render_loading_hub(tick)
+        tick += 1
+        await asyncio.sleep(1)
+
+    return await task
+
+
+async def _run_forever_with_initial_loading(cb, *, dry_run: bool, real_account: bool):
+    """Ejecuta loop continuo mostrando barra de carga hasta finalizar el primer ciclo."""
+    first_cycle_done = asyncio.Event()
+
+    async def _on_cycle_end_with_event(bot):
+        await _render_hub_once(bot)
+        if not first_cycle_done.is_set():
+            first_cycle_done.set()
+
+    task = asyncio.create_task(
+        cb.main(
+            dry_run=dry_run,
+            real_account=real_account,
+            loop_forever=True,
+            on_cycle_end=_on_cycle_end_with_event,
+        )
+    )
+
+    tick = 0
+    while not first_cycle_done.is_set() and not task.done():
+        _render_loading_hub(tick)
+        tick += 1
+        await asyncio.sleep(1)
+
+    return await task
 
 
 async def _on_cycle_end(bot) -> None:
@@ -171,22 +244,22 @@ async def _run(args: argparse.Namespace) -> None:
     hub_readonly = bool(args.hub_readonly)
     run_once = bool(args.once)
 
+    # El HUB se muestra siempre desde el inicio para evitar pantalla en blanco.
+    _configure_hub_console(cb)
+    _render_empty_hub()
+
     # En modo HUB no se ejecutan ordenes (dry_run=True), solo lectura/analisis.
     dry_run = hub_readonly
 
     if hub_readonly:
-        _configure_hub_console(cb)
-        _render_empty_hub()
-
         # Loop propio: un escaneo (loop_forever=False) → renderizar hub → esperar → repetir.
         # Esto garantiza que el panel se dibuje después de cada ciclo.
         while True:
             try:
-                bot = await cb.main(
+                bot = await _run_cycle_with_loading(
+                    cb,
                     dry_run=True,
                     real_account=bool(args.real),
-                    loop_forever=False,
-                    on_cycle_end=_on_cycle_end,
                 )
             except SystemExit as exc:
                 code = exc.code if isinstance(exc.code, int) else 1
@@ -202,12 +275,18 @@ async def _run(args: argparse.Namespace) -> None:
             except asyncio.CancelledError:
                 return
     else:
-        bot = await cb.main(
-            dry_run=dry_run,
-            real_account=bool(args.real),
-            loop_forever=not run_once,
-            on_cycle_end=_on_cycle_end,
-        )
+        if run_once:
+            bot = await _run_cycle_with_loading(
+                cb,
+                dry_run=dry_run,
+                real_account=bool(args.real),
+            )
+        else:
+            bot = await _run_forever_with_initial_loading(
+                cb,
+                dry_run=dry_run,
+                real_account=bool(args.real),
+            )
 
 
 if __name__ == "__main__":

@@ -185,6 +185,10 @@ SCAN_PROGRESS_EVERY = 10
 
 # Control de carga para evitar tormenta de requests simultáneas al broker.
 CANDLE_FETCH_CONCURRENCY = 2   # reducido a 2 para evitar mezcla de respuestas WebSocket
+SCAN_5M_PREFETCH_WINDOW = 8    # fetches 5m máximos en vuelo por ciclo
+H1_FETCH_CONCURRENCY = 2       # fetches H1 máximos en vuelo por ciclo
+OB_FETCH_CONCURRENCY = 2       # fetches de Order Block máximos en vuelo
+SCAN_CANDLES_BUFFER_MAX = 20   # buffers 1m/precio para pending_reversals
 
 # Sensor matemático para filtrar entradas con mejor expectativa
 HEALTHCHECK_RECONNECT_RETRIES = 2  # intentos por ciclo si cae websocket
@@ -1085,7 +1089,6 @@ class ConsolidationBot:
                 self.client,
                 asset,
                 60,
-                BROKEN_FOLLOWUP_1M_COUNT,
                 timeout_sec=CANDLE_FETCH_1M_TIMEOUT_SEC,
             )
             payload = json.loads(capture_file.read_text(encoding="utf-8"))
@@ -2629,6 +2632,8 @@ class ConsolidationBot:
 
         # Descarga paralela con límite de concurrencia para evitar timeouts masivos.
         fetch_sem = asyncio.Semaphore(CANDLE_FETCH_CONCURRENCY)
+        h1_fetch_sem = asyncio.Semaphore(H1_FETCH_CONCURRENCY)
+        ob_fetch_sem = asyncio.Semaphore(OB_FETCH_CONCURRENCY)
 
         async def _fetch_5m_limited(symbol: str) -> List[Candle]:
             async with fetch_sem:
@@ -2656,13 +2661,34 @@ class ConsolidationBot:
                     )
                 return result
 
+        async def _fetch_h1_limited(symbol: str) -> List[Candle]:
+            async with h1_fetch_sem:
+                return await fetch_candles_with_retry(
+                    self.client,
+                    symbol,
+                    H1_TF_SEC,
+                    H1_CANDLES_LOOKBACK,
+                    timeout_sec=H1_FETCH_TIMEOUT_SEC,
+                )
+
+        async def _fetch_ob_limited(symbol: str) -> List[Candle]:
+            async with ob_fetch_sem:
+                return await fetch_candles_with_retry(
+                    self.client,
+                    symbol,
+                    ORDER_BLOCK_TF_SEC,
+                    ORDER_BLOCK_CANDLES,
+                    timeout_sec=CANDLE_FETCH_TIMEOUT_SEC,
+                    retries=1,
+                )
+
         # Solo pre-lanzamos los fetches 5m en paralelo (concurrencia limitada).
         # Los fetches 1m se hacen de forma SECUENCIAL en el loop para evitar
         # que las respuestas WebSocket se mezclen entre activos.
-        candles_tasks = {
-            sym: asyncio.create_task(_fetch_5m_limited(sym), name=f"fetch_5m:{sym}")
-            for sym, _ in assets
-        }
+        candles_tasks: dict[str, asyncio.Task[List[Candle]]] = {}
+        prefetch_window = max(1, min(SCAN_5M_PREFETCH_WINDOW, len(assets)))
+        for sym, _ in assets[:prefetch_window]:
+            candles_tasks[sym] = asyncio.create_task(_fetch_5m_limited(sym), name=f"fetch_5m:{sym}")
 
         try:
             # Decrementar contadores de activos en cooldown post-fallo.
@@ -2673,6 +2699,15 @@ class ConsolidationBot:
                 self.failed_assets[a] -= 1
 
             for idx, (sym, payout) in enumerate(assets, start=1):
+                next_prefetch_idx = idx - 1 + prefetch_window
+                if next_prefetch_idx < len(assets):
+                    next_sym, _ = assets[next_prefetch_idx]
+                    if next_sym not in candles_tasks:
+                        candles_tasks[next_sym] = asyncio.create_task(
+                            _fetch_5m_limited(next_sym),
+                            name=f"fetch_5m:{next_sym}",
+                        )
+
                 if SCAN_PROGRESS_EVERY > 0 and (idx == 1 or idx % SCAN_PROGRESS_EVERY == 0 or idx == len(assets)):
                     log.info("⏱ Progreso scan: %d/%d activos", idx, len(assets))
 
@@ -2697,7 +2732,7 @@ class ConsolidationBot:
                              sym, self.failed_assets[sym])
                     continue
 
-                candles = await candles_tasks[sym]
+                candles = await candles_tasks.pop(sym)
 
                 # STRAT-B (Spring Sweep): fetch 1m SECUENCIAL para este activo.
                 # Un pequeño sleep antes del request 1m deja que el WebSocket
@@ -2706,6 +2741,8 @@ class ConsolidationBot:
                 strat_b_total += 1
                 candles_1m = await _fetch_1m_limited(sym)
                 candles_1m_collected[sym] = candles_1m
+                if len(candles_1m_collected) > SCAN_CANDLES_BUFFER_MAX:
+                    candles_1m_collected.pop(next(iter(candles_1m_collected)), None)
                 strat_b_signal = False
                 strat_b_info = {
                     "confidence": 0.0,
@@ -2918,14 +2955,10 @@ class ConsolidationBot:
                 # Precio válido — actualizar registro.
                 self.last_known_price[sym] = price
                 last_prices_collected[sym] = price
-                candles_ob = await fetch_candles_with_retry(
-                    self.client,
-                    sym,
-                    ORDER_BLOCK_TF_SEC,
-                    ORDER_BLOCK_CANDLES,
-                    timeout_sec=CANDLE_FETCH_TIMEOUT_SEC,
-                    retries=1,
-                )
+                if len(last_prices_collected) > SCAN_CANDLES_BUFFER_MAX:
+                    last_prices_collected.pop(next(iter(last_prices_collected)), None)
+
+                candles_ob = await _fetch_ob_limited(sym)
                 ob_tf_label = "3m"
                 if len(candles_ob) < 6:
                     candles_ob = candles
@@ -3190,13 +3223,7 @@ class ConsolidationBot:
                         continue
 
                 if H1_CONFIRM_ENABLED:
-                    h1_candles = await fetch_candles_with_retry(
-                        self.client,
-                        sym,
-                        H1_TF_SEC,
-                        H1_CANDLES_LOOKBACK,
-                        timeout_sec=H1_FETCH_TIMEOUT_SEC,
-                    )
+                    h1_candles = await _fetch_h1_limited(sym)
                     h1_trend = infer_h1_trend(h1_candles)
                     if (direction == "put" and h1_trend == "bullish") or (
                         direction == "call" and h1_trend == "bearish"
@@ -3204,13 +3231,7 @@ class ConsolidationBot:
                         self.stats["filtered_sensor"] += 1
                         continue
                 else:
-                    h1_candles = await fetch_candles_with_retry(
-                        self.client,
-                        sym,
-                        H1_TF_SEC,
-                        H1_CANDLES_LOOKBACK,
-                        timeout_sec=H1_FETCH_TIMEOUT_SEC,
-                    )
+                    h1_candles = await _fetch_h1_limited(sym)
 
                 candidate = CandidateEntry(
                     asset=sym,
@@ -3869,23 +3890,6 @@ class ConsolidationBot:
         payout: int = MIN_PAYOUT,
         score_original: float = 0.0,
     ) -> bool:
-        if self.compensation_pending and stage != "martin":
-            lock_reason = "gale activo: solo operación martingala cuenta"
-            log.info("⏭ %s: entrada bloqueada — %s", sym, lock_reason)
-            if journal_cid:
-                _j = get_journal()
-                if _j._conn is not None:
-                    _j._conn.execute(
-                        """UPDATE candidates
-                           SET decision='REJECTED_GALE_LOCK',
-                               reject_reason=?,
-                               outcome='GALE_LOCK_SKIPPED'
-                           WHERE id=?""",
-                        (lock_reason, journal_cid),
-                    )
-                    _j._conn.commit()
-            return False
-
         if stage == "martin":
             if not self._martin_session_available():
                 return False
