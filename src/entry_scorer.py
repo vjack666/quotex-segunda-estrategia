@@ -56,8 +56,8 @@ PAYOUT_MAX = 95
 # Contexto histórico: niveles swing en H1 (cubre ~3 días con 80 velas)
 HIST_LEVEL_TOUCH_PCT   = 0.0015  # 0.15% — proximidad para considerar "en el nivel"
 HIST_LEVEL_SWING_N     = 3       # velas a cada lado para confirmar pivote swing
-HIST_LEVEL_PUT_BONUS   = 18.0    # bonus PUT cuando precio choca con alto histórico (resistencia)
-HIST_LEVEL_CALL_BONUS  = 12.0    # bonus CALL cuando precio choca con bajo histórico (soporte)
+HIST_LEVEL_PUT_BONUS   = 18.0    # bonus PUT cuando precio choca con alto histórico
+HIST_LEVEL_CALL_BONUS  = 12.0    # bonus CALL cuando precio choca con bajo histórico
 HIST_LEVEL_PENALTY     = 12.0    # penalización si operamos contra el nivel histórico
 
 # Ajuste por antigüedad de zona (minutos → puntos: negativos penalizan, positivos bonifican)
@@ -80,7 +80,6 @@ class CandidateEntry:
     reversal_strength: float = 0.0
     reversal_confirms: bool = False
     mode: SignalMode = SignalMode.REBOUND
-    # Velas H1 históricas (hasta ~3 días) para detección de altos/bajos antiguos.
     candles_h1: List[Candle] = field(default_factory=list)
 
     def __str__(self) -> str:
@@ -263,59 +262,37 @@ def _age_adjustment(zone: ConsolidationZone) -> float:
 def detect_swing_levels(
     candles_h1: List[Candle],
     n: int = HIST_LEVEL_SWING_N,
-) -> tuple:
-    """
-    Detecta pivotes swing high/low en velas H1 (context histórico de 2-3 días).
-
-    Un swing high: la vela i tiene el HIGH más alto de las N velas anteriores y N siguientes.
-    Un swing low:  la vela i tiene el LOW más bajo  de las N velas anteriores y N siguientes.
-
-    Retorna (List[float] swing_highs, List[float] swing_lows).
-    """
+) -> tuple[List[float], List[float]]:
+    """Detecta pivotes swing high/low en velas H1 para contexto histórico."""
     highs: List[float] = []
     lows: List[float] = []
     if len(candles_h1) < 2 * n + 1:
         return highs, lows
-    for i in range(n, len(candles_h1) - n):
-        c = candles_h1[i]
-        left  = candles_h1[i - n: i]
-        right = candles_h1[i + 1: i + n + 1]
-        if all(c.high >= lc.high for lc in left) and all(c.high >= rc.high for rc in right):
-            highs.append(c.high)
-        if all(c.low <= lc.low for lc in left) and all(c.low <= rc.low for rc in right):
-            lows.append(c.low)
+
+    for index in range(n, len(candles_h1) - n):
+        candle = candles_h1[index]
+        left = candles_h1[index - n:index]
+        right = candles_h1[index + 1:index + n + 1]
+        if all(candle.high >= item.high for item in left) and all(candle.high >= item.high for item in right):
+            highs.append(candle.high)
+        if all(candle.low <= item.low for item in left) and all(candle.low <= item.low for item in right):
+            lows.append(candle.low)
     return highs, lows
 
 
-def _score_historical_level(entry: "CandidateEntry") -> float:
-    """
-    Ajuste de score por proximidad a altos/bajos históricos detectados en H1.
-
-    Lógica:
-    - Precio cerca de un SWING HIGH (resistencia histórica):
-        → PUT alineado:  +HIST_LEVEL_PUT_BONUS  (mercado rechaza el nivel, ideal para venta)
-        → CALL contra:   -HIST_LEVEL_PENALTY     (llamada contra resistencia, penalizar)
-    - Precio cerca de un SWING LOW (soporte histórico):
-        → CALL alineado: +HIST_LEVEL_CALL_BONUS  (soporte histórico, ideal para compra)
-        → PUT contra:    -HIST_LEVEL_PENALTY      (venta contra soporte, penalizar)
-    """
+def _score_historical_level(entry: CandidateEntry) -> float:
+    """Ajuste por cercanía a soportes/resistencias históricas detectadas en H1."""
     if not entry.candles_h1:
         return 0.0
 
-    # Precio actual: cierre de la última vela disponible
-    if entry.candles:
-        price = float(entry.candles[-1].close)
-    else:
-        price = float(entry.candles_h1[-1].close)
-
+    price = float(entry.candles[-1].close) if entry.candles else float(entry.candles_h1[-1].close)
     swing_highs, swing_lows = detect_swing_levels(entry.candles_h1)
     if not swing_highs and not swing_lows:
         return 0.0
 
-    tol = price * HIST_LEVEL_TOUCH_PCT
-
-    near_high = any(abs(price - h) <= tol for h in swing_highs)
-    near_low  = any(abs(price - l) <= tol for l in swing_lows)
+    tolerance = price * HIST_LEVEL_TOUCH_PCT
+    near_high = any(abs(price - level) <= tolerance for level in swing_highs)
+    near_low = any(abs(price - level) <= tolerance for level in swing_lows)
 
     if near_high:
         return HIST_LEVEL_PUT_BONUS if entry.direction == "put" else -HIST_LEVEL_PENALTY
@@ -409,13 +386,12 @@ def explain_score(entry: CandidateEntry, threshold: int = SCORE_THRESHOLD) -> st
     mode_label = entry.mode.value.upper()
     age_adjustment = bd.get("age_adjustment", 0.0)
     age_txt = f" (ajuste antigüedad zona: {age_adjustment:+.1f})" if age_adjustment != 0 else ""
-
     hist_adj = bd.get("hist_level", 0.0)
     hist_txt = ""
     if hist_adj > 0:
-        hist_txt = f" | 🟣 Alto histórico resistencia → {hist_adj:+.1f} pts"
+        hist_txt = f" | nivel histórico {hist_adj:+.1f}"
     elif hist_adj < 0:
-        hist_txt = f" | 🔴 Contra nivel histórico → {hist_adj:+.1f} pts"
+        hist_txt = f" | contra nivel histórico {hist_adj:+.1f}"
 
     if entry.mode == SignalMode.BREAKOUT:
         w = WEIGHTS_BREAKOUT
@@ -428,7 +404,7 @@ def explain_score(entry: CandidateEntry, threshold: int = SCORE_THRESHOLD) -> st
             f"| S3 Tendencia  : {bd.get('trend', 0):5.1f} / {w['trend']}",
             f"| S4 Payout     : {bd.get('payout', 0):5.1f} / {w['payout']} (payout={entry.payout}%)",
             f"| Zona edad     : {entry.zone.age_minutes:.0f} min → ajuste {age_adjustment:+.1f} pts",
-            f"| Alto histórico : ajuste {hist_adj:+.1f} pts  ({'PUT alineado con resistencia' if hist_adj > 0 else 'CALL contra resistencia' if hist_adj < 0 else 'sin nivel próximo'})",
+            f"| Nivel H1      : ajuste {hist_adj:+.1f} pts",
             "+--------------------------------------------",
         ]
     else:
@@ -442,7 +418,7 @@ def explain_score(entry: CandidateEntry, threshold: int = SCORE_THRESHOLD) -> st
             f"| S3 Tendencia  : {bd.get('trend', 0):5.1f} / {w['trend']}",
             f"| S4 Payout     : {bd.get('payout', 0):5.1f} / {w['payout']} (payout={entry.payout}%)",
             f"| Zona edad     : {entry.zone.age_minutes:.0f} min → ajuste {age_adjustment:+.1f} pts",
-            f"| Alto histórico : ajuste {hist_adj:+.1f} pts  ({'PUT alineado con resistencia' if hist_adj > 0 else 'CALL contra resistencia' if hist_adj < 0 else 'sin nivel próximo'})",
+            f"| Nivel H1      : ajuste {hist_adj:+.1f} pts",
             "+--------------------------------------------",
         ]
     return "\n".join(lines)

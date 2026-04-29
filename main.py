@@ -2,6 +2,7 @@ import sys
 import io
 import argparse
 import asyncio
+import logging
 from pathlib import Path
 
 # Forzar UTF-8 en stdout/stderr para evitar UnicodeEncodeError en Windows (CP1252).
@@ -35,8 +36,18 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     # Gestión de capital / martingala
-    p.add_argument("--amount-initial", type=float, default=1.0, help="Monto base por entrada")
-    p.add_argument("--amount-martin", type=float, default=3.0, help="Monto de martingala")
+    p.add_argument(
+        "--amount-initial",
+        type=float,
+        default=1.0,
+        help="Monto mínimo de orden para la calculadora de riesgo",
+    )
+    p.add_argument(
+        "--amount-martin",
+        type=float,
+        default=2.0,
+        help="Incremento objetivo por ciclo para la calculadora de riesgo",
+    )
     p.add_argument("--max-loss-session", type=float, default=0.20, help="Stop-loss de sesión (fracción)")
 
     # Perfil estilo Excel / Masaniello (ejemplo: 5 operaciones, 2 ITM)
@@ -71,10 +82,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _apply_runtime_config(args: argparse.Namespace) -> None:
     import consolidation_bot as cb
+    from martingale_calculator import MartingaleCalculator
 
-    cb.AMOUNT_INITIAL = float(args.amount_initial)
-    cb.AMOUNT_MARTIN = float(args.amount_martin)
     cb.MAX_LOSS_SESSION = float(args.max_loss_session)
+
+    # La gestión de montos ya no usa variables globales del bot; se configura
+    # directamente sobre la calculadora dinámica de riesgo.
+    MartingaleCalculator.MIN_ORDER_AMOUNT = max(0.01, float(args.amount_initial))
+    MartingaleCalculator.INCREMENT = max(0.01, float(args.amount_martin))
 
     cb.CYCLE_MAX_OPERATIONS = int(args.cycle_ops)
     cb.CYCLE_TARGET_WINS = int(args.cycle_wins)
@@ -94,9 +109,27 @@ def _apply_runtime_config(args: argparse.Namespace) -> None:
         cb.ALIGN_SCAN_TO_CANDLE = False
 
 
-async def _render_hub_once() -> None:
-    """Parsea el log y dibuja el panel HUB en la terminal."""
+async def _render_hub_once(bot=None) -> None:
+    """Renderiza el panel HUB desde bot.hub o desde el log."""
     import os
+    
+    # Si tenemos acceso a bot.hub, usar eso directamente
+    if bot is not None and hasattr(bot, 'hub'):
+        try:
+            from hub.hub_dashboard import HubDashboard
+            state = bot.hub.get_state()
+            if getattr(state, "total_scans", 0) > 0 or getattr(state, "last_scan", None) is not None:
+                balance = bot.current_balance or 0.0
+                HubDashboard.display(state, balance=balance)
+                return
+        except Exception as exc:
+            log_msg = f"[HUB] Error al renderizar desde bot.hub: {exc}"
+            if hasattr(bot, 'log'):
+                # Si bot tiene log, usarlo
+                pass
+            print(log_msg)
+    
+    # Fallback: parsear el log file
     try:
         from hub.parser import HubLogParser
         from hub.render import render_dashboard
@@ -112,6 +145,25 @@ async def _render_hub_once() -> None:
         print(f"[HUB] Error al renderizar el panel: {exc}")
 
 
+def _configure_hub_console(cb) -> None:
+    """Reduce el ruido del logger en consola para que el dashboard quede visible."""
+    stdout_handler = getattr(cb, "_stdout_handler", None)
+    if stdout_handler is not None:
+        stdout_handler.setLevel(logging.ERROR)
+
+
+def _render_empty_hub() -> None:
+    """Muestra la estructura del HUB antes del primer escaneo."""
+    from hub.hub_dashboard import HubDashboard
+    from hub.hub_models import HubState
+
+    HubDashboard.display(HubState(), balance=0.0)
+
+
+async def _on_cycle_end(bot) -> None:
+    await _render_hub_once(bot)
+
+
 async def _run(args: argparse.Namespace) -> None:
     import consolidation_bot as cb
 
@@ -123,14 +175,18 @@ async def _run(args: argparse.Namespace) -> None:
     dry_run = hub_readonly
 
     if hub_readonly:
+        _configure_hub_console(cb)
+        _render_empty_hub()
+
         # Loop propio: un escaneo (loop_forever=False) → renderizar hub → esperar → repetir.
         # Esto garantiza que el panel se dibuje después de cada ciclo.
         while True:
             try:
-                await cb.main(
+                bot = await cb.main(
                     dry_run=True,
                     real_account=bool(args.real),
                     loop_forever=False,
+                    on_cycle_end=_on_cycle_end,
                 )
             except SystemExit as exc:
                 code = exc.code if isinstance(exc.code, int) else 1
@@ -139,8 +195,6 @@ async def _run(args: argparse.Namespace) -> None:
                 if run_once:
                     return
                 continue
-            # Renderizar el panel HUB después del escaneo.
-            await _render_hub_once()
             if run_once:
                 return
             try:
@@ -148,10 +202,11 @@ async def _run(args: argparse.Namespace) -> None:
             except asyncio.CancelledError:
                 return
     else:
-        await cb.main(
+        bot = await cb.main(
             dry_run=dry_run,
             real_account=bool(args.real),
             loop_forever=not run_once,
+            on_cycle_end=_on_cycle_end,
         )
 
 

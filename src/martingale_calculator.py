@@ -196,45 +196,41 @@ class MartingaleCalculator:
 
         log.info(
             "❌ LOSS (gale %d): %.2f - %.2f = %.2f (objetivo: %.2f)",
-            self.cycle_losses, old_balance, amount_invested, self.current_balance, self.cycle_target
+            self.cycle_losses,
+            old_balance,
+            amount_invested,
+            self.current_balance,
+            self.cycle_target,
         )
 
         return self.current_balance, f"GALE_{self.cycle_losses}"
 
     def check_10_percent_risk(self, proposed_investment: float) -> Tuple[bool, str]:
-        """
-        Verifica si la inversión propuesta respeta la regla del 10%.
-
-        Args:
-            proposed_investment: Monto a verificar
-
-        Returns:
-            Tupla (es_seguro, mensaje)
-        """
+        """Verifica si una inversión propuesta respeta la regla del 10%."""
         if self.current_balance is None or self.current_balance <= 0:
             return False, "NO_BALANCE"
 
         limit = self.current_balance * self.MAX_RISK_PCT
-        safe = proposed_investment <= limit
-
-        if not safe:
-            msg = f"⚠️ Riesgo excesivo: ${proposed_investment:.2f} > 10% de ${self.current_balance:.2f} (${limit:.2f})"
-            return False, msg
+        if proposed_investment > limit:
+            return False, (
+                f"⚠️ Riesgo excesivo: ${proposed_investment:.2f} > 10% de "
+                f"${self.current_balance:.2f} (${limit:.2f})"
+            )
 
         return True, "OK"
 
     def get_status(self) -> dict:
-        """Retorna estado actual del ciclo."""
+        """Retorna el estado actual del ciclo de riesgo."""
         return {
             "balance": self.current_balance,
             "target": self.cycle_target,
             "profit_needed": (self.cycle_target - self.current_balance) if self.cycle_target else 0,
             "losses": self.cycle_losses,
-            "risk_limit_10pct": (self.current_balance * 0.1) if self.current_balance else 0,
+            "risk_limit_10pct": (self.current_balance * self.MAX_RISK_PCT) if self.current_balance else 0,
         }
 
     def format_status(self) -> str:
-        """Retorna estado formateado para logging."""
+        """Retorna el estado del ciclo formateado para logging."""
         status = self.get_status()
         return (
             f"Balance: ${status['balance']:.2f} | "

@@ -75,9 +75,41 @@ from candle_patterns import (
 from strategy_spring_sweep import detect_spring_or_upthrust
 from trade_journal import get_journal
 from martingale_calculator import MartingaleCalculator
+from hub.hub_scanner import HubScanner
+from hub.hub_models import CandidateData
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 _stdout_handler = logging.StreamHandler(sys.stdout)
+
+
+def _clear_quotex_session(client: Any) -> None:
+    """Limpia token/cookies cacheados para forzar reautenticación tras un 403."""
+    email = str(getattr(client, "email", EMAIL) or EMAIL or "").strip().lower()
+
+    for attr in ("token", "cookies", "ssid"):
+        if hasattr(client, attr):
+            try:
+                setattr(client, attr, None)
+            except Exception:
+                pass
+
+    session_paths = [ROOT / "session.json", ROOT / "sessions" / "session.json"]
+    for session_path in session_paths:
+        try:
+            if not session_path.exists():
+                continue
+            payload = json.loads(session_path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                if email and email in payload:
+                    payload.pop(email, None)
+                else:
+                    payload.clear()
+                session_path.write_text(
+                    json.dumps(payload, indent=4, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+        except Exception as exc:
+            log.debug("No se pudo limpiar %s: %s", session_path, exc)
 # Forzar UTF-8 en la consola de Windows (evita UnicodeEncodeError con símbolos de caja).
 if hasattr(_stdout_handler.stream, "reconfigure"):
     try:
@@ -948,6 +980,10 @@ class ConsolidationBot:
         self.last_entry_asset: Optional[str] = None
         self.last_entry_asset_streak: int = 0
         # Blacklist temporal de activos por racha de pérdidas.
+        # Hub para registrar candidatos en tiempo real
+        self.hub = HubScanner()
+        self.last_scan_strat_a: List[CandidateData] = []
+        self.last_scan_strat_b: List[CandidateData] = []
         self.asset_loss_streaks: dict[str, int] = {}
         self.asset_blacklist_until: dict[str, float] = {}
         # Estado técnico por activo para filtros adicionales.
@@ -1131,6 +1167,70 @@ class ConsolidationBot:
         expected_profit = self._round_up_to_cents(amount * payout_rate)
 
         return amount, expected_profit
+
+    def _record_hub_scan_cycle(self, total_assets: int) -> None:
+        """Actualiza el estado del HUB con los candidatos del ciclo actual."""
+        try:
+            strat_a_for_hub = []
+            for candidate in self.last_scan_strat_a[:5]:
+                try:
+                    cd = CandidateData(
+                        strategy="STRAT-A",
+                        asset=candidate.asset,
+                        direction=candidate.direction,
+                        score=candidate.score,
+                        payout=candidate.payout,
+                        zone_ceiling=candidate.zone.ceiling if candidate.zone else 0.0,
+                        zone_floor=candidate.zone.floor if candidate.zone else 0.0,
+                        zone_age_min=candidate.zone.age_minutes if candidate.zone else 0.0,
+                        pattern=getattr(candidate, "_reversal_pattern", "none"),
+                        pattern_strength=getattr(candidate, "_reversal_strength", 0.0),
+                        entry_mode=getattr(
+                            candidate,
+                            "_entry_mode",
+                            candidate.mode.value if hasattr(candidate, "mode") else "rebound_floor",
+                        ),
+                        confidence=None,
+                        signal_type=None,
+                    )
+                    strat_a_for_hub.append(cd)
+                except Exception as exc:
+                    log.debug("HUB: Error converting STRAT-A candidate: %s", exc)
+
+            strat_b_for_hub = []
+            for candidate in self.last_scan_strat_b[:5]:
+                try:
+                    cd = CandidateData(
+                        strategy="STRAT-B",
+                        asset=candidate.asset,
+                        direction=candidate.direction,
+                        score=candidate.score,
+                        payout=candidate.payout,
+                        zone_ceiling=candidate.zone.ceiling if candidate.zone else 0.0,
+                        zone_floor=candidate.zone.floor if candidate.zone else 0.0,
+                        zone_age_min=candidate.zone.age_minutes if candidate.zone else 0.0,
+                        pattern=getattr(candidate, "_reversal_pattern", "Spring Sweep"),
+                        pattern_strength=getattr(candidate, "_reversal_strength", 0.0),
+                        entry_mode=getattr(candidate, "_entry_mode", "rebound_floor"),
+                        confidence=getattr(candidate, "_reversal_strength", None),
+                        signal_type=getattr(candidate, "_reversal_pattern", None),
+                    )
+                    strat_b_for_hub.append(cd)
+                except Exception as exc:
+                    log.debug("HUB: Error converting STRAT-B candidate: %s", exc)
+
+            self.hub.record_scan_cycle(
+                total_assets=total_assets,
+                strat_a_candidates=strat_a_for_hub,
+                strat_b_candidates=strat_b_for_hub,
+                balance=self.current_balance,
+                cycle_id=self.cycle_id,
+                cycle_ops=self.cycle_ops,
+                cycle_wins=self.cycle_wins,
+                cycle_losses=self.cycle_losses,
+            )
+        except Exception as exc:
+            log.debug("Hub registration error: %s", exc)
 
     async def _get_asset_payout(self, asset: str, default: int = MIN_PAYOUT) -> int:
         try:
@@ -2519,6 +2619,10 @@ class ConsolidationBot:
         strat_b_timeout = 0  # fetches 1m que devolvieron 0 velas (timeout)
         strat_b_hits: list[tuple[str, int, float]] = []
         strat_b_nearmiss: list[tuple[str, int, float, str]] = []
+        
+        # Limpiar registro de candidatos para este ciclo
+        self.last_scan_strat_a = []
+        self.last_scan_strat_b = []
         # Acumuladores para pending_reversals (populados durante el loop).
         candles_1m_collected: dict[str, list] = {}
         last_prices_collected: dict[str, float] = {}
@@ -2684,6 +2788,9 @@ class ConsolidationBot:
                     )
                     setattr(b_candidate, "_reversal_pattern", strat_b_signal_type or "none")
                     setattr(b_candidate, "_reversal_strength", strat_b_conf)
+                    
+                    # Guardar para registro en HUB
+                    self.last_scan_strat_b.append(b_candidate)
 
                     b_strategy = self._strategy_snapshot()
                     b_strategy.update(
@@ -3207,6 +3314,7 @@ class ConsolidationBot:
                 )
 
                 candidates.append(candidate)
+                self.last_scan_strat_a.append(candidate)
                 await asyncio.sleep(0.30)  # breve pausa para separar respuestas WebSocket
         finally:
             pending_5m = [t for t in candles_tasks.values() if not t.done()]
@@ -3287,6 +3395,7 @@ class ConsolidationBot:
         candidates, pending_martin_entered = await self._process_pending_martin(candidates)
         if pending_martin_entered:
             await sleep_with_inline_countdown(COOLDOWN_BETWEEN_ENTRIES, "⏳ Cooldown post-martin diferido")
+            self._record_hub_scan_cycle(total_assets_available)
             return
 
         prev_threshold = self.current_score_threshold
@@ -3312,6 +3421,7 @@ class ConsolidationBot:
         if not candidates:
             log.info("  Sin señales este ciclo.")
             self._record_scan_acceptances(0)
+            self._record_hub_scan_cycle(total_assets_available)
             return
 
         log.info(
@@ -3404,6 +3514,7 @@ class ConsolidationBot:
             )
             self.stats["skipped"] += len(candidates)
             self._record_scan_acceptances(0)
+            self._record_hub_scan_cycle(total_assets_available)
             return
 
         log.info("[STRAT-A] 🏆 Mejor(es) seleccionado(s): %d de %d candidatos",
@@ -3437,6 +3548,7 @@ class ConsolidationBot:
                 )
             self.stats["skipped"] += len(selected)
             self._record_scan_acceptances(0)
+            self._record_hub_scan_cycle(total_assets_available)
             return
 
         for winner in selected:
@@ -3493,6 +3605,7 @@ class ConsolidationBot:
 
         self.stats["skipped"] += len(rejected)
         self._record_scan_acceptances(accepted_this_scan)
+        self._record_hub_scan_cycle(total_assets_available)
 
     async def ensure_connection(self) -> bool:
         """Valida websocket activa y reintenta reconectar sin tumbar el loop 24/7."""
@@ -3527,6 +3640,7 @@ class ConsolidationBot:
                         attempt,
                         HEALTHCHECK_RECONNECT_RETRIES,
                     )
+                    _clear_quotex_session(self.client)
                     await asyncio.sleep(CF_403_BACKOFF_SEC)
                     continue
                 log.warning("Reconexión fallida (%d/%d): %s", attempt, HEALTHCHECK_RECONNECT_RETRIES, reason)
@@ -4006,6 +4120,7 @@ async def connect_with_retry(client: Quotex) -> Tuple[bool, str]:
                 CONNECT_RETRIES,
                 CF_403_BACKOFF_SEC,
             )
+            _clear_quotex_session(client)
             await asyncio.sleep(CF_403_BACKOFF_SEC)
         else:
             await asyncio.sleep(1.5)
@@ -4017,7 +4132,8 @@ async def main(
     real_account: bool,
     loop_forever: bool,
     greylist_assets: Optional[set[str]] = None,
-) -> None:
+    on_cycle_end: Optional[Any] = None,
+) -> Optional[ConsolidationBot]:
     if not EMAIL or not PASSWORD:
         print("ERROR: Falta QUOTEX_EMAIL / QUOTEX_PASSWORD en el .env")
         sys.exit(1)
@@ -4100,6 +4216,14 @@ async def main(
 
             bot.log_stats()
 
+            if on_cycle_end is not None:
+                try:
+                    callback_result = on_cycle_end(bot)
+                    if asyncio.iscoroutine(callback_result):
+                        await callback_result
+                except Exception as exc:
+                    log.debug("HUB callback error: %s", exc)
+
             if not loop_forever:
                 log.info("Ciclo único completado. Agrega --loop para modo 24/7.")
                 break
@@ -4128,6 +4252,7 @@ async def main(
         except Exception:
             pass
         log.info("Bot detenido.")
+        return bot
 
 
 def parse_args() -> argparse.Namespace:
