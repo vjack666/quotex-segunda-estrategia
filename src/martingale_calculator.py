@@ -25,6 +25,7 @@ class MartingaleCalculator:
     MIN_ORDER_AMOUNT = 1.00  # Monto mínimo de orden
     MAX_RISK_PCT = 0.10  # Máximo 10% del saldo por operación
     PRECISION_CENTS = 0.01  # Redondear a centavos
+    RESET_BALANCE_THRESHOLD = 100.0  # Si saldo <= umbral y hay 3 pérdidas, reinicia ciclo
 
     def __init__(self, current_balance: Optional[float] = None):
         """
@@ -183,11 +184,12 @@ class MartingaleCalculator:
 
         self.cycle_losses += 1
 
-        # Regla de reset: 3 pérdidas seguidas si saldo <= $50
-        if self.current_balance <= 50.0 and self.cycle_losses >= 3:
+        # Regla de reset: 3 pérdidas seguidas si saldo <= $100
+        if self.current_balance <= self.RESET_BALANCE_THRESHOLD and self.cycle_losses >= 3:
             log.warning(
-                "🔄 RESET por 3 pérdidas (saldo: %.2f <= $50)",
-                self.current_balance
+                "🔄 RESET por 3 pérdidas (saldo: %.2f <= $%.0f)",
+                self.current_balance,
+                self.RESET_BALANCE_THRESHOLD,
             )
             self._reset_cycle()
             return self.current_balance, "RESET_3_LOSSES"

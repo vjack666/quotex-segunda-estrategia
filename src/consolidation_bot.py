@@ -214,6 +214,8 @@ TARGET_MIN_PROFIT      = 1.00  # objetivo mínimo neto por entrada inicial
 MARTIN_TARGET_PROFIT   = 1.00  # objetivo neto adicional en martingala/compensación
 MARTIN_MAX_PCT_BALANCE = 0.20  # cap global: martingala <= 20% del balance actual
 MARTIN_MAX_ATTEMPTS_SESSION = 2
+MARTIN_LOW_BALANCE_THRESHOLD = 100.0
+MARTIN_MAX_ATTEMPTS_LOW_BALANCE = 3
 PENDING_RECONCILE_AGE_MIN = 15.0
 MARTIN_MONITOR_INTERVAL_SEC = 10.0
 MARTIN_ALERT_PCT       = 0.0005  # 0.05% en contra = pérdida probable
@@ -1644,13 +1646,22 @@ class ConsolidationBot:
         log.info("[CICLO #%d] MA state: %s", cycle_num, self._build_ma_summary_line(cycle_ma_summary))
         log.info("══════════════════════════════════════")
 
+    def _current_martin_attempt_limit(self) -> int:
+        balance = self.current_balance
+        if balance is None:
+            balance = self.martingale.current_balance
+        if balance is not None and balance < MARTIN_LOW_BALANCE_THRESHOLD:
+            return MARTIN_MAX_ATTEMPTS_LOW_BALANCE
+        return MARTIN_MAX_ATTEMPTS_SESSION
+
     def _martin_session_available(self) -> bool:
         used = int(self.stats.get("martin_attempts_session", 0))
-        if used >= MARTIN_MAX_ATTEMPTS_SESSION:
+        max_attempts = self._current_martin_attempt_limit()
+        if used >= max_attempts:
             log.info(
                 "⛔ Martingala desactivada: límite de sesión alcanzado (%d/%d)",
                 used,
-                MARTIN_MAX_ATTEMPTS_SESSION,
+                max_attempts,
             )
             return False
         return True
@@ -2174,6 +2185,9 @@ class ConsolidationBot:
             "max_concurrent_trades": MAX_CONCURRENT_TRADES,
             "cooldown_between_entries": COOLDOWN_BETWEEN_ENTRIES,
             "max_consecutive_entries_per_asset": MAX_CONSECUTIVE_ENTRIES_PER_ASSET,
+            "martin_low_balance_threshold": MARTIN_LOW_BALANCE_THRESHOLD,
+            "martin_max_attempts_low_balance": MARTIN_MAX_ATTEMPTS_LOW_BALANCE,
+            "martin_max_attempts_session": MARTIN_MAX_ATTEMPTS_SESSION,
             "score_threshold_base": ADAPTIVE_THRESHOLD_BASE,
             "score_threshold_session": self.current_score_threshold,
             "volume_multiplier": VOLUME_MULTIPLIER,
@@ -3625,7 +3639,16 @@ class ConsolidationBot:
             self.last_closed_amount   = trade.amount
             self.last_closed_outcome  = "LOSS"
             # Registrar pérdida en Martingale Calculator
-            self.martingale.register_loss(trade.amount)
+            _, loss_status = self.martingale.register_loss(trade.amount)
+            if loss_status == "RESET_3_LOSSES":
+                # Reset operativo completo tras 3 pérdidas en saldo bajo.
+                self.compensation_pending = False
+                self.pending_martin.pop(sym, None)
+                log.warning(
+                    "🔁 %s: gale reiniciado tras 3 pérdidas con saldo bajo; "
+                    "se vuelve al ciclo base de +$2",
+                    sym,
+                )
             skip_martin = False
             log.info(
                 "💔 LOSS registrado ($%.2f) — próxima entrada usará monto de compensación ($%.2f)",
@@ -3870,7 +3893,7 @@ class ConsolidationBot:
         log.info(
             "📊 MARTIN | Sesión:%d/%d  Wins:%d  Losses:%d",
             self.stats.get("martin_attempts_session", 0),
-            MARTIN_MAX_ATTEMPTS_SESSION,
+            self._current_martin_attempt_limit(),
             self.stats.get("martin_wins", 0),
             self.stats.get("martin_losses", 0),
         )

@@ -18,7 +18,7 @@ Se mantiene el patron de breakout/momentum en activos muy volatiles porque fue c
 ## Guardrail agregado
 Para evitar sobreexposicion en un mismo activo:
 
-- Maximo 2 entradas consecutivas por activo
+- Maximo 2 entradas consecutivas por activo en caso de que el primer trade sea ganador o perdedor y las condiciones sean adecuadas
 - La tercera entrada seguida del mismo activo se bloquea
 - Se registra en caja negra como:
   - decision = REJECTED_LIMIT
@@ -27,3 +27,8 @@ Para evitar sobreexposicion en un mismo activo:
 
 ## Excepcion aplicada
 La etapa martin queda exenta de este limite para no romper la recuperacion del ciclo.
+
+## Regla adicional de gale (saldo bajo)
+- Si el saldo actual es menor a $100, se permiten hasta 3 intentos de gale en sesion.
+- Si se pierden esos 3 intentos, la calculadora reinicia el ciclo.
+- El reinicio vuelve al esquema base de incremento de $2 por ciclo.
