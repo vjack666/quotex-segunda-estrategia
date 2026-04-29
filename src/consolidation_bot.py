@@ -2381,6 +2381,14 @@ class ConsolidationBot:
                 # Necesitamos velas 5m para construir el CandidateEntry — solo tenemos 1m aquí,
                 # así que usamos una lista vacía: el score se basará en zona/payout/trend de 1m.
                 candles_5m: list = []
+                # Fetch H1 para niveles históricos
+                h1_hist: List[Candle] = await fetch_candles_with_retry(
+                    self.client,
+                    sym,
+                    H1_TF_SEC,
+                    H1_CANDLES_LOOKBACK,
+                    timeout_sec=H1_FETCH_TIMEOUT_SEC,
+                )
                 candidate = CandidateEntry(
                     asset=sym,
                     payout=payout,
@@ -2388,6 +2396,7 @@ class ConsolidationBot:
                     direction=pr.proposed_direction,
                     candles=candles_5m,
                 )
+                candidate.candles_h1 = h1_hist
                 candidate._reversal_pattern = pattern_name  # type: ignore[attr-defined]
                 candidate._reversal_strength = strength  # type: ignore[attr-defined]
                 candidate._reversal_confirms = confirms  # type: ignore[attr-defined]
@@ -3087,6 +3096,14 @@ class ConsolidationBot:
                     ):
                         self.stats["filtered_sensor"] += 1
                         continue
+                else:
+                    h1_candles = await fetch_candles_with_retry(
+                        self.client,
+                        sym,
+                        H1_TF_SEC,
+                        H1_CANDLES_LOOKBACK,
+                        timeout_sec=H1_FETCH_TIMEOUT_SEC,
+                    )
 
                 candidate = CandidateEntry(
                     asset=sym,
@@ -3095,6 +3112,7 @@ class ConsolidationBot:
                     direction=direction,
                     candles=candles,
                 )
+                candidate.candles_h1 = h1_candles
 
                 candidate._reversal_pattern = pattern_name  # type: ignore[attr-defined]
                 candidate._reversal_strength = strength  # type: ignore[attr-defined]

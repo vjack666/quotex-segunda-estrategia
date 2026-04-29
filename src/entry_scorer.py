@@ -53,6 +53,13 @@ TREND_EMA_SLOW = 20
 PAYOUT_MIN = 80
 PAYOUT_MAX = 95
 
+# Contexto histórico: niveles swing en H1 (cubre ~3 días con 80 velas)
+HIST_LEVEL_TOUCH_PCT   = 0.0015  # 0.15% — proximidad para considerar "en el nivel"
+HIST_LEVEL_SWING_N     = 3       # velas a cada lado para confirmar pivote swing
+HIST_LEVEL_PUT_BONUS   = 18.0    # bonus PUT cuando precio choca con alto histórico (resistencia)
+HIST_LEVEL_CALL_BONUS  = 12.0    # bonus CALL cuando precio choca con bajo histórico (soporte)
+HIST_LEVEL_PENALTY     = 12.0    # penalización si operamos contra el nivel histórico
+
 # Ajuste por antigüedad de zona (minutos → puntos: negativos penalizan, positivos bonifican)
 
 
@@ -73,6 +80,8 @@ class CandidateEntry:
     reversal_strength: float = 0.0
     reversal_confirms: bool = False
     mode: SignalMode = SignalMode.REBOUND
+    # Velas H1 históricas (hasta ~3 días) para detección de altos/bajos antiguos.
+    candles_h1: List[Candle] = field(default_factory=list)
 
     def __str__(self) -> str:
         bd = self.score_breakdown
@@ -251,6 +260,70 @@ def _age_adjustment(zone: ConsolidationZone) -> float:
     return 5.0
 
 
+def detect_swing_levels(
+    candles_h1: List[Candle],
+    n: int = HIST_LEVEL_SWING_N,
+) -> tuple:
+    """
+    Detecta pivotes swing high/low en velas H1 (context histórico de 2-3 días).
+
+    Un swing high: la vela i tiene el HIGH más alto de las N velas anteriores y N siguientes.
+    Un swing low:  la vela i tiene el LOW más bajo  de las N velas anteriores y N siguientes.
+
+    Retorna (List[float] swing_highs, List[float] swing_lows).
+    """
+    highs: List[float] = []
+    lows: List[float] = []
+    if len(candles_h1) < 2 * n + 1:
+        return highs, lows
+    for i in range(n, len(candles_h1) - n):
+        c = candles_h1[i]
+        left  = candles_h1[i - n: i]
+        right = candles_h1[i + 1: i + n + 1]
+        if all(c.high >= lc.high for lc in left) and all(c.high >= rc.high for rc in right):
+            highs.append(c.high)
+        if all(c.low <= lc.low for lc in left) and all(c.low <= rc.low for rc in right):
+            lows.append(c.low)
+    return highs, lows
+
+
+def _score_historical_level(entry: "CandidateEntry") -> float:
+    """
+    Ajuste de score por proximidad a altos/bajos históricos detectados en H1.
+
+    Lógica:
+    - Precio cerca de un SWING HIGH (resistencia histórica):
+        → PUT alineado:  +HIST_LEVEL_PUT_BONUS  (mercado rechaza el nivel, ideal para venta)
+        → CALL contra:   -HIST_LEVEL_PENALTY     (llamada contra resistencia, penalizar)
+    - Precio cerca de un SWING LOW (soporte histórico):
+        → CALL alineado: +HIST_LEVEL_CALL_BONUS  (soporte histórico, ideal para compra)
+        → PUT contra:    -HIST_LEVEL_PENALTY      (venta contra soporte, penalizar)
+    """
+    if not entry.candles_h1:
+        return 0.0
+
+    # Precio actual: cierre de la última vela disponible
+    if entry.candles:
+        price = float(entry.candles[-1].close)
+    else:
+        price = float(entry.candles_h1[-1].close)
+
+    swing_highs, swing_lows = detect_swing_levels(entry.candles_h1)
+    if not swing_highs and not swing_lows:
+        return 0.0
+
+    tol = price * HIST_LEVEL_TOUCH_PCT
+
+    near_high = any(abs(price - h) <= tol for h in swing_highs)
+    near_low  = any(abs(price - l) <= tol for l in swing_lows)
+
+    if near_high:
+        return HIST_LEVEL_PUT_BONUS if entry.direction == "put" else -HIST_LEVEL_PENALTY
+    if near_low:
+        return HIST_LEVEL_CALL_BONUS if entry.direction == "call" else -HIST_LEVEL_PENALTY
+    return 0.0
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  FUNCIÓN PRINCIPAL DE SCORING
 # ─────────────────────────────────────────────────────────────────────────────
@@ -275,8 +348,9 @@ def score_candidate(
         s_trend    = _score_trend(entry.candles, entry.direction, w["trend"])
         s_payout   = _score_payout(entry.payout, w["payout"])
         age_adj    = _age_adjustment(entry.zone)
+        hist_adj   = _score_historical_level(entry)
 
-        total = s_comp + s_momentum + s_trend + s_payout + age_adj
+        total = s_comp + s_momentum + s_trend + s_payout + age_adj + hist_adj
         entry.score = round(total, 1)
         entry.score_breakdown = {
             "compression": s_comp,
@@ -287,6 +361,8 @@ def score_candidate(
             # alias para compatibilidad con código que lee "bounce"
             "bounce":      s_momentum,
         }
+        if hist_adj != 0.0:
+            entry.score_breakdown["hist_level"] = round(hist_adj, 1)
     else:
         w = WEIGHTS_REBOUND
         s_comp    = _score_compression(entry.zone, w["compression"])
@@ -294,8 +370,9 @@ def score_candidate(
         s_trend   = _score_trend(entry.candles, entry.direction, w["trend"])
         s_payout  = _score_payout(entry.payout, w["payout"])
         age_adj   = _age_adjustment(entry.zone)
+        hist_adj  = _score_historical_level(entry)
 
-        total = s_comp + s_bounce + s_trend + s_payout + age_adj
+        total = s_comp + s_bounce + s_trend + s_payout + age_adj + hist_adj
         entry.score = round(total, 1)
         entry.score_breakdown = {
             "compression": s_comp,
@@ -304,6 +381,8 @@ def score_candidate(
             "payout":      s_payout,
             "age_adjustment": age_adj,
         }
+        if hist_adj != 0.0:
+            entry.score_breakdown["hist_level"] = round(hist_adj, 1)
 
     return entry.score
 
@@ -331,30 +410,39 @@ def explain_score(entry: CandidateEntry, threshold: int = SCORE_THRESHOLD) -> st
     age_adjustment = bd.get("age_adjustment", 0.0)
     age_txt = f" (ajuste antigüedad zona: {age_adjustment:+.1f})" if age_adjustment != 0 else ""
 
+    hist_adj = bd.get("hist_level", 0.0)
+    hist_txt = ""
+    if hist_adj > 0:
+        hist_txt = f" | 🟣 Alto histórico resistencia → {hist_adj:+.1f} pts"
+    elif hist_adj < 0:
+        hist_txt = f" | 🔴 Contra nivel histórico → {hist_adj:+.1f} pts"
+
     if entry.mode == SignalMode.BREAKOUT:
         w = WEIGHTS_BREAKOUT
         lines = [
             f"+- SCORE BREAKDOWN [{mode_label}]: {entry.asset} ({entry.direction.upper()}) -",
-            f"| Score total   : {entry.score:5.1f} / 100  {'OK' if entry.score >= threshold else 'SKIP'}{age_txt}",
+            f"| Score total   : {entry.score:5.1f} / 100  {'OK' if entry.score >= threshold else 'SKIP'}{age_txt}{hist_txt}",
             f"| Min threshold : {threshold}",
             f"| S1 Compresión : {bd.get('compression', 0):5.1f} / {w['compression']} (range={entry.zone.range_pct*100:.3f}% bars={entry.zone.bars_inside})",
             f"| S2 Momentum   : {bd.get('momentum', 0):5.1f} / {w['momentum']}",
             f"| S3 Tendencia  : {bd.get('trend', 0):5.1f} / {w['trend']}",
             f"| S4 Payout     : {bd.get('payout', 0):5.1f} / {w['payout']} (payout={entry.payout}%)",
             f"| Zona edad     : {entry.zone.age_minutes:.0f} min → ajuste {age_adjustment:+.1f} pts",
+            f"| Alto histórico : ajuste {hist_adj:+.1f} pts  ({'PUT alineado con resistencia' if hist_adj > 0 else 'CALL contra resistencia' if hist_adj < 0 else 'sin nivel próximo'})",
             "+--------------------------------------------",
         ]
     else:
         w = WEIGHTS_REBOUND
         lines = [
             f"+- SCORE BREAKDOWN [{mode_label}]: {entry.asset} ({entry.direction.upper()}) -",
-            f"| Score total   : {entry.score:5.1f} / 100  {'OK' if entry.score >= threshold else 'SKIP'}{age_txt}",
+            f"| Score total   : {entry.score:5.1f} / 100  {'OK' if entry.score >= threshold else 'SKIP'}{age_txt}{hist_txt}",
             f"| Min threshold : {threshold}",
             f"| S1 Compresión : {bd.get('compression', 0):5.1f} / {w['compression']} (range={entry.zone.range_pct*100:.3f}% bars={entry.zone.bars_inside})",
             f"| S2 Rebote     : {bd.get('bounce', 0):5.1f} / {w['bounce']}",
             f"| S3 Tendencia  : {bd.get('trend', 0):5.1f} / {w['trend']}",
             f"| S4 Payout     : {bd.get('payout', 0):5.1f} / {w['payout']} (payout={entry.payout}%)",
             f"| Zona edad     : {entry.zone.age_minutes:.0f} min → ajuste {age_adjustment:+.1f} pts",
+            f"| Alto histórico : ajuste {hist_adj:+.1f} pts  ({'PUT alineado con resistencia' if hist_adj > 0 else 'CALL contra resistencia' if hist_adj < 0 else 'sin nivel próximo'})",
             "+--------------------------------------------",
         ]
     return "\n".join(lines)
