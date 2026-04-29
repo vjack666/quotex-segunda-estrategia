@@ -3744,6 +3744,23 @@ class ConsolidationBot:
         payout: int = MIN_PAYOUT,
         score_original: float = 0.0,
     ) -> bool:
+        if self.compensation_pending and stage != "martin":
+            lock_reason = "gale activo: solo operación martingala cuenta"
+            log.info("⏭ %s: entrada bloqueada — %s", sym, lock_reason)
+            if journal_cid:
+                _j = get_journal()
+                if _j._conn is not None:
+                    _j._conn.execute(
+                        """UPDATE candidates
+                           SET decision='REJECTED_GALE_LOCK',
+                               reject_reason=?,
+                               outcome='GALE_LOCK_SKIPPED'
+                           WHERE id=?""",
+                        (lock_reason, journal_cid),
+                    )
+                    _j._conn.commit()
+            return False
+
         if stage == "martin":
             if not self._martin_session_available():
                 return False
