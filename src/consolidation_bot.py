@@ -112,8 +112,6 @@ TOUCH_TOLERANCE_PCT    = 0.00035 # 0.035% — tolerancia para "tocar" techo/piso
 MAX_CONSOLIDATION_MIN  = 0       # 0 = sin límite de tiempo para descartar zona
 MIN_PAYOUT             = 80      # payout mínimo %
 DURATION_SEC           = 30      # duración fija de cada opción binaria (30s)
-AMOUNT_INITIAL         = 1.00    # capital inicial $
-AMOUNT_MARTIN          = 3.00    # martingala $
 SCAN_INTERVAL_SEC      = 60      # segundos entre escaneos completos
 CONNECT_RETRIES        = 3       # reintentos de conexión con delay
 MAX_CONCURRENT_TRADES  = 1       # máximo de operaciones abiertas simultáneas
@@ -210,8 +208,6 @@ BROKER_TZ_LABEL = "UTC-3"
 
 # Gestión de monto dinámico para cerrar en enteros y evitar centavos residuales.
 MIN_ORDER_AMOUNT       = 1.00
-TARGET_MIN_PROFIT      = 1.00  # objetivo mínimo neto por entrada inicial
-MARTIN_TARGET_PROFIT   = 1.00  # objetivo neto adicional en martingala/compensación
 MARTIN_MAX_PCT_BALANCE = 0.20  # cap global: martingala <= 20% del balance actual
 MARTIN_MAX_ATTEMPTS_SESSION = 2
 MARTIN_LOW_BALANCE_THRESHOLD = 100.0
@@ -916,7 +912,7 @@ class ConsolidationBot:
             "rejected_same_asset_limit": 0,
         }
         # Estado de compensación: si la última operación cerró LOSS,
-        # la próxima entrada usará AMOUNT_MARTIN para cubrir esa pérdida.
+        # la próxima entrada usará monto dinámico de compensación para cubrir esa pérdida.
         self.compensation_pending:  bool  = False
         self.last_closed_amount:    float = 0.0
         self.last_closed_outcome:   str   = ""
@@ -2180,8 +2176,6 @@ class ConsolidationBot:
             "max_consolidation_min": MAX_CONSOLIDATION_MIN,
             "min_payout": MIN_PAYOUT,
             "duration_sec": DURATION_SEC,
-            "amount_initial": AMOUNT_INITIAL,
-            "amount_martin": AMOUNT_MARTIN,
             "max_concurrent_trades": MAX_CONCURRENT_TRADES,
             "cooldown_between_entries": COOLDOWN_BETWEEN_ENTRIES,
             "max_consecutive_entries_per_asset": MAX_CONSECUTIVE_ENTRIES_PER_ASSET,
@@ -3372,7 +3366,7 @@ class ConsolidationBot:
                 c,
                 decision="REJECTED_SCORE",
                 reject_reason=f"score={c.score:.1f} < umbral dinámico {session_threshold}",
-                amount=getattr(c, "_amount", AMOUNT_INITIAL),
+                amount=getattr(c, "_amount", 0.0),
                 stage=getattr(c, "_stage", "initial"),
                 strategy=self._strategy_snapshot(),
             )
@@ -3419,7 +3413,7 @@ class ConsolidationBot:
                     c,
                     decision="REJECTED_LIMIT",
                     reject_reason=f"trades abiertos={len(self.trades)}/{MAX_CONCURRENT_TRADES} — vigilado",
-                    amount=getattr(c, "_amount", AMOUNT_INITIAL),
+                    amount=getattr(c, "_amount", 0.0),
                     stage=getattr(c, "_stage", "initial"),
                     strategy=self._strategy_snapshot(),
                 )
@@ -3433,23 +3427,22 @@ class ConsolidationBot:
                     winner,
                     decision="REJECTED_LIMIT",
                     reject_reason=f"trades abiertos={len(self.trades)}/{MAX_CONCURRENT_TRADES}",
-                    amount=getattr(winner, "_amount", AMOUNT_INITIAL),
+                    amount=getattr(winner, "_amount", 0.0),
                     stage=getattr(winner, "_stage", "initial"),
                     strategy=self._strategy_snapshot(),
                 )
                 break
             log.info(explain_score(winner, threshold=session_threshold))
-            amount = getattr(winner, "_amount", AMOUNT_INITIAL)
+            amount = getattr(winner, "_amount", 0.0)
             stage = getattr(winner, "_stage", "initial")
             # Si hay compensación pendiente por LOSS anterior, escalar el monto
             if self.compensation_pending and stage == "initial":
                 amount, exp_profit = self._compute_compensation_amount(winner.payout, self.last_closed_amount)
                 log.info(
-                    "🔁 COMPENSACIÓN activa — monto dinámico $%.2f | payout=%d%% | recup=%.2f + objetivo=$%.2f (est. neto=%.2f)",
+                    "🔁 COMPENSACIÓN activa — monto dinámico $%.2f | payout=%d%% | recup=%.2f (est. neto=%.2f)",
                     amount,
                     winner.payout,
                     self.last_closed_amount,
-                    MARTIN_TARGET_PROFIT,
                     exp_profit,
                 )
             # Pre-registrar como ACCEPTED (outcome se actualiza después)
@@ -3651,8 +3644,8 @@ class ConsolidationBot:
                 )
             skip_martin = False
             log.info(
-                "💔 LOSS registrado ($%.2f) — próxima entrada usará monto de compensación ($%.2f)",
-                trade.amount, AMOUNT_MARTIN,
+                "💔 LOSS registrado ($%.2f) — próxima entrada usará monto de compensación dinámico",
+                trade.amount,
             )
             if (not trade.martin_fired) and trade.stage != "martin":
                 if trade.score_original < 70.0:
@@ -4019,8 +4012,7 @@ async def main(
     log.info("║  Modo    : %-34s║", "LIVE" if not dry_run else "DRY-RUN")
     log.info("║  Velas   : %-2d min  Rango: %.1f%%  Timeout: %dmin ║",
              MIN_CONSOLIDATION_BARS, MAX_RANGE_PCT * 100, MAX_CONSOLIDATION_MIN)
-    log.info("║  Capital : $%.2f inicial → $%.2f martingala   ║",
-             AMOUNT_INITIAL, AMOUNT_MARTIN)
+    log.info("║  Montos  : dinámicos (MartingaleCalculator)   ║")
     log.info("║  Payout  : %d%%  |  Vol filtro: %.1fx avg body ║",
              MIN_PAYOUT, VOLUME_MULTIPLIER)
     log.info("╚══════════════════════════════════════════════╝")
