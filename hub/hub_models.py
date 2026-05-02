@@ -145,6 +145,26 @@ class HubScanSnapshot:
 
 
 @dataclass
+class GaleState:
+    """Estado en tiempo real del GaleWatcher (motor de compensación)."""
+    active:          bool  = False   # hay una operación siendo vigilada
+    asset:           str   = ""
+    direction:       str   = ""      # "call" | "put"
+    entry_price:     float = 0.0
+    current_price:   float = 0.0
+    secs_remaining:  float = 0.0
+    duration_sec:    int   = 300
+    payout:          int   = 0
+    amount_invested: float = 0.0     # monto de la operación base
+    gale_amount:     float = 0.0     # monto calculado para el gale (según calculadora)
+    is_losing:       bool  = False
+    delta_pct:       float = 0.0     # variación % precio vs entrada
+    gale_fired:      bool  = False   # ya se disparó el gale
+    gale_order_id:   str   = ""      # order_id del gale si fue enviado
+    gale_success:    bool  = False   # True si el broker aceptó el gale
+
+
+@dataclass
 class HubState:
     """Estado global del HUB en ejecución."""
 
@@ -165,10 +185,12 @@ class HubState:
     live_wins: int = 0
     live_losses: int = 0
     known_balance: float = 0.0  # último balance conocido (se actualiza al conectar y en cada scan)
+    gale: "GaleState" = field(default_factory=lambda: GaleState())  # estado del GaleWatcher
 
 
 __all__ = [
     "CandidateData",
+    "GaleState",
     "HubScanSnapshot",
     "HubState",
     "VALID_DIRECTIONS",

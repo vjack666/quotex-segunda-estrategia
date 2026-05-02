@@ -105,6 +105,17 @@ CREATE TABLE IF NOT EXISTS candidates (
     outcome          TEXT DEFAULT 'PENDING', -- WIN | LOSS | PENDING | DRY_RUN
     profit           REAL DEFAULT 0.0,
     closed_at        TEXT,
+    order_ref        INTEGER DEFAULT 0,
+    strategy_origin  TEXT DEFAULT 'STRAT-A',
+    ticket_open_price REAL,
+    ticket_close_price REAL,
+    ticket_opened_at TEXT,
+    ticket_closed_at TEXT,
+    ticket_duration_sec INTEGER,
+    ticket_price_diff REAL,
+    pre_objectives_json TEXT,
+    pre_objectives_ok INTEGER,
+    pre_objectives_note TEXT,
 
     -- Velas (JSON) para reproducir el análisis después
     candles_json     TEXT,
@@ -191,6 +202,28 @@ class Journal:
             self._conn.execute("ALTER TABLE candidates ADD COLUMN entry_duration_sec INTEGER")
         if "entry_timing_decision" not in cols:
             self._conn.execute("ALTER TABLE candidates ADD COLUMN entry_timing_decision TEXT")
+        if "order_ref" not in cols:
+            self._conn.execute("ALTER TABLE candidates ADD COLUMN order_ref INTEGER DEFAULT 0")
+        if "strategy_origin" not in cols:
+            self._conn.execute("ALTER TABLE candidates ADD COLUMN strategy_origin TEXT DEFAULT 'STRAT-A'")
+        if "ticket_open_price" not in cols:
+            self._conn.execute("ALTER TABLE candidates ADD COLUMN ticket_open_price REAL")
+        if "ticket_close_price" not in cols:
+            self._conn.execute("ALTER TABLE candidates ADD COLUMN ticket_close_price REAL")
+        if "ticket_opened_at" not in cols:
+            self._conn.execute("ALTER TABLE candidates ADD COLUMN ticket_opened_at TEXT")
+        if "ticket_closed_at" not in cols:
+            self._conn.execute("ALTER TABLE candidates ADD COLUMN ticket_closed_at TEXT")
+        if "ticket_duration_sec" not in cols:
+            self._conn.execute("ALTER TABLE candidates ADD COLUMN ticket_duration_sec INTEGER")
+        if "ticket_price_diff" not in cols:
+            self._conn.execute("ALTER TABLE candidates ADD COLUMN ticket_price_diff REAL")
+        if "pre_objectives_json" not in cols:
+            self._conn.execute("ALTER TABLE candidates ADD COLUMN pre_objectives_json TEXT")
+        if "pre_objectives_ok" not in cols:
+            self._conn.execute("ALTER TABLE candidates ADD COLUMN pre_objectives_ok INTEGER")
+        if "pre_objectives_note" not in cols:
+            self._conn.execute("ALTER TABLE candidates ADD COLUMN pre_objectives_note TEXT")
         # Migración: tabla expired_zones (bases anteriores sin ella)
         self._conn.executescript(
             "CREATE TABLE IF NOT EXISTS expired_zones ("
@@ -286,6 +319,19 @@ class Journal:
           REJECTED_NO_SIGNAL— sin señal válida (no era techo/piso)
         """
         bd = entry.score_breakdown
+        strategy_payload = dict(strategy or {})
+        strategy_payload["pattern_snapshot"] = {
+            "stage": stage,
+            "entry_mode": str(getattr(entry, "_entry_mode", "") or ""),
+            "force_execute": bool(getattr(entry, "_force_execute", False)),
+            "reversal_pattern": getattr(entry, "_reversal_pattern", getattr(entry, "reversal_pattern", "none")),
+            "reversal_strength": float(getattr(entry, "_reversal_strength", getattr(entry, "reversal_strength", 0.0)) or 0.0),
+            "reversal_confirms": bool(getattr(entry, "_reversal_confirms", getattr(entry, "reversal_confirms", False))),
+            "signal_ts_1m": getattr(entry, "_signal_ts_1m", None),
+            "order_block_info": str(getattr(entry, "_ob_info", "") or ""),
+            "ma_info": str(getattr(entry, "_ma_info", "") or ""),
+            "score_breakdown": dict(bd),
+        }
 
         # Serializar velas (últimas 20 para no inflar la BD)
         candles_data = []
@@ -327,7 +373,7 @@ class Journal:
                 entry.zone.age_minutes,
                 decision, reject_reason, order_id, outcome,
                 json.dumps(candles_data),
-                json.dumps(strategy or {}),
+                json.dumps(strategy_payload, ensure_ascii=False),
             ),
         )
         self._conn.commit()
@@ -450,6 +496,156 @@ class Journal:
             (outcome, profit, _now(), row_id),
         )
         self._conn.commit()
+
+    def update_ticket_details(
+        self,
+        *,
+        row_id: Optional[int] = None,
+        order_id: str = "",
+        order_ref: int = 0,
+        strategy_origin: str = "",
+        open_price: Optional[float] = None,
+        close_price: Optional[float] = None,
+        opened_at: str = "",
+        closed_at: str = "",
+        duration_sec: Optional[int] = None,
+        price_diff: Optional[float] = None,
+        pre_objectives: Optional[dict] = None,
+        pre_objectives_ok: Optional[bool] = None,
+        pre_objectives_note: str = "",
+    ) -> None:
+        """Actualiza trazabilidad de ticket para una fila de candidato."""
+        if row_id is None and not order_id:
+            return
+
+        payload_json = json.dumps(pre_objectives or {}, ensure_ascii=False) if pre_objectives is not None else None
+        ok_val = None if pre_objectives_ok is None else int(bool(pre_objectives_ok))
+
+        if row_id is not None:
+            self._conn.execute(
+                """UPDATE candidates
+                   SET order_ref=COALESCE(NULLIF(?, 0), order_ref),
+                       strategy_origin=COALESCE(NULLIF(?, ''), strategy_origin),
+                       ticket_open_price=COALESCE(?, ticket_open_price),
+                       ticket_close_price=COALESCE(?, ticket_close_price),
+                       ticket_opened_at=COALESCE(NULLIF(?, ''), ticket_opened_at),
+                       ticket_closed_at=COALESCE(NULLIF(?, ''), ticket_closed_at),
+                       ticket_duration_sec=COALESCE(?, ticket_duration_sec),
+                       ticket_price_diff=COALESCE(?, ticket_price_diff),
+                       pre_objectives_json=COALESCE(?, pre_objectives_json),
+                       pre_objectives_ok=COALESCE(?, pre_objectives_ok),
+                       pre_objectives_note=COALESCE(NULLIF(?, ''), pre_objectives_note)
+                   WHERE id=?""",
+                (
+                    int(order_ref),
+                    strategy_origin,
+                    open_price,
+                    close_price,
+                    opened_at,
+                    closed_at,
+                    int(duration_sec) if duration_sec is not None else None,
+                    price_diff,
+                    payload_json,
+                    ok_val,
+                    pre_objectives_note,
+                    int(row_id),
+                ),
+            )
+        else:
+            self._conn.execute(
+                """UPDATE candidates
+                   SET order_ref=COALESCE(NULLIF(?, 0), order_ref),
+                       strategy_origin=COALESCE(NULLIF(?, ''), strategy_origin),
+                       ticket_open_price=COALESCE(?, ticket_open_price),
+                       ticket_close_price=COALESCE(?, ticket_close_price),
+                       ticket_opened_at=COALESCE(NULLIF(?, ''), ticket_opened_at),
+                       ticket_closed_at=COALESCE(NULLIF(?, ''), ticket_closed_at),
+                       ticket_duration_sec=COALESCE(?, ticket_duration_sec),
+                       ticket_price_diff=COALESCE(?, ticket_price_diff),
+                       pre_objectives_json=COALESCE(?, pre_objectives_json),
+                       pre_objectives_ok=COALESCE(?, pre_objectives_ok),
+                       pre_objectives_note=COALESCE(NULLIF(?, ''), pre_objectives_note)
+                   WHERE order_id=?""",
+                (
+                    int(order_ref),
+                    strategy_origin,
+                    open_price,
+                    close_price,
+                    opened_at,
+                    closed_at,
+                    int(duration_sec) if duration_sec is not None else None,
+                    price_diff,
+                    payload_json,
+                    ok_val,
+                    pre_objectives_note,
+                    order_id,
+                ),
+            )
+        self._conn.commit()
+
+    def print_ticket_audit(self, ticket_id: str) -> None:
+        """Muestra detalle de ticket y comparación pre-ejecución."""
+        def _fetch_row(conn: sqlite3.Connection):
+            return conn.execute(
+            """SELECT id, order_id, order_ref, asset, payout, direction, amount, stage,
+                      strategy_origin, score, decision, outcome, profit,
+                      ticket_open_price, ticket_close_price, ticket_opened_at,
+                      ticket_closed_at, ticket_duration_sec, ticket_price_diff,
+                      pre_objectives_ok, pre_objectives_note, pre_objectives_json,
+                      strategy_json
+               FROM candidates
+               WHERE order_id=? OR id=?
+               ORDER BY id DESC LIMIT 1""",
+                (ticket_id, int(ticket_id) if ticket_id.isdigit() else -1),
+            ).fetchone()
+
+        row = _fetch_row(self._conn)
+        db_used = str(self.db_path)
+
+        if not row:
+            for db_file in sorted(_DB_DIR.glob("trade_journal-*.db")):
+                if str(db_file) == str(self.db_path):
+                    continue
+                try:
+                    conn = sqlite3.connect(str(db_file), check_same_thread=False)
+                    conn.row_factory = sqlite3.Row
+                    found = _fetch_row(conn)
+                    conn.close()
+                    if found:
+                        row = found
+                        db_used = str(db_file)
+                        break
+                except Exception:
+                    continue
+            if not row:
+                print(f"No se encontró ticket: {ticket_id}")
+                return
+
+        print(f"\n{'═'*78}")
+        print("  AUDITORIA DE TICKET")
+        print(f"{'═'*78}")
+        print(f"  DB origen       : {db_used}")
+        print(f"  DB id           : {row['id']}")
+        print(f"  Ticket id       : {row['order_id']}")
+        print(f"  Ticket ref      : {row['order_ref']}")
+        print(f"  Activo          : {row['asset']}  ({row['payout']}%)")
+        print(f"  Operación       : {str(row['direction']).upper()}  stage={row['stage']}  estrategia={row['strategy_origin']}")
+        print(f"  Resultado       : {row['outcome']}  profit={float(row['profit'] or 0):.2f}")
+        print(f"  Precio apertura : {row['ticket_open_price']}")
+        print(f"  Precio cierre   : {row['ticket_close_price']}")
+        print(f"  Hora apertura   : {row['ticket_opened_at']}")
+        print(f"  Hora cierre     : {row['ticket_closed_at']}")
+        print(f"  Duración (seg)  : {row['ticket_duration_sec']}")
+        print(f"  Diferencia      : {row['ticket_price_diff']}")
+
+        pre_ok = row["pre_objectives_ok"]
+        pre_label = "N/A" if pre_ok is None else ("OK" if int(pre_ok) == 1 else "NO")
+        print(f"  Objetivos pre   : {pre_label}")
+        if row["pre_objectives_note"]:
+            print(f"  Nota objetivos  : {row['pre_objectives_note']}")
+        if row["pre_objectives_json"]:
+            print(f"  Detalle pre     : {row['pre_objectives_json']}")
+        print(f"{'═'*78}\n")
 
     # ── Reporte de rendimiento ────────────────────────────────────────────────
     def print_report(self, days: int = 30) -> None:
@@ -660,10 +856,13 @@ def _now() -> str:
 if __name__ == "__main__":
     import sys as _sys
 
-    days_arg = int(_sys.argv[1]) if len(_sys.argv) > 1 else 30
     j = Journal()
-    j.print_report(days=days_arg)
-    j.print_rejected(n=15)
+    if len(_sys.argv) > 2 and _sys.argv[1] == "--ticket":
+        j.print_ticket_audit(_sys.argv[2])
+    else:
+        days_arg = int(_sys.argv[1]) if len(_sys.argv) > 1 else 30
+        j.print_report(days=days_arg)
+        j.print_rejected(n=15)
 
-    if len(_sys.argv) > 2 and _sys.argv[2] == "--csv":
-        j.export_csv()
+        if len(_sys.argv) > 2 and _sys.argv[2] == "--csv":
+            j.export_csv()

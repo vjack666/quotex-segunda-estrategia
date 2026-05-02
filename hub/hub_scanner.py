@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any, List, Mapping, Optional, Sequence
 import logging
 
-from .hub_models import CandidateData, HubScanSnapshot, HubState
+from .hub_models import CandidateData, GaleState, HubScanSnapshot, HubState
 
 log = logging.getLogger("hub_scanner")
 
@@ -178,6 +178,22 @@ class HubScanner:
         self.state.active_trade_entry_price = None
         self.state.active_trade_current_price = None
         self.state.active_trade_delta_pct = None
+
+    def update_gale_state(self, **kwargs) -> None:
+        """
+        Actualiza campos del GaleState en tiempo real.
+        Acepta cualquier campo definido en GaleState como keyword argument.
+        Ejemplo:
+            hub.update_gale_state(active=True, asset="GBPAUD_otc", secs_remaining=45.0)
+        """
+        g = self.state.gale
+        for key, value in kwargs.items():
+            if hasattr(g, key):
+                setattr(g, key, value)
+
+    def clear_gale_state(self) -> None:
+        """Resetea el GaleState a inactivo (tras expirar la operación)."""
+        self.state.gale = GaleState()
 
     def get_state(self) -> HubState:
         """Devuelve el estado actual del HUB."""

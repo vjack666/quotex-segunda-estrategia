@@ -96,8 +96,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--strat-b-duration",
         type=int,
-        default=120,
-        help="Duración en segundos para entradas STRAT-B",
+        default=300,
+        help="Duración en segundos para entradas STRAT-B (fijado en 300)",
     )
     p.add_argument(
         "--strat-b-min-confidence",
@@ -144,9 +144,10 @@ def _apply_runtime_config(args: argparse.Namespace) -> None:
     cb.MIN_PAYOUT = int(args.min_payout)
     cb.SCAN_LEAD_SEC = float(args.scan_lead_sec)
     cb.LIVE_SCAN_SLEEP_SEC = max(0.2, float(args.scan_sleep_sec))
+    cb.DURATION_SEC = 300
 
     cb.STRAT_B_CAN_TRADE = bool(args.strat_b_live)
-    cb.STRAT_B_DURATION_SEC = max(30, int(args.strat_b_duration))
+    cb.STRAT_B_DURATION_SEC = 300
     cb.STRAT_B_MIN_CONFIDENCE = max(0.0, min(1.0, float(args.strat_b_min_confidence)))
     cb.SAME_ASSET_REENTRY_COOLDOWN_SEC = max(0.0, float(args.same_asset_cooldown_sec))
     cb.REJECTION_CALL_MIN_LOWER_WICK = max(0.0, min(1.0, float(args.rejection_call_min_lower_wick)))
@@ -216,7 +217,7 @@ async def _run_cycle_with_loading(cb, *, dry_run: bool, real_account: bool):
     return await task
 
 
-async def _hub_ticker(bot_ref: list, interval: float = 5.0) -> None:
+async def _hub_ticker(bot_ref: list, interval: float = 1.0) -> None:
     """Refresca el HUB en segundo plano cada `interval` segundos sin esperar ciclos.
     Si llega un resultado de trade (WIN/LOSS) antes del intervalo, re-renderiza al instante.
     """
@@ -284,8 +285,8 @@ async def _run_forever_with_initial_loading(cb, *, dry_run: bool, real_account: 
         await _render_hub_once(bot_ref[0])
         await asyncio.sleep(1)
 
-    # Ticker de fondo: refresca el HUB cada 5s independiente de los ciclos.
-    ticker = asyncio.create_task(_hub_ticker(bot_ref, interval=5.0))
+    # Ticker de fondo: refresca el HUB cada 1s independiente de los ciclos.
+    ticker = asyncio.create_task(_hub_ticker(bot_ref, interval=1.0))
     try:
         return await task
     finally:

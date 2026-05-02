@@ -4,26 +4,70 @@ from __future__ import annotations
 
 import sys
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 from .hub_models import CandidateData, HubState
 
-try:
+if TYPE_CHECKING:
     from rich.console import Console
     from rich.layout import Layout
     from rich.live import Live
     from rich.panel import Panel
     from rich.table import Table
     from rich.text import Text
+
+try:
+    from rich.console import Console as RichConsole
+    from rich.layout import Layout as RichLayout
+    from rich.live import Live as RichLive
+    from rich.panel import Panel as RichPanel
+    from rich.table import Table as RichTable
+    from rich.text import Text as RichText
     _RICH_OK = True
 except Exception:  # pragma: no cover
-    Console = None  # type: ignore[assignment]
-    Layout = None   # type: ignore[assignment]
-    Live = None     # type: ignore[assignment]
-    Panel = None    # type: ignore[assignment]
-    Table = None    # type: ignore[assignment]
-    Text = None     # type: ignore[assignment]
+    RichConsole = None
+    RichLayout = None
+    RichLive = None
+    RichPanel = None
+    RichTable = None
+    RichText = None
     _RICH_OK = False
+
+
+def _require_console_class() -> type[Any]:
+    if RichConsole is None:
+        raise RuntimeError("rich.console no disponible")
+    return RichConsole
+
+
+def _require_layout_class() -> type[Any]:
+    if RichLayout is None:
+        raise RuntimeError("rich.layout no disponible")
+    return RichLayout
+
+
+def _require_live_class() -> type[Any]:
+    if RichLive is None:
+        raise RuntimeError("rich.live no disponible")
+    return RichLive
+
+
+def _require_panel_class() -> type[Any]:
+    if RichPanel is None:
+        raise RuntimeError("rich.panel no disponible")
+    return RichPanel
+
+
+def _require_table_class() -> type[Any]:
+    if RichTable is None:
+        raise RuntimeError("rich.table no disponible")
+    return RichTable
+
+
+def _require_text_class() -> type[Any]:
+    if RichText is None:
+        raise RuntimeError("rich.text no disponible")
+    return RichText
 
 
 # ── colores ANSI (fallback y compat) ─────────────────────────────────────────
@@ -77,7 +121,8 @@ def _abbrev(mode: str) -> str:
 # ── tablas Rich ───────────────────────────────────────────────────────────────
 
 def _build_strat_a_table(candidates: List[CandidateData]) -> "Table":
-    t = Table(show_header=True, header_style="bold cyan", box=None, padding=(0, 1), expand=True)
+    table_cls = _require_table_class()
+    t = table_cls(show_header=True, header_style="bold cyan", box=None, padding=(0, 1), expand=True)
     t.add_column("#",      width=2,  justify="right")
     t.add_column("Activo", width=14, no_wrap=True)
     t.add_column("Dir",    width=6)
@@ -109,7 +154,8 @@ def _build_strat_a_table(candidates: List[CandidateData]) -> "Table":
 
 
 def _build_strat_b_table(candidates: List[CandidateData]) -> "Table":
-    t = Table(show_header=True, header_style="bold magenta", box=None, padding=(0, 1), expand=True)
+    table_cls = _require_table_class()
+    t = table_cls(show_header=True, header_style="bold magenta", box=None, padding=(0, 1), expand=True)
     t.add_column("#",      width=2,  justify="right")
     t.add_column("Activo", width=14, no_wrap=True)
     t.add_column("Dir",    width=6)
@@ -143,11 +189,12 @@ def _build_strat_b_table(candidates: List[CandidateData]) -> "Table":
 
 
 def _build_status_table(state: HubState, balance: float) -> "Table":
+    table_cls = _require_table_class()
     now = datetime.now(tz=timezone.utc).strftime("%H:%M:%S")
     cycle_id = 0 if state.last_scan is None else state.last_scan.cycle_id
     ops = state.last_scan.cycle_ops if state.last_scan else 0
 
-    t = Table.grid(padding=(0, 2))
+    t = table_cls.grid(padding=(0, 2))
     t.add_column(); t.add_column(); t.add_column(); t.add_column(); t.add_column()
     t.add_row(
         f"[cyan]UTC {now}[/cyan]",
@@ -188,18 +235,92 @@ def _build_status_table(state: HubState, balance: float) -> "Table":
     return t
 
 
+def _build_gale_panel(state: HubState) -> "Panel":
+    """Construye el panel GALE WATCHER con el estado en tiempo real."""
+    panel_cls = _require_panel_class()
+    table_cls = _require_table_class()
+    g = state.gale
+
+    t = table_cls.grid(expand=True, padding=(0, 1))
+    t.add_column(style="bold", min_width=14)
+    t.add_column()
+
+    if not g.active:
+        t.add_row("Estado:", "[dim]Sin operación activa[/dim]")
+        return panel_cls(t, title="[bold yellow]GALE WATCHER[/bold yellow]",
+                 border_style="yellow", padding=(0, 1))
+
+    # dirección
+    dir_mu = _direction_markup(g.direction)
+
+    # delta color
+    delta = g.delta_pct
+    if abs(delta) < 0.001:
+        delta_mu = f"[dim]{delta:+.4f}%[/dim]"
+    elif g.direction.upper() == "CALL":
+        delta_mu = f"[bold green]{delta:+.4f}%[/bold green]" if delta >= 0 else f"[bold red]{delta:+.4f}%[/bold red]"
+    else:  # PUT
+        delta_mu = f"[bold green]{delta:+.4f}%[/bold green]" if delta <= 0 else f"[bold red]{delta:+.4f}%[/bold red]"
+
+    # estado ganando/perdiendo
+    if g.is_losing:
+        status_mu = "[bold red]⚠  PERDIENDO[/bold red]"
+    else:
+        status_mu = "[bold green]✓  GANANDO[/bold green]"
+
+    # tiempo restante
+    secs = max(0.0, g.secs_remaining)
+    mm, ss = divmod(int(secs), 60)
+    time_mu = f"[bold]{mm:02d}:{ss:02d}[/bold]  [dim]/ {g.duration_sec}s[/dim]"
+
+    # monto gale
+    if g.gale_amount > 0:
+        gale_mu = f"[bold yellow]${g.gale_amount:.2f}[/bold yellow]"
+    else:
+        gale_mu = "[dim]calculando...[/dim]"
+
+    # estado disparo
+    if g.gale_fired:
+        fired_mu = (
+            "[bold green]✔ ENVIADO[/bold green]" if g.gale_success
+            else "[bold red]✗ ERROR[/bold red]"
+        ) + (f"  [dim]#{g.gale_order_id}[/dim]" if g.gale_order_id else "")
+    else:
+        fired_mu = "[dim]En espera...[/dim]" if secs > 1 else "[bold yellow]⏳ Por disparar[/bold yellow]"
+
+    t.add_row("Activo:",   f"{g.asset.upper()}  {dir_mu}  [dim]payout {g.payout}%[/dim]")
+    t.add_row("Entrada:",  f"EP [bold]{g.entry_price:.5f}[/bold]  PX [bold]{g.current_price:.5f}[/bold]  {delta_mu}")
+    t.add_row("Estado:",   status_mu)
+    t.add_row("⏱ Tiempo:",  time_mu)
+    t.add_row("Monto:",    f"Base ${g.amount_invested:.2f}  →  Gale {gale_mu}")
+    t.add_row("Disparo:",  fired_mu)
+
+    border = "red" if g.is_losing else "green"
+    if g.gale_fired:
+        border = "yellow"
+    title_suffix = "  [bold red]● ACTIVO[/bold red]" if g.active else ""
+    return panel_cls(t, title=f"[bold yellow]GALE WATCHER[/bold yellow]{title_suffix}",
+                     border_style=border, padding=(0, 1))
+
+
 def _build_layout(state: HubState, balance: float) -> "Layout":
-    layout = Layout()
+    layout_cls = _require_layout_class()
+    panel_cls = _require_panel_class()
+    table_cls = _require_table_class()
+    text_cls = _require_text_class()
+
+    layout = layout_cls()
     layout.split_column(
-        Layout(name="header", size=5),
-        Layout(name="body",   ratio=1),
-        Layout(name="footer", size=1),
+        layout_cls(name="header", size=5),
+        layout_cls(name="body",   ratio=1),
+        layout_cls(name="gale",   size=8),
+        layout_cls(name="footer", size=1),
     )
 
-    layout["body"].split_row(Layout(name="strat_a"), Layout(name="strat_b"))
+    layout["body"].split_row(layout_cls(name="strat_a"), layout_cls(name="strat_b"))
 
     layout["header"].update(
-        Panel(
+        panel_cls(
             _build_status_table(state, balance),
             title="[bold cyan]QUOTEX BOT HUB — LIVE[/bold cyan]",
             border_style="cyan",
@@ -207,12 +328,12 @@ def _build_layout(state: HubState, balance: float) -> "Layout":
     )
 
     a_count = len(state.strat_a_watching)
-    a_inner = Table.grid(expand=True)
+    a_inner = table_cls.grid(expand=True)
     a_inner.add_column()
-    a_inner.add_row(Text.from_markup("[dim]Score · Dir · Dist-trigger · Modo · Patron[/dim]"))
+    a_inner.add_row(text_cls.from_markup("[dim]Score · Dir · Dist-trigger · Modo · Patron[/dim]"))
     a_inner.add_row(_build_strat_a_table(state.strat_a_watching))
     layout["strat_a"].update(
-        Panel(
+        panel_cls(
             a_inner,
             title=f"[bold cyan]STRAT-A | CONSOLIDACION[/bold cyan]  [dim]({a_count})[/dim]",
             border_style="cyan",
@@ -221,12 +342,12 @@ def _build_layout(state: HubState, balance: float) -> "Layout":
     )
 
     b_count = len(state.strat_b_watching)
-    b_inner = Table.grid(expand=True)
+    b_inner = table_cls.grid(expand=True)
     b_inner.add_column()
-    b_inner.add_row(Text.from_markup("[dim]Conf · Dir · Dist-trigger · Señal · Patron[/dim]"))
+    b_inner.add_row(text_cls.from_markup("[dim]Conf · Dir · Dist-trigger · Señal · Patron[/dim]"))
     b_inner.add_row(_build_strat_b_table(state.strat_b_watching))
     layout["strat_b"].update(
-        Panel(
+        panel_cls(
             b_inner,
             title=f"[bold magenta]STRAT-B | SPRING/WYCKOFF[/bold magenta]  [dim]({b_count})[/dim]",
             border_style="magenta",
@@ -234,8 +355,10 @@ def _build_layout(state: HubState, balance: float) -> "Layout":
         )
     )
 
+    layout["gale"].update(_build_gale_panel(state))
+
     layout["footer"].update(
-        Text(
+        text_cls(
             "CTRL+C para salir  |  Escaneo continuo  |  "
             "● verde=≤0.10%  ● amarillo=≤0.30%  ● dim=lejos del trigger",
             justify="center",
@@ -269,14 +392,18 @@ class HubDashboard:
     @classmethod
     def _get_console(cls) -> "Console":
         if cls._console is None:
-            cls._console = Console(force_terminal=True, legacy_windows=False)
+            console_cls = _require_console_class()
+            cls._console = console_cls(force_terminal=True, legacy_windows=False)
+        assert cls._console is not None
         return cls._console
 
     @classmethod
     def _ensure_live(cls) -> "Live":
         if cls._live is None:
-            cls._live = Live(
-                Text(""),
+            live_cls = _require_live_class()
+            text_cls = _require_text_class()
+            cls._live = live_cls(
+                text_cls(""),
                 console=cls._get_console(),
                 auto_refresh=False,
                 refresh_per_second=8,
@@ -286,7 +413,9 @@ class HubDashboard:
                 redirect_stdout=False,
                 redirect_stderr=False,
             )
+            assert cls._live is not None
             cls._live.start()
+        assert cls._live is not None
         return cls._live
 
     @classmethod
@@ -315,6 +444,7 @@ class HubDashboard:
 
     # ── fallback ANSI ─────────────────────────────────────────────────────────
     _last_text: str = ""
+    _last_line_count: int = 0
     _screen_initialized: bool = False
 
     @classmethod
@@ -326,9 +456,21 @@ class HubDashboard:
             import os as _os
             _os.system("cls" if _os.name == "nt" else "clear")
             cls._screen_initialized = True
-        sys.stdout.write("\033[H\033[J" + text + "\n")
+
+        new_lines = text.splitlines()
+        previous_lines = cls._last_line_count
+
+        sys.stdout.write("\033[H")
+        sys.stdout.write(text)
+
+        extra_lines = max(0, previous_lines - len(new_lines))
+        if extra_lines:
+            sys.stdout.write("\n" + "\n".join(" " * 120 for _ in range(extra_lines)))
+
+        sys.stdout.write("\n")
         sys.stdout.flush()
         cls._last_text = text
+        cls._last_line_count = len(new_lines)
 
     @classmethod
     def _render_fallback(cls, state: HubState, balance: float) -> str:
@@ -353,5 +495,30 @@ class HubDashboard:
                         f"S:{c.score:.1f} P:{c.payout}% Dist:{dist}"
                     )
             lines.append("")
+        # ── GALE panel (fallback) ───────────────────────────────────────────
+        g = state.gale
+        lines.append(f"{_BOLD}{_YELLOW}--- GALE WATCHER ---{_RESET}")
+        if not g.active:
+            lines.append(f"  {_DIM}Sin operación activa{_RESET}")
+        else:
+            dir_color = _GREEN if g.direction.upper() == "CALL" else _RED
+            status = f"{_RED}⚠ PERDIENDO{_RESET}" if g.is_losing else f"{_GREEN}✓ GANANDO{_RESET}"
+            secs = max(0.0, g.secs_remaining)
+            mm, ss = divmod(int(secs), 60)
+            fired = (
+                f"{_GREEN}✔ ENVIADO{_RESET}" if g.gale_fired and g.gale_success
+                else (f"{_RED}✗ ERROR{_RESET}" if g.gale_fired
+                      else f"{_DIM}En espera{_RESET}")
+            )
+            lines.append(
+                f"  {g.asset.upper()} {dir_color}{g.direction.upper()}{_RESET}"
+                f"  EP:{g.entry_price:.5f}  PX:{g.current_price:.5f}"
+                f"  {g.delta_pct:+.4f}%  {status}"
+            )
+            lines.append(
+                f"  ⏱ {mm:02d}:{ss:02d}  Base:${g.amount_invested:.2f}"
+                f"  Gale:{_YELLOW}${g.gale_amount:.2f}{_RESET}  Disparo:{fired}"
+            )
+        lines.append("")
         lines.append(f"{_DIM}CTRL+C para salir{_RESET}")
         return "\n".join(lines)

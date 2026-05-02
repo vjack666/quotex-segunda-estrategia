@@ -78,6 +78,19 @@ from martingale_calculator import MartingaleCalculator
 from hub.hub_scanner import HubScanner
 from hub.hub_models import CandidateData
 
+# Motor de Gale — ruta relativa al ROOT del proyecto
+import sys as _sys
+_MG_DIR = str(Path(__file__).resolve().parent.parent)
+if _MG_DIR not in _sys.path:
+    _sys.path.insert(0, _MG_DIR)
+try:
+    from mg.mg_watcher import GaleWatcher, TradeInfo as GaleTradeInfo
+    _GALE_WATCHER_AVAILABLE = True
+except ImportError:
+    _GALE_WATCHER_AVAILABLE = False
+    GaleWatcher = None  # type: ignore
+    GaleTradeInfo = None  # type: ignore
+
 ROOT = Path(__file__).resolve().parent.parent
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -150,7 +163,7 @@ MAX_RANGE_PCT          = 0.003   # 0.3% — amplitud máxima del rango
 TOUCH_TOLERANCE_PCT    = 0.00035 # 0.035% — tolerancia para "tocar" techo/piso
 MAX_CONSOLIDATION_MIN  = 0       # 0 = sin límite de tiempo para descartar zona
 MIN_PAYOUT             = 80      # payout mínimo %
-DURATION_SEC           = 30      # duración fija de cada opción binaria (30s)
+DURATION_SEC           = 300     # duración fija de cada opción binaria (5 min)
 SCAN_INTERVAL_SEC      = 60      # segundos entre escaneos completos
 CONNECT_RETRIES        = 3       # reintentos de conexión con delay
 MAX_CONCURRENT_TRADES  = 1       # máximo de operaciones abiertas simultáneas
@@ -161,6 +174,7 @@ ENTRY_SYNC_TO_CANDLE     = True  # alinear entrada al inicio de vela
 ENTRY_MAX_LAG_SEC        = 1.5   # cancelar si se envía tarde respecto a la vela
 ENTRY_REJECT_LAST_SEC    = 2.0   # margen mínimo de seguridad sobre vela 1m
 ENTRY_PRE_SEND_SEC       = 0.35  # enviar orden 350ms ANTES del open para compensar latencia WS
+ENTRY_OTC_POST_OPEN_SEC  = 0.20  # en OTC enviar levemente DESPUES del open para evitar vela previa
 ALIGN_SCAN_TO_CANDLE     = False # escaneo cada 60s (SCAN_INTERVAL_SEC)
 SCAN_LEAD_SEC            = 35.0  # escanear ~35s antes del próximo open de 5m
 MAX_LOSS_SESSION         = 0.20  # detener sesión si drawdown alcanza 20%
@@ -269,7 +283,7 @@ MARTIN_MAX_ATTEMPTS_SESSION = 2
 MARTIN_LOW_BALANCE_THRESHOLD = 100.0
 MARTIN_MAX_ATTEMPTS_LOW_BALANCE = 3
 PENDING_RECONCILE_AGE_MIN = 15.0
-MARTIN_MONITOR_INTERVAL_SEC = 10.0
+MARTIN_MONITOR_INTERVAL_SEC = 1.0
 MARTIN_ALERT_PCT       = 0.0005  # 0.05% en contra = pérdida probable
 MARTIN_LIVE_WINDOW_MIN_SEC = 30.0
 MARTIN_LIVE_WINDOW_MAX_SEC = 60.0
@@ -280,7 +294,7 @@ MARTIN_RESOLVE_MAX_ATTEMPTS = 3
 
 # STRAT-B (Spring Sweep) en paralelo (modo espejo por defecto)
 STRAT_B_CAN_TRADE      = True
-STRAT_B_DURATION_SEC   = 30
+STRAT_B_DURATION_SEC   = 300
 STRAT_B_MIN_CONFIDENCE = 0.70
 STRAT_B_MIN_CONFIDENCE_EARLY = 0.62
 STRAT_B_ALLOW_WYCKOFF_EARLY = True
@@ -1014,6 +1028,20 @@ class ConsolidationBot:
         self.hub = HubScanner()
         self.last_scan_strat_a: List[CandidateEntry] = []
         self.last_scan_strat_b: List[CandidateEntry] = []
+        # Motor de Gale — vigila operaciones activas y dispara compensación en T-1s
+        if _GALE_WATCHER_AVAILABLE:
+            self._gale_watcher = GaleWatcher(
+                fetch_price_fn=self._get_current_price,
+                place_order_fn=self._gale_place_order,
+                calculator=self.martingale,
+                get_balance_fn=self._gale_get_balance,
+                dry_run=dry_run,
+                on_status_fn=self.hub.update_gale_state,
+                on_clear_fn=self.hub.clear_gale_state,
+            )
+        else:
+            self._gale_watcher = None
+        self._gale_tasks: set[asyncio.Task] = set()
         self.asset_loss_streaks: dict[str, int] = {}
         self.asset_blacklist_until: dict[str, float] = {}
         # Estado técnico por activo para filtros adicionales.
@@ -1024,6 +1052,7 @@ class ConsolidationBot:
         # Offset de reloj servidor: diferencia entre ts de última vela y reloj local (segundos).
         # Se actualiza con cada fetch de velas para compensar drift del reloj local.
         self._clock_offset: float = 0.0
+        self._candle_phase_sec: int = 0
         if greylist_assets is not None:
             self.greylist_assets = {a.strip() for a in greylist_assets if a and a.strip()}
 
@@ -1323,7 +1352,7 @@ class ConsolidationBot:
 
     async def _get_asset_payout(self, asset: str, default: int = MIN_PAYOUT) -> int:
         try:
-            assets_now = await get_open_assets(self.client, MIN_PAYOUT)
+            assets_now = await get_open_assets(self.client, 0)
             for as_sym, as_payout in assets_now:
                 if as_sym == asset:
                     return int(as_payout)
@@ -1759,8 +1788,10 @@ class ConsolidationBot:
             return
 
         last_ts = int(candles[-1].ts)
+        # Fase real de apertura de vela en el broker (puede ser :00 o :30).
+        self._candle_phase_sec = int(last_ts % int(tf_sec))
         now_ts = time.time()
-        expected_open = (int(now_ts) // int(tf_sec)) * int(tf_sec)
+        expected_open = ((int(now_ts) - self._candle_phase_sec) // int(tf_sec)) * int(tf_sec) + self._candle_phase_sec
         raw_offset = float(last_ts - expected_open)
 
         # Evitar offsets invalidos por respuestas viejas o ruido.
@@ -2168,7 +2199,10 @@ class ConsolidationBot:
     async def _resolve_trade_after_expiry(self, asset: str, trade: TradeState) -> None:
         wait_sec = max(0.0, trade.duration_sec + MARTIN_RESOLVE_GRACE_SEC - (time.time() - trade.opened_at))
         if wait_sec > 0:
-            await asyncio.sleep(wait_sec)
+            if wait_sec > 1.0:
+                await sleep_with_inline_countdown(wait_sec, "Entrada sincronizada 1m")
+            else:
+                await asyncio.sleep(wait_sec)
         await self._resolve_trade(trade, asset)
 
     async def _process_pending_martin(
@@ -2528,14 +2562,75 @@ class ConsolidationBot:
             "greylist_assets": sorted(self.greylist_assets),
         }
 
-    async def _sync_to_next_candle_open(self, signal_ts: Optional[int] = None) -> EntryTimingInfo:
+    def _build_pre_objectives_audit(self, trade: TradeState) -> tuple[dict, Optional[bool], str]:
+        """Compara ticket vs objetivos definidos antes de la ejecución."""
+        if not trade.journal_id:
+            return {}, None, "sin_journal_id"
+
+        journal = get_journal()
+        if journal._conn is None:
+            return {}, None, "sin_conexion_journal"
+
+        row = journal._conn.execute(
+            """SELECT payout, score, entry_timing_decision, entry_duration_sec, strategy_json
+               FROM candidates WHERE id=?""",
+            (int(trade.journal_id),),
+        ).fetchone()
+        if not row:
+            return {}, None, "fila_no_encontrada"
+
+        strategy_raw = row["strategy_json"] or "{}"
+        try:
+            strategy = json.loads(strategy_raw)
+        except Exception:
+            strategy = {}
+
+        checks: dict[str, bool] = {}
+        min_payout = strategy.get("min_payout")
+        if isinstance(min_payout, (int, float)):
+            checks["payout_ok"] = float(row["payout"] or 0.0) >= float(min_payout)
+
+        score_thr = strategy.get("score_threshold_session", strategy.get("score_threshold_base"))
+        if isinstance(score_thr, (int, float)):
+            checks["score_ok"] = float(row["score"] or 0.0) >= float(score_thr)
+
+        timing_dec = str(row["entry_timing_decision"] or "")
+        checks["timing_ok"] = timing_dec in {"SYNCED_1M_OPEN", "SYNC_DISABLED"}
+
+        target_duration = strategy.get("strat_b_duration_sec") if trade.strategy_origin == "STRAT-B" else strategy.get("duration_sec")
+        actual_duration = int(row["entry_duration_sec"] or trade.duration_sec)
+        if isinstance(target_duration, (int, float)):
+            checks["duration_ok"] = actual_duration == int(target_duration)
+
+        failed = [k for k, v in checks.items() if not v]
+        ok = len(failed) == 0 if checks else None
+        note = "ok" if ok else ("fallaron: " + ", ".join(failed) if failed else "sin_checks")
+
+        details = {
+            "strategy_origin": trade.strategy_origin,
+            "checks": checks,
+            "targets": {
+                "min_payout": min_payout,
+                "score_threshold": score_thr,
+                "target_duration_sec": int(target_duration) if isinstance(target_duration, (int, float)) else None,
+            },
+            "observed": {
+                "payout": float(row["payout"] or 0.0),
+                "score": float(row["score"] or 0.0),
+                "entry_timing_decision": timing_dec,
+                "entry_duration_sec": actual_duration,
+            },
+        }
+        return details, ok, note
+
+    async def _sync_to_next_candle_open(self, signal_ts: Optional[int] = None, asset: Optional[str] = None) -> EntryTimingInfo:
         """
         Sincroniza/valida timing de entrada al inicio de vela de 1m.
 
         Regla operativa:
         - Esperar siempre al próximo open de vela 1m.
         - Rechazar si el envío queda tardío (> ENTRY_MAX_LAG_SEC).
-        - La duración de la orden es fija (DURATION_SEC = 30s).
+        - La duración de la orden es fija (DURATION_SEC = 300s).
 
         Devuelve un EntryTimingInfo con telemetría de timing.
         """
@@ -2549,27 +2644,34 @@ class ConsolidationBot:
                 decision="SYNC_DISABLED",
             )
 
+        phase = int(self._candle_phase_sec % TF_1M)
         now = time.time()
-        next_open = ((int(now) // TF_1M) + 1) * TF_1M
         # Ajustar con offset de reloj y adelantar ENTRY_PRE_SEND_SEC para llegar al broker a tiempo.
         # now_adj usa el reloj calibrado con las últimas velas del servidor Quotex.
         now_adj = now + self._clock_offset
-        next_open_adj = ((int(now_adj) // TF_1M) + 1) * TF_1M
-        # Esperar hasta ENTRY_PRE_SEND_SEC antes del open: la orden llega al broker ~al mismo tiempo.
-        wait_sec = max(0.0, next_open_adj - now_adj - ENTRY_PRE_SEND_SEC)
+        next_open_adj = ((int(now_adj - phase) // TF_1M) + 1) * TF_1M + phase
+        is_otc = bool(asset and "_otc" in str(asset).lower())
+        # En OTC no conviene pre-send: la expiración es en segundos relativos y puede caer en vela previa.
+        target_send_adj = (next_open_adj + ENTRY_OTC_POST_OPEN_SEC) if is_otc else (next_open_adj - ENTRY_PRE_SEND_SEC)
+        wait_sec = max(0.0, target_send_adj - now_adj)
         if wait_sec > 0:
             if abs(self._clock_offset) >= 0.1:
                 log.info(
-                    "⏳ Esperando apertura 1m: %.2fs (offset reloj=%.2fs, pre-send=%.2fs)",
-                    wait_sec, self._clock_offset, ENTRY_PRE_SEND_SEC,
+                    "⏳ Esperando apertura 1m: %.2fs (fase=%ds, offset=%.2fs, modo=%s)",
+                    wait_sec, phase, self._clock_offset, "post-open OTC" if is_otc else f"pre-send {ENTRY_PRE_SEND_SEC:.2f}s",
                 )
             else:
-                log.info("⏳ Esperando apertura de vela 1m: %.2fs (pre-send=%.2fs)", wait_sec, ENTRY_PRE_SEND_SEC)
+                log.info(
+                    "⏳ Esperando apertura de vela 1m: %.2fs (fase=%ds, modo=%s)",
+                    wait_sec,
+                    phase,
+                    "post-open OTC" if is_otc else f"pre-send {ENTRY_PRE_SEND_SEC:.2f}s",
+                )
             await asyncio.sleep(wait_sec)
 
         send_ts = time.time()
         lag_sec = (send_ts + self._clock_offset) - next_open_adj
-        time_since_open = send_ts % TF_1M
+        time_since_open = (send_ts + self._clock_offset - phase) % TF_1M
         secs_to_close = max(0.0, TF_1M - time_since_open)
 
         if lag_sec > ENTRY_MAX_LAG_SEC or secs_to_close <= ENTRY_REJECT_LAST_SEC:
@@ -2606,6 +2708,34 @@ class ConsolidationBot:
             time_since_open_sec=time_since_open,
             secs_to_close_sec=secs_to_close,
             decision="SYNCED_1M_OPEN",
+        )
+
+    def _snapshot_current_candle_timing(self, asset: Optional[str] = None) -> EntryTimingInfo:
+        """Captura el timing actual dentro de la vela 1m sin esperar ni alterar la ejecución."""
+        if not ENTRY_SYNC_TO_CANDLE:
+            return EntryTimingInfo(
+                ok=True,
+                lag_sec=0.0,
+                duration_sec=DURATION_SEC,
+                time_since_open_sec=0.0,
+                secs_to_close_sec=float(TF_1M),
+                decision="SYNC_DISABLED",
+            )
+
+        phase = int(self._candle_phase_sec % TF_1M)
+        now_adj = time.time() + self._clock_offset
+        current_open_adj = (int(now_adj - phase) // TF_1M) * TF_1M + phase
+        time_since_open = max(0.0, now_adj - current_open_adj)
+        secs_to_close = max(0.0, TF_1M - time_since_open)
+        is_ok = time_since_open <= ENTRY_MAX_LAG_SEC and secs_to_close > ENTRY_REJECT_LAST_SEC
+        is_otc = bool(asset and "_otc" in str(asset).lower())
+        return EntryTimingInfo(
+            ok=is_ok,
+            lag_sec=time_since_open,
+            duration_sec=DURATION_SEC,
+            time_since_open_sec=time_since_open,
+            secs_to_close_sec=secs_to_close,
+            decision="BREAKOUT_IMMEDIATE_OTC" if is_otc else "BREAKOUT_IMMEDIATE",
         )
 
     async def _process_pending_reversals(
@@ -3946,6 +4076,8 @@ class ConsolidationBot:
 
         outcome = "UNRESOLVED"
         profit  = 0.0
+        close_price: Optional[float] = None
+        result_payload: Optional[dict[str, Any]] = None
         if has_id or has_ref:
             for attempt in range(1, MARTIN_RESOLVE_MAX_ATTEMPTS + 1):
                 try:
@@ -3967,6 +4099,8 @@ class ConsolidationBot:
                             self.client.get_result(trade.order_id),
                             timeout=MARTIN_RESOLVE_TIMEOUT_SEC,
                         )
+                        if isinstance(payload, dict):
+                            result_payload = payload
                         if status == "win":
                             outcome = "WIN"
                             if isinstance(payload, dict):
@@ -3994,12 +4128,49 @@ class ConsolidationBot:
                 if attempt < MARTIN_RESOLVE_MAX_ATTEMPTS:
                     await asyncio.sleep(MARTIN_RESOLVE_RETRY_SEC)
 
+        if isinstance(result_payload, dict):
+            for key in ("closePrice", "close_price", "close", "sellPrice"):
+                if key in result_payload and result_payload.get(key) is not None:
+                    try:
+                        close_price = float(result_payload.get(key))
+                        break
+                    except Exception:
+                        pass
+        if close_price is None:
+            try:
+                close_price = await self._get_current_price(sym)
+            except Exception:
+                close_price = None
+
         trade.resolved = True
 
         if trade.journal_id:
             journal.update_outcome_by_id(row_id=trade.journal_id, outcome=outcome, profit=profit)
         else:
             journal.update_outcome(order_id=trade.order_id, outcome=outcome, profit=profit)
+
+        pre_objectives, pre_ok, pre_note = self._build_pre_objectives_audit(trade)
+        ticket_opened_at = datetime.fromtimestamp(trade.opened_at, tz=BROKER_TZ).isoformat(timespec="milliseconds")
+        ticket_closed_at = datetime.now(tz=BROKER_TZ).isoformat(timespec="milliseconds")
+        ticket_diff = None
+        if close_price is not None:
+            ticket_diff = float(close_price) - float(trade.entry_price)
+
+        journal.update_ticket_details(
+            row_id=trade.journal_id if trade.journal_id else None,
+            order_id=trade.order_id if not trade.journal_id else "",
+            order_ref=int(trade.order_ref or 0),
+            strategy_origin=trade.strategy_origin,
+            open_price=float(trade.entry_price),
+            close_price=float(close_price) if close_price is not None else None,
+            opened_at=ticket_opened_at,
+            closed_at=ticket_closed_at,
+            duration_sec=int(trade.duration_sec),
+            price_diff=ticket_diff,
+            pre_objectives=pre_objectives,
+            pre_objectives_ok=pre_ok,
+            pre_objectives_note=pre_note,
+        )
         await self.refresh_balance_and_risk()
         balance_now = self.current_balance if self.current_balance is not None else 0.0
         log.info("🏁 %s %s $%.2f | saldo: $%.2f", sym, outcome, profit, balance_now)
@@ -4079,6 +4250,38 @@ class ConsolidationBot:
     def open_trades_get(self, sym: str) -> Optional[TradeState]:
         return self.trades.get(sym)
 
+    # ── helpers para GaleWatcher ──────────────────────────────────────────────
+
+    async def _gale_place_order(
+        self,
+        asset: str,
+        direction: str,
+        amount: float,
+        duration: int,
+        account_type: str = "PRACTICE",
+    ) -> tuple:
+        """Wrapper de place_order() para el GaleWatcher."""
+        return await place_order(
+            self.client,
+            asset,
+            direction,
+            amount,
+            duration,
+            self.dry_run,
+            account_type=account_type,
+        )
+
+    async def _gale_get_balance(self) -> float:
+        """Retorna el balance actual para el GaleWatcher."""
+        if self.current_balance is not None:
+            return self.current_balance
+        try:
+            bal = float(await self.client.get_balance())
+            self.current_balance = bal
+            return bal
+        except Exception:
+            return 0.0
+
     async def _enter(
         self, sym: str, direction: str, amount: float,
         zone: ConsolidationZone, reason: str, stage: str,
@@ -4132,18 +4335,24 @@ class ConsolidationBot:
                     _j._conn.commit()
             return False
 
+        timing: Optional[EntryTimingInfo] = None
         if stage in ("initial", "martin"):
-            timing = await self._sync_to_next_candle_open(signal_ts)
-            if journal_cid:
-                _j = get_journal()
-                if _j._conn is not None:
-                    _j.log_entry_timing(
-                        candidate_id=journal_cid,
-                        time_since_open=timing.time_since_open_sec,
-                        secs_to_close=timing.secs_to_close_sec,
-                        duration_sec=timing.duration_sec,
-                        timing_decision=timing.decision,
-                    )
+            timing = await self._sync_to_next_candle_open(signal_ts, asset=sym)
+        else:
+            timing = self._snapshot_current_candle_timing(asset=sym)
+
+        if journal_cid and timing is not None:
+            _j = get_journal()
+            if _j._conn is not None:
+                _j.log_entry_timing(
+                    candidate_id=journal_cid,
+                    time_since_open=timing.time_since_open_sec,
+                    secs_to_close=timing.secs_to_close_sec,
+                    duration_sec=timing.duration_sec,
+                    timing_decision=timing.decision,
+                )
+
+        if stage in ("initial", "martin"):
             if not timing.ok:
                 if journal_cid:
                     reject_reason = f"timing 1m inválido: lag +{timing.lag_sec:.2f}s"
@@ -4160,6 +4369,28 @@ class ConsolidationBot:
                         _j._conn.commit()
                 return False
             duration_sec = timing.duration_sec
+
+        payout_now = await self._get_asset_payout(sym, payout)
+        if payout_now < MIN_PAYOUT:
+            reject_reason = (
+                f"payout actual insuficiente: {payout_now}% < mínimo {MIN_PAYOUT}%"
+            )
+            log.warning("⏭ %s: orden bloqueada — %s", sym, reject_reason)
+            if journal_cid:
+                _j = get_journal()
+                if _j._conn is not None:
+                    _j._conn.execute(
+                        """UPDATE candidates
+                           SET decision='REJECTED_PAYOUT',
+                               reject_reason=?,
+                               outcome='PAYOUT_SKIPPED'
+                           WHERE id=?""",
+                        (reject_reason, journal_cid),
+                    )
+                    _j._conn.commit()
+            return False
+
+        payout = int(payout_now)
 
         icon = "🟢" if direction == "call" else "🔴"
         log.info("[%s] %s ENTRADA[%s] %s  %s  $%.2f  %ds  | %s",
@@ -4223,12 +4454,41 @@ class ConsolidationBot:
                     (stored_oid, journal_cid)
                 )
                 _j._conn.commit()
+                _j.update_ticket_details(
+                    row_id=journal_cid,
+                    order_ref=int(order_ref or 0),
+                    strategy_origin=strategy_origin,
+                    open_price=float(open_price or 0.0),
+                    opened_at=datetime.fromtimestamp(trade.opened_at, tz=BROKER_TZ).isoformat(timespec="milliseconds"),
+                    duration_sec=int(duration_sec),
+                )
 
         self.stats["entries"] += 1
         if strategy_origin == "STRAT-B":
             self.stats["strat_b_signals"] += 1
         else:
             self.stats["strat_a_signals"] += 1
+
+        # ── Lanzar GaleWatcher en background (solo para entradas iniciales) ──
+        if stage not in ("martin",) and self._gale_watcher is not None:
+            gale_info = GaleTradeInfo(
+                asset=sym,
+                direction=direction,
+                amount=amount,
+                entry_price=float(open_price or 0.0),
+                opened_at=trade.opened_at,
+                duration_sec=int(duration_sec),
+                payout=int(payout),
+                order_id=str(oid or ""),
+                order_ref=int(order_ref or 0),
+                account_type=self.account_type,
+            )
+            _gale_task = asyncio.create_task(
+                self._gale_watcher.watch(gale_info),
+                name=f"gale_watch:{sym}:{stage}",
+            )
+            self._gale_tasks.add(_gale_task)
+            _gale_task.add_done_callback(self._gale_tasks.discard)
 
         if oid:
             log.info("  ✓ Orden aceptada  id=%s  open=%.5f  ref=%s", oid, open_price, order_ref)
