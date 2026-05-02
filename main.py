@@ -1,5 +1,6 @@
 import sys
 import io
+import os
 import argparse
 import asyncio
 import logging
@@ -20,6 +21,27 @@ ROOT = Path(__file__).resolve().parent
 SRC_DIR = ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
+
+import time as _time
+
+_DATA_SUBDIRS = ("logs/bot", "logs/broker", "db")
+_RETENTION_DAYS = 31
+
+
+def _cleanup_old_data_files() -> None:
+    """Elimina archivos en data/ con más de 31 días de antigüedad."""
+    cutoff = _time.time() - _RETENTION_DAYS * 24 * 3600
+    data_dir = ROOT / "data"
+    for subdir in _DATA_SUBDIRS:
+        target = data_dir / subdir
+        if not target.exists():
+            continue
+        for f in target.iterdir():
+            if f.is_file() and f.stat().st_mtime < cutoff:
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -48,23 +70,6 @@ def _build_parser() -> argparse.ArgumentParser:
         default=2.0,
         help="Incremento objetivo por ciclo para la calculadora de riesgo",
     )
-    p.add_argument(
-        "--mg-disabled",
-        action="store_true",
-        help="Desactiva el motor externo de martingala en background",
-    )
-    p.add_argument(
-        "--mg-prefire-sec",
-        type=float,
-        default=2.0,
-        help="Segundos antes del cierre para preparar/ejecutar martin",
-    )
-    p.add_argument(
-        "--mg-poll-sec",
-        type=float,
-        default=0.5,
-        help="Intervalo de monitoreo en vivo del motor martin",
-    )
     p.add_argument("--max-loss-session", type=float, default=0.20, help="Stop-loss de sesión (fracción)")
 
     # Perfil estilo Excel / Masaniello (ejemplo: 5 operaciones, 2 ITM)
@@ -75,6 +80,12 @@ def _build_parser() -> argparse.ArgumentParser:
     # Filtros operativos
     p.add_argument("--min-payout", type=int, default=80, help="Payout mínimo permitido")
     p.add_argument("--scan-lead-sec", type=float, default=35.0, help="Anticipación del scan antes del open")
+    p.add_argument(
+        "--scan-sleep-sec",
+        type=float,
+        default=1.0,
+        help="Pausa entre ciclos de escaneo live (segundos)",
+    )
 
     # STRAT-B (Spring Sweep)
     p.add_argument(
@@ -94,6 +105,24 @@ def _build_parser() -> argparse.ArgumentParser:
         default=0.70,
         help="Confianza mínima [0.0-1.0] para habilitar entrada STRAT-B",
     )
+    p.add_argument(
+        "--same-asset-cooldown-sec",
+        type=float,
+        default=65.0,
+        help="Enfriamiento mínimo para reentrar el mismo activo tras una entrada exitosa",
+    )
+    p.add_argument(
+        "--rejection-call-min-lower-wick",
+        type=float,
+        default=0.30,
+        help="Mecha inferior mínima [0.0-1.0] para validar rechazo CALL en vela 1m",
+    )
+    p.add_argument(
+        "--structure-entry-lock-ttl-min",
+        type=float,
+        default=180.0,
+        help="Minutos para bloquear reentrada en la misma estructura (0 desactiva)",
+    )
     return p
 
 
@@ -107,9 +136,6 @@ def _apply_runtime_config(args: argparse.Namespace) -> None:
     # directamente sobre la calculadora dinámica de riesgo.
     MartingaleCalculator.MIN_ORDER_AMOUNT = max(0.01, float(args.amount_initial))
     MartingaleCalculator.INCREMENT = max(0.01, float(args.amount_martin))
-    cb.MG_EXTERNAL_ENABLED = not bool(args.mg_disabled)
-    cb.MG_PREFIRE_SECONDS = max(0.5, float(args.mg_prefire_sec))
-    cb.MG_MONITOR_POLL_SECONDS = max(0.2, float(args.mg_poll_sec))
 
     cb.CYCLE_MAX_OPERATIONS = int(args.cycle_ops)
     cb.CYCLE_TARGET_WINS = int(args.cycle_wins)
@@ -117,10 +143,14 @@ def _apply_runtime_config(args: argparse.Namespace) -> None:
 
     cb.MIN_PAYOUT = int(args.min_payout)
     cb.SCAN_LEAD_SEC = float(args.scan_lead_sec)
+    cb.LIVE_SCAN_SLEEP_SEC = max(0.2, float(args.scan_sleep_sec))
 
     cb.STRAT_B_CAN_TRADE = bool(args.strat_b_live)
     cb.STRAT_B_DURATION_SEC = max(30, int(args.strat_b_duration))
     cb.STRAT_B_MIN_CONFIDENCE = max(0.0, min(1.0, float(args.strat_b_min_confidence)))
+    cb.SAME_ASSET_REENTRY_COOLDOWN_SEC = max(0.0, float(args.same_asset_cooldown_sec))
+    cb.REJECTION_CALL_MIN_LOWER_WICK = max(0.0, min(1.0, float(args.rejection_call_min_lower_wick)))
+    cb.STRUCTURE_ENTRY_LOCK_TTL_MIN = max(0.0, float(args.structure_entry_lock_ttl_min))
 
     # Modo HUB (solo lectura): fuerza escaneo por minuto y deshabilita trading.
     if bool(args.hub_readonly):
@@ -263,7 +293,18 @@ async def _run_forever_with_initial_loading(cb, *, dry_run: bool, real_account: 
 
 
 async def _run(args: argparse.Namespace) -> None:
+    # Limpiar archivos de data/ anteriores a 31 días
+    _cleanup_old_data_files()
+
+    # Crear directorio de logs del broker y cambiar CWD ANTES de importar
+    # consolidation_bot (que a su vez importa pyquotex/api_quotex, la cual
+    # registra el sink de loguru con ruta relativa al CWD actual).
+    _broker_log_dir = ROOT / "data" / "logs" / "broker"
+    _broker_log_dir.mkdir(parents=True, exist_ok=True)
+    _orig_cwd = os.getcwd()
+    os.chdir(_broker_log_dir)
     import consolidation_bot as cb
+    os.chdir(_orig_cwd)
 
     _apply_runtime_config(args)
     hub_readonly = bool(args.hub_readonly)

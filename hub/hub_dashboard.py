@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import os
 import sys
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from .hub_models import CandidateData, GaleState, HubState
+from .hub_models import CandidateData, HubState
 
 try:
     from rich.console import Console
@@ -189,46 +188,13 @@ def _build_status_table(state: HubState, balance: float) -> "Table":
     return t
 
 
-def _build_gale_panel(g: "GaleState") -> "Panel":
-    """Construye el panel GALE con estado del martingale pendiente."""
-    expected_profit = g.amount * (g.payout / 100.0)
-    secs = int(g.seconds_until_fire)
-    dir_markup = _direction_markup(g.direction)
-    gale_num = g.cycle_losses + 1  # Gale #1, #2, etc.
-
-    t = Table.grid(padding=(0, 2))
-    t.add_column(style="bold")
-    t.add_column()
-    t.add_row("[bold yellow]Par[/bold yellow]",      f"[bold white]{g.asset}[/bold white]  {dir_markup}")
-    t.add_row("[bold yellow]Gale #[/bold yellow]",   f"[bold magenta]{gale_num}[/bold magenta]  [dim](acumulado para +$2)[/dim]")
-    t.add_row("[bold yellow]Tiempo[/bold yellow]",   f"[bold red]{secs}s[/bold red]")
-    t.add_row("[bold yellow]Monto[/bold yellow]",    f"[bold cyan]${g.amount:.2f}[/bold cyan]")
-    t.add_row("[bold yellow]Ganancia[/bold yellow]", f"[bold green]+${expected_profit:.2f}[/bold green]  [dim](payout {g.payout}%)[/dim]")
-
-    return Panel(
-        t,
-        title="[bold yellow]⚡ GALE PENDIENTE[/bold yellow]",
-        border_style="yellow",
-        padding=(0, 1),
-    )
-
-
 def _build_layout(state: HubState, balance: float) -> "Layout":
     layout = Layout()
-
-    if state.gale_pending is not None:
-        layout.split_column(
-            Layout(name="header", size=5),
-            Layout(name="body",   ratio=1),
-            Layout(name="gale",   size=9),
-            Layout(name="footer", size=1),
-        )
-    else:
-        layout.split_column(
-            Layout(name="header", size=5),
-            Layout(name="body",   ratio=1),
-            Layout(name="footer", size=1),
-        )
+    layout.split_column(
+        Layout(name="header", size=5),
+        Layout(name="body",   ratio=1),
+        Layout(name="footer", size=1),
+    )
 
     layout["body"].split_row(Layout(name="strat_a"), Layout(name="strat_b"))
 
@@ -276,9 +242,6 @@ def _build_layout(state: HubState, balance: float) -> "Layout":
             style="dim",
         )
     )
-
-    if state.gale_pending is not None:
-        layout["gale"].update(_build_gale_panel(state.gale_pending))
 
     return layout
 
@@ -392,41 +355,3 @@ class HubDashboard:
             lines.append("")
         lines.append(f"{_DIM}CTRL+C para salir{_RESET}")
         return "\n".join(lines)
-
-    # ── compat: métodos usados por main.py / código legacy ───────────────────
-
-    @classmethod
-    def display_text(cls, text: str) -> None:
-        """Acepta texto ANSI y lo renderiza (compat con main.py legacy)."""
-        if _RICH_OK:
-            try:
-                live = cls._ensure_live()
-                live.update(Text.from_ansi(text), refresh=True)
-                return
-            except Exception:
-                pass
-        if text != cls._last_text:
-            sys.stdout.write("\033[H\033[J" + text)
-            sys.stdout.flush()
-            cls._last_text = text
-
-    @classmethod
-    def render_full_dashboard(cls, state: HubState, balance: float = 0.0) -> str:
-        """Compat: devuelve texto ANSI (usado por código que no llama a display())."""
-        return cls._render_fallback(state, balance)
-
-    @classmethod
-    def render_status_bar(cls, state: HubState, balance: float = 0.0) -> str:
-        now = datetime.now(tz=timezone.utc).strftime("%H:%M:%S")
-        cycle_id = 0 if state.last_scan is None else state.last_scan.cycle_id
-        return (
-            f"{_CYAN}UTC {now}{_RESET} | "
-            f"{_MAGENTA}Scans {state.total_scans}{_RESET} | "
-            f"{_YELLOW}Ciclo #{cycle_id}{_RESET} | "
-            f"{_BLUE}Balance ${balance:.2f}{_RESET} | "
-            f"{_GREEN}{state.live_wins}W{_RESET}/{_RED}{state.live_losses}L{_RESET}"
-        )
-
-    @classmethod
-    def clear_screen(cls) -> None:
-        os.system("cls" if os.name == "nt" else "clear")

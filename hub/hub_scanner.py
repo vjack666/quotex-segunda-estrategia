@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any, List, Mapping, Optional, Sequence
 import logging
 
-from .hub_models import CandidateData, GaleState, HubScanSnapshot, HubState
+from .hub_models import CandidateData, HubScanSnapshot, HubState
 
 log = logging.getLogger("hub_scanner")
 
@@ -178,29 +178,6 @@ class HubScanner:
         self.state.active_trade_entry_price = None
         self.state.active_trade_current_price = None
         self.state.active_trade_delta_pct = None
-
-    def update_gale_state(
-        self,
-        asset: str,
-        direction: str,
-        amount: float,
-        payout: int,
-        seconds_until_fire: float,
-        cycle_losses: int,
-    ) -> None:
-        """Registra el estado del gale pendiente para mostrarlo en el panel GALE."""
-        self.state.gale_pending = GaleState(
-            asset=asset.upper(),
-            direction=str(direction).lower(),
-            amount=float(amount),
-            payout=int(payout),
-            seconds_until_fire=max(0.0, float(seconds_until_fire)),
-            cycle_losses=int(cycle_losses),
-        )
-
-    def clear_gale_state(self) -> None:
-        """Limpia el panel GALE (después de disparar o cuando el trade cierra en WIN)."""
-        self.state.gale_pending = None
 
     def get_state(self) -> HubState:
         """Devuelve el estado actual del HUB."""

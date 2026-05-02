@@ -20,7 +20,7 @@ from pathlib import Path
 #  CONFIGURACIÓN
 # ─────────────────────────────────────────────────────────────────────────────
 
-DEFAULT_DB = Path(__file__).resolve().parent.parent / "trade_journal.db"
+DEFAULT_DB = Path(__file__).resolve().parent.parent / "data" / "db" / "trade_journal.db"
 
 CURRENT_WEIGHTS = {
     "compression": 25,

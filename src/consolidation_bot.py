@@ -77,7 +77,6 @@ from trade_journal import get_journal
 from martingale_calculator import MartingaleCalculator
 from hub.hub_scanner import HubScanner
 from hub.hub_models import CandidateData
-from mg.mg_engine import MartingaleEngine, MGOpenTrade
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -121,13 +120,17 @@ if callable(_reconfigure):
     except Exception:
         pass
 
+_BOT_LOG_DIR = Path(__file__).resolve().parent.parent / "data" / "logs" / "bot"
+_BOT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+_BOT_LOG_DATE = datetime.now().strftime("%Y-%m-%d")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
     handlers=[
         _stdout_handler,
-        logging.FileHandler("consolidation_bot.log", encoding="utf-8"),
+        logging.FileHandler(_BOT_LOG_DIR / f"consolidation_bot-{_BOT_LOG_DATE}.log", encoding="utf-8"),
     ],
 )
 logging.getLogger("pyquotex").setLevel(logging.WARNING)
@@ -153,7 +156,7 @@ CONNECT_RETRIES        = 3       # reintentos de conexión con delay
 MAX_CONCURRENT_TRADES  = 1       # máximo de operaciones abiertas simultáneas
 COOLDOWN_BETWEEN_ENTRIES = 30    # espera entre órdenes exitosas (segundos)
 LIVE_SCAN_MODE           = True  # escaneo continuo "super live" guiado por flujo de Quotex
-LIVE_SCAN_SLEEP_SEC      = 2.0   # pausa mínima entre ciclos live para no saturar WS
+LIVE_SCAN_SLEEP_SEC      = 1.0   # pausa mínima entre ciclos live para no saturar WS
 ENTRY_SYNC_TO_CANDLE     = True  # alinear entrada al inicio de vela
 ENTRY_MAX_LAG_SEC        = 1.5   # cancelar si se envía tarde respecto a la vela
 ENTRY_REJECT_LAST_SEC    = 2.0   # margen mínimo de seguridad sobre vela 1m
@@ -212,6 +215,7 @@ VOLUME_LOOKBACK        = 10      # velas para calcular cuerpo promedio
 REBOUND_MIN_STRENGTH_CALL = 0.50
 REBOUND_MIN_STRENGTH_PUT  = 0.65
 REJECTION_CANDLE_MIN_BODY = 0.40    # body >= 40% del rango para confirmar rebote
+REJECTION_CALL_MIN_LOWER_WICK = 0.30
 REJECTION_PUT_MIN_UPPER_WICK = 0.30
 ZONE_AGE_REBOUND_MIN = 20
 ZONE_AGE_BREAKOUT_MIN = 8
@@ -232,6 +236,11 @@ ASSET_LOSS_STREAK_LIMIT = 3
 ASSET_BLACKLIST_DURATION_MIN = 60
 # Máximo de entradas consecutivas sobre el mismo activo (0 = desactivar límite).
 MAX_CONSECUTIVE_ENTRIES_PER_ASSET = 2
+# Enfriamiento mínimo antes de reentrar el mismo activo tras una entrada exitosa.
+SAME_ASSET_REENTRY_COOLDOWN_SEC = 65
+# Una sola entrada por estructura (zona) dentro de una ventana temporal.
+# 0 = desactivar bloqueo por estructura.
+STRUCTURE_ENTRY_LOCK_TTL_MIN = 180
 
 ORDER_BLOCK_LOOKBACK = 50
 ORDER_BLOCK_MAX_PER_SIDE = 3
@@ -268,9 +277,6 @@ MARTIN_RESOLVE_GRACE_SEC = 5.0
 MARTIN_RESOLVE_TIMEOUT_SEC = 8.0
 MARTIN_RESOLVE_RETRY_SEC = 5.0
 MARTIN_RESOLVE_MAX_ATTEMPTS = 3
-MG_EXTERNAL_ENABLED = True
-MG_PREFIRE_SECONDS = 2.0
-MG_MONITOR_POLL_SECONDS = 0.5
 
 # STRAT-B (Spring Sweep) en paralelo (modo espejo por defecto)
 STRAT_B_CAN_TRADE      = True
@@ -961,6 +967,8 @@ class ConsolidationBot:
             "martin_wins": 0,
             "martin_losses": 0,
             "rejected_same_asset_limit": 0,
+            "rejected_same_asset_cooldown": 0,
+            "rejected_same_structure": 0,
         }
         # Estado de compensación: si la última operación cerró LOSS,
         # la próxima entrada usará monto dinámico de compensación para cubrir esa pérdida.
@@ -970,14 +978,6 @@ class ConsolidationBot:
         self.session_start_balance: Optional[float] = None
         self.current_balance:       Optional[float] = None
         self.martingale:            MartingaleCalculator = MartingaleCalculator()
-        self.mg_engine = MartingaleEngine(
-            get_price=self._get_current_price,
-            place_martin_order=self._external_mg_place_order,
-            log=lambda msg: log.info(msg),
-            prefire_sec=MG_PREFIRE_SECONDS,
-            poll_sec=MG_MONITOR_POLL_SECONDS,
-            enabled=MG_EXTERNAL_ENABLED,
-        )
         self.session_stop_hit:      bool = False
         self.cycle_id:              int = 1
         self.cycle_ops:             int = 0
@@ -1006,11 +1006,12 @@ class ConsolidationBot:
         # Control de repetición de activo para evitar sobre-exposición por momentum.
         self.last_entry_asset: Optional[str] = None
         self.last_entry_asset_streak: int = 0
+        self.last_entry_ts_by_asset: dict[str, float] = {}
+        # Candado de estructuras ya operadas: key -> timestamp de última entrada.
+        self.structure_entry_locks: dict[str, float] = {}
         # Blacklist temporal de activos por racha de pérdidas.
         # Hub para registrar candidatos en tiempo real
         self.hub = HubScanner()
-        # Vincula el hub al motor de martingala para actualizar panel GALE
-        self.mg_engine._hub = self.hub
         self.last_scan_strat_a: List[CandidateEntry] = []
         self.last_scan_strat_b: List[CandidateEntry] = []
         self.asset_loss_streaks: dict[str, int] = {}
@@ -1152,7 +1153,6 @@ class ConsolidationBot:
         self.session_start_balance = float(balance)
         self.current_balance = float(balance)
         self.martingale.set_balance(float(balance))
-        self.mg_engine.set_balance(float(balance))
         self.hub.state.known_balance = float(balance)
         if self.cycle_start_balance is None:
             self.cycle_start_balance = float(balance)
@@ -1428,6 +1428,16 @@ class ConsolidationBot:
         """
         if stage == "martin":
             return True, "MARTIN_EXEMPT"
+        if SAME_ASSET_REENTRY_COOLDOWN_SEC > 0:
+            last_ts = float(self.last_entry_ts_by_asset.get(asset, 0.0) or 0.0)
+            if last_ts > 0:
+                elapsed = time.time() - last_ts
+                if elapsed < SAME_ASSET_REENTRY_COOLDOWN_SEC:
+                    remaining = max(0.0, SAME_ASSET_REENTRY_COOLDOWN_SEC - elapsed)
+                    return False, (
+                        f"cooldown mismo activo activo: faltan {remaining:.1f}s "
+                        f"(min={SAME_ASSET_REENTRY_COOLDOWN_SEC}s)"
+                    )
         if MAX_CONSECUTIVE_ENTRIES_PER_ASSET <= 0:
             return True, "LIMIT_DISABLED"
         if self.last_entry_asset != asset:
@@ -1440,7 +1450,42 @@ class ConsolidationBot:
         )
         return False, reason
 
-    def _register_successful_entry_asset(self, asset: str) -> None:
+    @staticmethod
+    def _structure_key(asset: str, zone: ConsolidationZone) -> str:
+        return f"{asset}|{zone.floor:.5f}|{zone.ceiling:.5f}"
+
+    def _cleanup_structure_locks(self) -> None:
+        if STRUCTURE_ENTRY_LOCK_TTL_MIN <= 0:
+            self.structure_entry_locks.clear()
+            return
+        now = time.time()
+        ttl_sec = float(STRUCTURE_ENTRY_LOCK_TTL_MIN) * 60.0
+        expired = [k for k, ts in self.structure_entry_locks.items() if (now - ts) >= ttl_sec]
+        for k in expired:
+            self.structure_entry_locks.pop(k, None)
+
+    def _can_enter_structure_now(self, asset: str, zone: ConsolidationZone) -> Tuple[bool, str]:
+        self._cleanup_structure_locks()
+        if STRUCTURE_ENTRY_LOCK_TTL_MIN <= 0:
+            return True, "STRUCTURE_LOCK_DISABLED"
+        key = self._structure_key(asset, zone)
+        last_ts = float(self.structure_entry_locks.get(key, 0.0) or 0.0)
+        if last_ts <= 0:
+            return True, "NEW_STRUCTURE"
+        ttl_sec = float(STRUCTURE_ENTRY_LOCK_TTL_MIN) * 60.0
+        elapsed = time.time() - last_ts
+        if elapsed >= ttl_sec:
+            return True, "STRUCTURE_LOCK_EXPIRED"
+        remain = max(0.0, ttl_sec - elapsed)
+        return False, (
+            f"estructura ya operada (techo={zone.ceiling:.5f}, piso={zone.floor:.5f}); "
+            f"faltan {remain/60.0:.1f}min"
+        )
+
+    def _register_successful_entry_asset(self, asset: str, zone: ConsolidationZone) -> None:
+        self._cleanup_structure_locks()
+        self.structure_entry_locks[self._structure_key(asset, zone)] = time.time()
+        self.last_entry_ts_by_asset[asset] = time.time()
         if self.last_entry_asset == asset:
             self.last_entry_asset_streak += 1
         else:
@@ -1903,51 +1948,6 @@ class ConsolidationBot:
             return False
         return True
 
-    def _to_mg_open_trade(self, trade: TradeState) -> MGOpenTrade:
-        return MGOpenTrade(
-            asset=trade.asset,
-            direction=trade.direction,
-            entry_price=trade.entry_price,
-            opened_at=trade.opened_at,
-            duration_sec=int(trade.duration_sec),
-            payout=int(trade.payout),
-            amount=float(trade.amount),
-            stage=trade.stage,
-            strategy_origin=trade.strategy_origin,
-            ceiling=trade.ceiling,
-            floor=trade.floor,
-            score_original=float(trade.score_original),
-        )
-
-    async def _external_mg_place_order(self, trade: MGOpenTrade, amount: float) -> bool:
-        if not self._martin_session_available():
-            return False
-
-        zone = ConsolidationZone(
-            asset=trade.asset,
-            ceiling=trade.ceiling,
-            floor=trade.floor,
-            bars_inside=0,
-            detected_at=time.time(),
-            range_pct=0.0,
-        )
-        payout_now = await self._get_asset_payout(trade.asset, trade.payout)
-        mg_amount = self._cap_martin_amount(amount, self.current_balance)
-        if mg_amount <= 0:
-            return False
-
-        return await self._enter(
-            trade.asset,
-            trade.direction,
-            mg_amount,
-            zone,
-            "MG externo | monitor en vivo (prefire)",
-            "martin",
-            strategy_origin=trade.strategy_origin,
-            duration_sec=int(trade.duration_sec),
-            payout=payout_now,
-            score_original=float(trade.score_original),
-        )
 
     def _track_task(self, task: asyncio.Task[Any]) -> None:
         self._trade_tasks.add(task)
@@ -1975,7 +1975,6 @@ class ConsolidationBot:
             t for t in (list(self._trade_tasks) + list(self._followup_capture_tasks))
             if not t.done()
         ]
-        await self.mg_engine.shutdown()
         if not pending:
             return
         for t in pending:
@@ -2250,6 +2249,13 @@ class ConsolidationBot:
                 return False, f"vela bajista (close={last.close:.5f} < open={last.open:.5f})"
             if body_ratio < min_body_ratio:
                 return False, f"cuerpo débil {body_ratio:.0%} < {min_body_ratio:.0%}"
+            lower_wick = min(last.open, last.close) - last.low
+            lower_wick_ratio = lower_wick / rango
+            if lower_wick_ratio < REJECTION_CALL_MIN_LOWER_WICK:
+                return False, (
+                    f"mecha inferior débil {lower_wick_ratio:.0%} "
+                    f"< {REJECTION_CALL_MIN_LOWER_WICK:.0%}"
+                )
             return True, ""
         
         elif direction == "put":
@@ -2339,7 +2345,6 @@ class ConsolidationBot:
 
         self.current_balance = bal
         self.martingale.set_balance(bal)
-        self.mg_engine.set_balance(bal)
         if not self.session_start_balance or self.session_start_balance <= 0:
             return False
 
@@ -3628,7 +3633,6 @@ class ConsolidationBot:
                 log.info("⏳→✅ %d candidato(s) de pending_reversals agregados al ciclo.", len(pending_confirmed))
                 candidates.extend(pending_confirmed)
 
-        # Flujo legacy de martin diferido desactivado: la martingala ahora vive en mg_engine.
         self.pending_martin.clear()
 
         prev_threshold = self.current_score_threshold
@@ -4021,8 +4025,6 @@ class ConsolidationBot:
         self.last_closed_amount = float(trade.amount)
         self.last_closed_outcome = outcome
         self.pending_martin.pop(sym, None)
-        self.mg_engine.on_trade_close(self._to_mg_open_trade(trade), outcome, profit)
-
         if self.trades.get(sym) is trade:
             self.trades.pop(sym, None)
         try:
@@ -4095,6 +4097,8 @@ class ConsolidationBot:
         can_enter_asset, same_asset_reason = self._can_enter_asset_now(sym, stage)
         if not can_enter_asset:
             self.stats["rejected_same_asset_limit"] += 1
+            if "cooldown mismo activo" in same_asset_reason:
+                self.stats["rejected_same_asset_cooldown"] += 1
             log.info("⏭ %s: entrada bloqueada — %s", sym, same_asset_reason)
             if journal_cid:
                 _j = get_journal()
@@ -4106,6 +4110,24 @@ class ConsolidationBot:
                                outcome='LIMIT_SKIPPED'
                            WHERE id=?""",
                         (same_asset_reason, journal_cid),
+                    )
+                    _j._conn.commit()
+            return False
+
+        can_enter_structure, structure_reason = self._can_enter_structure_now(sym, zone)
+        if not can_enter_structure:
+            self.stats["rejected_same_structure"] += 1
+            log.info("⏭ %s: entrada bloqueada — %s", sym, structure_reason)
+            if journal_cid:
+                _j = get_journal()
+                if _j._conn is not None:
+                    _j._conn.execute(
+                        """UPDATE candidates
+                           SET decision='REJECTED_STRUCTURE',
+                               reject_reason=?,
+                               outcome='STRUCTURE_SKIPPED'
+                           WHERE id=?""",
+                        (structure_reason, journal_cid),
                     )
                     _j._conn.commit()
             return False
@@ -4167,7 +4189,7 @@ class ConsolidationBot:
                     _j._conn.commit()
             return False
 
-        self._register_successful_entry_asset(sym)
+        self._register_successful_entry_asset(sym, zone)
 
         self.trades[sym] = TradeState(
             asset=sym, direction=direction, amount=amount,
@@ -4191,7 +4213,6 @@ class ConsolidationBot:
         except Exception as exc:
             log.debug("HUB: no se pudo registrar entrada activa %s: %s", sym, exc)
         self._track_task(asyncio.create_task(self._resolve_trade_after_expiry(sym, trade), name=f"resolve:{sym}:{stage}"))
-        self.mg_engine.on_trade_open(self._to_mg_open_trade(trade))
         # Actualizar el journal con el order_id real del broker (aunque sea vacío)
         if journal_cid:
             stored_oid = oid if oid else f"REF-{order_ref}" if order_ref else "BROKER_NO_ID"

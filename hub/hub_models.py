@@ -145,18 +145,6 @@ class HubScanSnapshot:
 
 
 @dataclass
-class GaleState:
-    """Estado de un gale pendiente (a punto de dispararse) para mostrar en el HUB."""
-
-    asset: str               # par en martingala
-    direction: str           # call | put
-    amount: float            # monto calculado del gale
-    payout: int              # payout % del activo
-    seconds_until_fire: float  # segundos restantes para ejecutar
-    cycle_losses: int        # número de gales acumulados en este ciclo
-
-
-@dataclass
 class HubState:
     """Estado global del HUB en ejecución."""
 
@@ -176,13 +164,11 @@ class HubState:
     last_update: datetime = field(default_factory=_utc_now)
     live_wins: int = 0
     live_losses: int = 0
-    gale_pending: Optional["GaleState"] = None
     known_balance: float = 0.0  # último balance conocido (se actualiza al conectar y en cada scan)
 
 
 __all__ = [
     "CandidateData",
-    "GaleState",
     "HubScanSnapshot",
     "HubState",
     "VALID_DIRECTIONS",

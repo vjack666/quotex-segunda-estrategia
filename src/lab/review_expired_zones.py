@@ -29,7 +29,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
-DB_PATH = ROOT / "trade_journal.db"
+DB_PATH = ROOT / "data" / "db" / "trade_journal.db"
 
 BROKER_TZ = timezone(timedelta(hours=-3))
 

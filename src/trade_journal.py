@@ -57,7 +57,10 @@ if TYPE_CHECKING:
 # ── Ruta a la BD ──────────────────────────────────────────────────────────────
 _HERE = Path(__file__).resolve().parent
 _ROOT = _HERE.parent
-DB_PATH = _ROOT / "trade_journal.db"
+_DB_DIR = _ROOT / "data" / "db"
+_DB_DIR.mkdir(parents=True, exist_ok=True)
+_DB_DATE = datetime.now().strftime("%Y-%m-%d")
+DB_PATH = _DB_DIR / f"trade_journal-{_DB_DATE}.db"
 BROKER_TZ = timezone(timedelta(hours=-3))
 
 
