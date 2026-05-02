@@ -159,6 +159,7 @@ class GaleState:
     gale_amount:     float = 0.0     # monto calculado para el gale (según calculadora)
     is_losing:       bool  = False
     delta_pct:       float = 0.0     # variación % precio vs entrada
+    updated_at:      float = 0.0     # epoch del último tick recibido desde GaleWatcher
     gale_fired:      bool  = False   # ya se disparó el gale
     gale_order_id:   str   = ""      # order_id del gale si fue enviado
     gale_success:    bool  = False   # True si el broker aceptó el gale

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, List, Optional
 
@@ -269,7 +270,10 @@ def _build_gale_panel(state: HubState) -> "Panel":
         status_mu = "[bold green]✓  GANANDO[/bold green]"
 
     # tiempo restante
-    secs = max(0.0, g.secs_remaining)
+    drift = 0.0
+    if g.updated_at > 0:
+        drift = max(0.0, time.time() - g.updated_at)
+    secs = max(0.0, g.secs_remaining - drift)
     mm, ss = divmod(int(secs), 60)
     time_mu = f"[bold]{mm:02d}:{ss:02d}[/bold]  [dim]/ {g.duration_sec}s[/dim]"
 
@@ -503,7 +507,10 @@ class HubDashboard:
         else:
             dir_color = _GREEN if g.direction.upper() == "CALL" else _RED
             status = f"{_RED}⚠ PERDIENDO{_RESET}" if g.is_losing else f"{_GREEN}✓ GANANDO{_RESET}"
-            secs = max(0.0, g.secs_remaining)
+            drift = 0.0
+            if g.updated_at > 0:
+                drift = max(0.0, time.time() - g.updated_at)
+            secs = max(0.0, g.secs_remaining - drift)
             mm, ss = divmod(int(secs), 60)
             fired = (
                 f"{_GREEN}✔ ENVIADO{_RESET}" if g.gale_fired and g.gale_success

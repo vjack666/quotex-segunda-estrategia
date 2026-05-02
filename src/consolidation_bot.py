@@ -40,8 +40,10 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 import pandas as pd
+from concurrent.futures import Future as ConcurrentFuture
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -49,7 +51,7 @@ from datetime import timedelta
 from math import ceil
 from pathlib import Path
 from statistics import mean
-from typing import Any, Deque, List, Optional, Tuple
+from typing import Any, Awaitable, Deque, List, Optional, Tuple
 
 # ── Cargar .env ───────────────────────────────────────────────────────────────
 for _candidate in (Path(__file__).parent / ".env", Path(__file__).parent.parent / ".env"):
@@ -204,6 +206,10 @@ H1_EMA_SLOW              = 50
 H1_FETCH_TIMEOUT_SEC     = 12.0
 CANDLE_FETCH_TIMEOUT_SEC = 8.0
 CANDLE_FETCH_1M_TIMEOUT_SEC = 12.0
+REALTIME_PRICE_TIMEOUT_SEC = 3.0
+REALTIME_PRICE_STALE_SEC = 4.0
+REALTIME_PRICE_WARN_EVERY_SEC = 15.0
+FALLBACK_PRICE_TIMEOUT_SEC = 1.2
 FETCH_RETRIES            = 2
 FETCH_RETRY_BACKOFF_SEC  = 0.35
 ORDER_SEND_RETRIES       = 1
@@ -325,6 +331,7 @@ class TradeState:
     order_id:      str   = ""
     order_ref:     int   = 0
     opened_at:     float = field(default_factory=time.time)
+    opened_at_source: str = "fallback:local_clock"
     martin_fired:  bool  = False
     stage:         str   = "initial"
     journal_id:    int   = 0
@@ -712,15 +719,102 @@ def looks_like_connection_issue(reason: str) -> bool:
     return any(hint in text for hint in conn_hints)
 
 
+def _extract_ticket_opened_at(info: Any, fallback_ts: float) -> float:
+    """Intenta obtener el timestamp real de apertura desde la respuesta del broker."""
+    if not isinstance(info, dict):
+        return fallback_ts
+
+    now = time.time()
+    keys = (
+        "openTime", "open_time", "opened_at", "openTimestamp",
+        "open_ts", "createdAt", "created_at", "timestamp", "time",
+    )
+    for key in keys:
+        raw = info.get(key)
+        if raw is None:
+            continue
+        try:
+            if isinstance(raw, (int, float)):
+                ts = float(raw)
+                if ts > 1e12:
+                    ts /= 1000.0
+                if now - 7200.0 <= ts <= now + 300.0:
+                    return ts
+            elif isinstance(raw, str):
+                txt = raw.strip()
+                if not txt:
+                    continue
+                if txt.isdigit():
+                    ts = float(txt)
+                    if ts > 1e12:
+                        ts /= 1000.0
+                    if now - 7200.0 <= ts <= now + 300.0:
+                        return ts
+                    continue
+                iso = txt.replace("Z", "+00:00")
+                dt = datetime.fromisoformat(iso)
+                ts = dt.timestamp()
+                if now - 7200.0 <= ts <= now + 300.0:
+                    return ts
+        except Exception:
+            continue
+
+    return fallback_ts
+
+
+def _extract_ticket_opened_at_with_source(info: Any, fallback_ts: float) -> tuple[float, str]:
+    """Devuelve (timestamp_apertura, fuente) para auditoría operativa del ticket."""
+    if not isinstance(info, dict):
+        return float(fallback_ts), "fallback:local_clock"
+
+    now = time.time()
+    keys = (
+        "openTime", "open_time", "opened_at", "openTimestamp",
+        "open_ts", "createdAt", "created_at", "timestamp", "time",
+    )
+    for key in keys:
+        raw = info.get(key)
+        if raw is None:
+            continue
+        try:
+            if isinstance(raw, (int, float)):
+                ts = float(raw)
+                if ts > 1e12:
+                    ts /= 1000.0
+                if now - 7200.0 <= ts <= now + 300.0:
+                    return ts, f"broker:{key}"
+            elif isinstance(raw, str):
+                txt = raw.strip()
+                if not txt:
+                    continue
+                if txt.isdigit():
+                    ts = float(txt)
+                    if ts > 1e12:
+                        ts /= 1000.0
+                    if now - 7200.0 <= ts <= now + 300.0:
+                        return ts, f"broker:{key}"
+                    continue
+                iso = txt.replace("Z", "+00:00")
+                dt = datetime.fromisoformat(iso)
+                ts = dt.timestamp()
+                if now - 7200.0 <= ts <= now + 300.0:
+                    return ts, f"broker:{key}"
+        except Exception:
+            continue
+
+    return float(fallback_ts), "fallback:local_clock"
+
+
 async def place_order(
     client: Quotex, asset: str, direction: str,
     amount: float, duration: int, dry_run: bool,
     account_type: str = "PRACTICE",
-) -> Tuple[bool, str, float, int, str]:
+) -> Tuple[bool, str, float, int, str, float, str]:
     if dry_run:
         log.info("  [DRY-RUN] %s %s $%.2f %ds",
                  direction.upper(), asset, amount, duration)
-        return True, f"DRY-{int(time.time())}", 0.0, 0, ""
+        ts_now = time.time()
+        return True, f"DRY-{int(ts_now)}", 0.0, 0, "", ts_now, "dry_run"
 
     # Activos equity OTC (stocks) pueden tener restricciones de horario
     # aunque aparezcan como "open" en el scanner.
@@ -797,7 +891,7 @@ async def place_order(
     ok_reconnect, reconnect_reason = await _force_reconnect("pre-orden")
     if not ok_reconnect:
         log.error("  Reconexión pre-orden fallida: %s", reconnect_reason)
-        return False, "", 0.0, 0, reconnect_reason
+        return False, "", 0.0, 0, reconnect_reason, 0.0, ""
 
     await _log_pre_buy()
 
@@ -820,19 +914,19 @@ async def place_order(
             "abierta en broker. Verificar manualmente.",
             elapsed,
         )
-        return False, "", 0.0, 0, "buy_timeout_30s"
+        return False, "", 0.0, 0, "buy_timeout_30s", 0.0, ""
     except Exception as exc:
         elapsed = time.time() - t0
         first_reason = f"buy_exception:{exc}"
         log.error("  Excepción en buy() elapsed=%.2fs: %s", elapsed, exc)
         if not looks_like_connection_issue(first_reason):
-            return False, "", 0.0, 0, first_reason
+            return False, "", 0.0, 0, first_reason, 0.0, ""
 
         log.warning("  ↻ Falla de conexión detectada en buy(); reintentando una vez...")
         ok_reconnect, reconnect_reason = await _force_reconnect("reintento")
         if not ok_reconnect:
             log.error("  Reconexión de reintento fallida: %s", reconnect_reason)
-            return False, "", 0.0, 0, f"{first_reason} | {reconnect_reason}"
+            return False, "", 0.0, 0, f"{first_reason} | {reconnect_reason}", 0.0, ""
         await _log_pre_buy()
         t0_retry = time.time()
         try:
@@ -852,17 +946,18 @@ async def place_order(
                 "  ⏱ buy() reintento sin respuesta en 30s (elapsed=%.1fs)",
                 elapsed_retry,
             )
-            return False, "", 0.0, 0, "buy_timeout_30s_retry"
+            return False, "", 0.0, 0, "buy_timeout_30s_retry", 0.0, ""
         except Exception as retry_exc:
             elapsed_retry = time.time() - t0_retry
             retry_reason = f"buy_exception_retry:{retry_exc}"
             log.error("  Excepción en buy() reintento elapsed=%.2fs: %s", elapsed_retry, retry_exc)
-            return False, "", 0.0, 0, retry_reason
+            return False, "", 0.0, 0, retry_reason, 0.0, ""
 
     elapsed = time.time() - t0
 
     if status and isinstance(info, dict):
         log.debug("  Respuesta broker (%.2fs): %s", elapsed, info)
+        opened_at_ts, opened_at_source = _extract_ticket_opened_at_with_source(info, time.time())
         order_ref = 0
         for key in ("id_number", "idNumber", "openOrderId", "ticket"):
             raw_val = info.get(key)
@@ -872,7 +967,7 @@ async def place_order(
                     break
             except (TypeError, ValueError):
                 continue
-        return True, info.get("id", ""), float(info.get("openPrice", 0)), order_ref, ""
+        return True, info.get("id", ""), float(info.get("openPrice", 0)), order_ref, "", opened_at_ts, opened_at_source
 
     log.error(
         "  Orden rechazada por broker. status=%s info=%s elapsed=%.2fs",
@@ -894,7 +989,7 @@ async def place_order(
         ok_reconnect, reconnect_reason = await _force_reconnect("reintento")
         if not ok_reconnect:
             log.error("  Reconexión de reintento fallida: %s", reconnect_reason)
-            return False, "", 0.0, 0, f"{reject_reason} | {reconnect_reason}"
+            return False, "", 0.0, 0, f"{reject_reason} | {reconnect_reason}", 0.0, ""
 
         await _log_pre_buy()
         t0_retry = time.time()
@@ -914,16 +1009,17 @@ async def place_order(
                 "  ⏱ buy() reintento sin respuesta en 30s (elapsed=%.1fs)",
                 elapsed_retry,
             )
-            return False, "", 0.0, 0, "buy_timeout_30s_retry"
+            return False, "", 0.0, 0, "buy_timeout_30s_retry", 0.0, ""
         except Exception as retry_exc:
             elapsed_retry = time.time() - t0_retry
             retry_reason = f"buy_exception_retry:{retry_exc}"
             log.error("  Excepción en buy() reintento elapsed=%.2fs: %s", elapsed_retry, retry_exc)
-            return False, "", 0.0, 0, retry_reason
+            return False, "", 0.0, 0, retry_reason, 0.0, ""
 
         elapsed_retry = time.time() - t0_retry
         if status_retry and isinstance(info_retry, dict):
             log.info("  ✅ Reintento exitoso en broker (%.2fs)", elapsed_retry)
+            opened_at_ts, opened_at_source = _extract_ticket_opened_at_with_source(info_retry, time.time())
             order_ref = 0
             for key in ("id_number", "idNumber", "openOrderId", "ticket"):
                 raw_val = info_retry.get(key)
@@ -933,7 +1029,7 @@ async def place_order(
                         break
                 except (TypeError, ValueError):
                     continue
-            return True, info_retry.get("id", ""), float(info_retry.get("openPrice", 0)), order_ref, ""
+            return True, info_retry.get("id", ""), float(info_retry.get("openPrice", 0)), order_ref, "", opened_at_ts, opened_at_source
 
         retry_reason = "broker_rejected_retry"
         if isinstance(info_retry, dict):
@@ -945,9 +1041,9 @@ async def place_order(
             )
         elif info_retry is not None:
             retry_reason = str(info_retry)
-        return False, "", 0.0, 0, retry_reason
+        return False, "", 0.0, 0, retry_reason, 0.0, ""
 
-    return False, "", 0.0, 0, reject_reason
+    return False, "", 0.0, 0, reject_reason, 0.0, ""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -965,6 +1061,10 @@ class ConsolidationBot:
         self.client      = client
         self.dry_run     = dry_run
         self.account_type = account_type
+        try:
+            self._main_loop: Optional[asyncio.AbstractEventLoop] = asyncio.get_running_loop()
+        except RuntimeError:
+            self._main_loop = None
         self.zones:  dict[str, ConsolidationZone] = {}
         self.broken_zones: dict[str, float] = {}
         self.trades: dict[str, TradeState]        = {}
@@ -1007,6 +1107,10 @@ class ConsolidationBot:
         self._followup_capture_tasks: set[asyncio.Task[Any]] = set()
         # Último precio válido conocido por activo — detecta contaminación cruzada.
         self.last_known_price: dict[str, float] = {}
+        # Estado del stream realtime por activo (pyquotex).
+        self._rt_stream_started: set[str] = set()
+        self._rt_last_tick_ts: dict[str, float] = {}
+        self._rt_last_warn_ts: dict[str, float] = {}
         # Activos que fallaron en place_order() — skippear por 2 ciclos.
         # key=asset, value=ciclos_restantes_a_skipear
         self.failed_assets: dict[str, int] = {}
@@ -1028,16 +1132,20 @@ class ConsolidationBot:
         self.hub = HubScanner()
         self.last_scan_strat_a: List[CandidateEntry] = []
         self.last_scan_strat_b: List[CandidateEntry] = []
+        self._gale_thread: Optional[threading.Thread] = None
+        self._gale_thread_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._gale_thread_ready = threading.Event()
+        self._gale_futures: set[ConcurrentFuture[Any]] = set()
         # Motor de Gale — vigila operaciones activas y dispara compensación en T-1s
         if _GALE_WATCHER_AVAILABLE:
             self._gale_watcher = GaleWatcher(
-                fetch_price_fn=self._get_current_price,
-                place_order_fn=self._gale_place_order,
+                fetch_price_fn=self._gale_fetch_price_bridge,
+                place_order_fn=self._gale_place_order_bridge,
                 calculator=self.martingale,
-                get_balance_fn=self._gale_get_balance,
+                get_balance_fn=self._gale_get_balance_bridge,
                 dry_run=dry_run,
-                on_status_fn=self.hub.update_gale_state,
-                on_clear_fn=self.hub.clear_gale_state,
+                on_status_fn=self._gale_on_status_bridge,
+                on_clear_fn=self._gale_on_clear_bridge,
             )
         else:
             self._gale_watcher = None
@@ -1360,18 +1468,113 @@ class ConsolidationBot:
             pass
         return int(default)
 
+    @staticmethod
+    def _extract_realtime_price(payload: Any) -> tuple[Optional[float], Optional[float]]:
+        """Extrae (price, tick_ts) desde la estructura realtime de pyquotex."""
+        item = None
+        if isinstance(payload, list) and payload:
+            item = payload[-1]
+        elif isinstance(payload, dict):
+            item = payload
+
+        if not isinstance(item, dict):
+            return None, None
+
+        raw_price = item.get("price")
+        raw_time = item.get("time")
+
+        price: Optional[float] = None
+        tick_ts: Optional[float] = None
+
+        try:
+            if raw_price is not None:
+                price = float(raw_price)
+        except Exception:
+            price = None
+
+        try:
+            if raw_time is not None:
+                tick_ts = float(raw_time)
+                if tick_ts > 1e12:
+                    tick_ts /= 1000.0
+        except Exception:
+            tick_ts = None
+
+        return price, tick_ts
+
     async def _get_current_price(self, asset: str) -> Optional[float]:
+        last_valid = self.last_known_price.get(asset)
+        now = time.time()
+
+        # 1) Fuente primaria: stream realtime de pyquotex.
+        try:
+            if asset not in self._rt_stream_started:
+                await self.client.start_realtime_price(
+                    asset,
+                    period=0,
+                    timeout=REALTIME_PRICE_TIMEOUT_SEC,
+                )
+                self._rt_stream_started.add(asset)
+                log.info("📡 Realtime stream activo para %s", asset)
+
+            rt_payload = await asyncio.wait_for(
+                self.client.get_realtime_price(asset),
+                timeout=1.0,
+            )
+            price, tick_ts = self._extract_realtime_price(rt_payload)
+
+            if price is not None and price > 0:
+                if last_valid and last_valid > 0:
+                    delta_pct = abs(price - last_valid) / last_valid
+                    if delta_pct > 0.05:
+                        log.warning(
+                            "⚠ %s: tick realtime contaminado %.5f (delta %.1f%% vs %.5f) — usando último válido",
+                            asset, price, delta_pct * 100.0, last_valid,
+                        )
+                        return last_valid
+                self.last_known_price[asset] = price
+                self._rt_last_tick_ts[asset] = tick_ts if tick_ts is not None else now
+                return price
+
+            # Si no llegó precio nuevo, verificar si el stream está stale.
+            last_tick = self._rt_last_tick_ts.get(asset)
+            if last_tick is not None and (now - last_tick) > REALTIME_PRICE_STALE_SEC:
+                last_warn = self._rt_last_warn_ts.get(asset, 0.0)
+                if (now - last_warn) >= REALTIME_PRICE_WARN_EVERY_SEC:
+                    log.warning(
+                        "⚠ %s: realtime stale %.1fs sin ticks — fallback a velas",
+                        asset,
+                        now - last_tick,
+                    )
+                    self._rt_last_warn_ts[asset] = now
+        except Exception as exc:
+            log.debug("%s: fallo realtime price (%s) — fallback velas", asset, exc)
+
+        # 2) Fallback: velas 1m (rápido), solo para no quedarnos ciegos.
         candles = await fetch_candles_with_retry(
             self.client,
             asset,
             60,
             3,
-            timeout_sec=CANDLE_FETCH_1M_TIMEOUT_SEC,
+            timeout_sec=FALLBACK_PRICE_TIMEOUT_SEC,
             retries=1,
         )
         if candles:
-            return float(candles[-1].close)
-        return self.last_known_price.get(asset)
+            price = float(candles[-1].close)
+            # Guardia anti-contaminación: ignora saltos improbables por activo
+            # (bug intermitente de pyquotex devolviendo precio de otro símbolo).
+            if last_valid and last_valid > 0:
+                delta_pct = abs(price - last_valid) / last_valid
+                if delta_pct > 0.05:
+                    log.warning(
+                        "⚠ %s: realtime contaminado %.5f (delta %.1f%% vs %.5f) — usando último válido",
+                        asset, price, delta_pct * 100.0, last_valid,
+                    )
+                    return last_valid
+            if price > 0:
+                self.last_known_price[asset] = price
+                return price
+        return last_valid
 
     def _cap_martin_amount(self, amount: float, balance: Optional[float]) -> float:
         if balance is None or balance <= 0:
@@ -2006,11 +2209,15 @@ class ConsolidationBot:
             t for t in (list(self._trade_tasks) + list(self._followup_capture_tasks))
             if not t.done()
         ]
-        if not pending:
-            return
-        for t in pending:
-            t.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
+        if pending:
+            for t in pending:
+                t.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        for f in list(self._gale_futures):
+            if not f.done():
+                f.cancel()
+        self._stop_gale_thread()
 
     def _consume_fresh_watched_candidate(self, asset: str) -> Optional[CandidateEntry]:
         watched = self.watched_candidates.get(asset)
@@ -4055,18 +4262,15 @@ class ConsolidationBot:
 
     async def _resolve_trade(self, trade: "TradeState", sym: str) -> None:
         """
-        Constry:
-                self.hub.close_active_trade()
-            except Exception:
-                pass
-            ulta el resultado de una operación expirada al broker
+        Consulta el resultado de una operación expirada al broker
         y actualiza el journal con WIN / LOSS / UNRESOLVED sin bloquear el bot.
         """
         if trade.resolved:
             return
 
         journal = get_journal()
-        has_id  = bool(trade.order_id) and not trade.order_id.startswith("DRY-")
+        order_id = str(trade.order_id or "").strip()
+        has_id  = bool(order_id) and not order_id.startswith("DRY-")
         has_ref = trade.order_ref > 0
         if self.dry_run:
             trade.resolved = True
@@ -4096,7 +4300,7 @@ class ConsolidationBot:
                             break
                     elif has_id:
                         status, payload = await asyncio.wait_for(
-                            self.client.get_result(trade.order_id),
+                            self.client.get_result(order_id),
                             timeout=MARTIN_RESOLVE_TIMEOUT_SEC,
                         )
                         if isinstance(payload, dict):
@@ -4250,6 +4454,124 @@ class ConsolidationBot:
     def open_trades_get(self, sym: str) -> Optional[TradeState]:
         return self.trades.get(sym)
 
+    def _start_gale_thread(self) -> None:
+        if self._gale_thread is not None and self._gale_thread.is_alive():
+            return
+
+        self._gale_thread_ready.clear()
+
+        def _runner() -> None:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self._gale_thread_loop = loop
+            self._gale_thread_ready.set()
+            try:
+                loop.run_forever()
+            finally:
+                pending = asyncio.all_tasks(loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                loop.close()
+
+        self._gale_thread = threading.Thread(target=_runner, name="GaleWatcherThread", daemon=True)
+        self._gale_thread.start()
+        if not self._gale_thread_ready.wait(timeout=2.0):
+            log.error("No se pudo iniciar hilo de GaleWatcher")
+
+    def _stop_gale_thread(self) -> None:
+        loop = self._gale_thread_loop
+        thread = self._gale_thread
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(loop.stop)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+        self._gale_thread = None
+        self._gale_thread_loop = None
+
+    async def _run_on_main_loop(self, coro: Awaitable[Any]) -> Any:
+        main_loop = self._main_loop
+        if main_loop is None:
+            main_loop = asyncio.get_running_loop()
+            self._main_loop = main_loop
+
+        current = asyncio.get_running_loop()
+        if main_loop is current:
+            return await coro
+
+        fut = asyncio.run_coroutine_threadsafe(coro, main_loop)
+        return await asyncio.wrap_future(fut)
+
+    async def _gale_fetch_price_bridge(self, asset: str) -> Optional[float]:
+        result = await self._run_on_main_loop(self._get_current_price(asset))
+        if result is None:
+            return None
+        try:
+            return float(result)
+        except Exception:
+            return None
+
+    async def _gale_place_order_bridge(
+        self,
+        asset: str,
+        direction: str,
+        amount: float,
+        duration: int,
+        account_type: str = "PRACTICE",
+    ) -> tuple:
+        return await self._run_on_main_loop(
+            self._gale_place_order(
+                asset=asset,
+                direction=direction,
+                amount=amount,
+                duration=duration,
+                account_type=account_type,
+            )
+        )
+
+    async def _gale_get_balance_bridge(self) -> float:
+        result = await self._run_on_main_loop(self._gale_get_balance())
+        return float(result or 0.0)
+
+    async def _gale_on_status_bridge(self, **kwargs) -> None:
+        async def _inner() -> None:
+            self.hub.update_gale_state(**kwargs)
+
+        await self._run_on_main_loop(_inner())
+
+    async def _gale_on_clear_bridge(self) -> None:
+        async def _inner() -> None:
+            self.hub.clear_gale_state()
+
+        await self._run_on_main_loop(_inner())
+
+    def _launch_gale_watch(self, gale_info: Any, stage: str) -> None:
+        if self._gale_watcher is None:
+            return
+        self._start_gale_thread()
+        loop = self._gale_thread_loop
+        if loop is None:
+            log.error("GaleWatcher: loop de hilo no disponible")
+            return
+
+        async def _runner() -> None:
+            await self._gale_watcher.watch(gale_info)
+
+        fut = asyncio.run_coroutine_threadsafe(_runner(), loop)
+        self._gale_futures.add(fut)
+
+        def _done_callback(done_fut: ConcurrentFuture[Any]) -> None:
+            self._gale_futures.discard(done_fut)
+            if done_fut.cancelled():
+                return
+            try:
+                done_fut.result()
+            except Exception as exc:
+                log.error("GaleWatcher task falló (%s): %s", stage, exc)
+
+        fut.add_done_callback(_done_callback)
+
     # ── helpers para GaleWatcher ──────────────────────────────────────────────
 
     async def _gale_place_order(
@@ -4261,7 +4583,7 @@ class ConsolidationBot:
         account_type: str = "PRACTICE",
     ) -> tuple:
         """Wrapper de place_order() para el GaleWatcher."""
-        return await place_order(
+        ok, oid, open_price, order_ref, reason, _opened_at_ts, _opened_at_source = await place_order(
             self.client,
             asset,
             direction,
@@ -4270,6 +4592,7 @@ class ConsolidationBot:
             self.dry_run,
             account_type=account_type,
         )
+        return ok, oid, open_price, order_ref, reason
 
     async def _gale_get_balance(self) -> float:
         """Retorna el balance actual para el GaleWatcher."""
@@ -4396,7 +4719,7 @@ class ConsolidationBot:
         log.info("[%s] %s ENTRADA[%s] %s  %s  $%.2f  %ds  | %s",
                  strategy_origin, icon, stage, direction.upper(), sym, amount, duration_sec, reason)
 
-        ok, oid, open_price, order_ref, reject_reason = await place_order(
+        ok, oid, open_price, order_ref, reject_reason, ticket_opened_at_ts, ticket_opened_at_source = await place_order(
             self.client,
             sym,
             direction,
@@ -4431,6 +4754,8 @@ class ConsolidationBot:
             duration_sec=int(duration_sec),
             payout=int(payout),
             score_original=float(score_original),
+            opened_at=float(ticket_opened_at_ts or time.time()),
+            opened_at_source=str(ticket_opened_at_source or "fallback:local_clock"),
         )
         trade = self.trades[sym]
         try:
@@ -4461,6 +4786,7 @@ class ConsolidationBot:
                     open_price=float(open_price or 0.0),
                     opened_at=datetime.fromtimestamp(trade.opened_at, tz=BROKER_TZ).isoformat(timespec="milliseconds"),
                     duration_sec=int(duration_sec),
+                    pre_objectives_note=f"ticket_opened_at_source={trade.opened_at_source}",
                 )
 
         self.stats["entries"] += 1
@@ -4483,12 +4809,7 @@ class ConsolidationBot:
                 order_ref=int(order_ref or 0),
                 account_type=self.account_type,
             )
-            _gale_task = asyncio.create_task(
-                self._gale_watcher.watch(gale_info),
-                name=f"gale_watch:{sym}:{stage}",
-            )
-            self._gale_tasks.add(_gale_task)
-            _gale_task.add_done_callback(self._gale_tasks.discard)
+            self._launch_gale_watch(gale_info, stage)
 
         if oid:
             log.info("  ✓ Orden aceptada  id=%s  open=%.5f  ref=%s", oid, open_price, order_ref)

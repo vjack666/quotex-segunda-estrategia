@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime, timezone
 from typing import Any, List, Mapping, Optional, Sequence
 import logging
@@ -187,9 +188,19 @@ class HubScanner:
             hub.update_gale_state(active=True, asset="GBPAUD_otc", secs_remaining=45.0)
         """
         g = self.state.gale
+        prev_price = g.current_price
         for key, value in kwargs.items():
             if hasattr(g, key):
+                if key == "current_price":
+                    try:
+                        v = float(value)
+                    except Exception:
+                        continue
+                    # Evita reset visual a 0.00000 por un tick fallido aislado.
+                    if v <= 0.0 and prev_price > 0.0:
+                        continue
                 setattr(g, key, value)
+        g.updated_at = time.time()
 
     def clear_gale_state(self) -> None:
         """Resetea el GaleState a inactivo (tras expirar la operación)."""
