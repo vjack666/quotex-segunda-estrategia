@@ -77,6 +77,9 @@ from trade_journal import get_journal
 from martingale_calculator import MartingaleCalculator
 from hub.hub_scanner import HubScanner
 from hub.hub_models import CandidateData
+from mg.mg_engine import MartingaleEngine, MGOpenTrade
+
+ROOT = Path(__file__).resolve().parent.parent
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 _stdout_handler = logging.StreamHandler(sys.stdout)
@@ -111,9 +114,10 @@ def _clear_quotex_session(client: Any) -> None:
         except Exception as exc:
             log.debug("No se pudo limpiar %s: %s", session_path, exc)
 # Forzar UTF-8 en la consola de Windows (evita UnicodeEncodeError con símbolos de caja).
-if hasattr(_stdout_handler.stream, "reconfigure"):
+_reconfigure = getattr(_stdout_handler.stream, "reconfigure", None)
+if callable(_reconfigure):
     try:
-        _stdout_handler.stream.reconfigure(encoding="utf-8")
+        _reconfigure(encoding="utf-8")
     except Exception:
         pass
 
@@ -148,12 +152,19 @@ SCAN_INTERVAL_SEC      = 60      # segundos entre escaneos completos
 CONNECT_RETRIES        = 3       # reintentos de conexión con delay
 MAX_CONCURRENT_TRADES  = 1       # máximo de operaciones abiertas simultáneas
 COOLDOWN_BETWEEN_ENTRIES = 30    # espera entre órdenes exitosas (segundos)
+LIVE_SCAN_MODE           = True  # escaneo continuo "super live" guiado por flujo de Quotex
+LIVE_SCAN_SLEEP_SEC      = 2.0   # pausa mínima entre ciclos live para no saturar WS
 ENTRY_SYNC_TO_CANDLE     = True  # alinear entrada al inicio de vela
 ENTRY_MAX_LAG_SEC        = 1.5   # cancelar si se envía tarde respecto a la vela
 ENTRY_REJECT_LAST_SEC    = 2.0   # margen mínimo de seguridad sobre vela 1m
+ENTRY_PRE_SEND_SEC       = 0.35  # enviar orden 350ms ANTES del open para compensar latencia WS
 ALIGN_SCAN_TO_CANDLE     = False # escaneo cada 60s (SCAN_INTERVAL_SEC)
 SCAN_LEAD_SEC            = 35.0  # escanear ~35s antes del próximo open de 5m
 MAX_LOSS_SESSION         = 0.20  # detener sesión si drawdown alcanza 20%
+
+# Filtro "cerca de disparo" para HUB/ejecución.
+HUB_NEAR_ENTRY_TOLERANCE_PCT = 0.0010  # 0.10% alrededor de piso/techo de zona
+HUB_BREAKOUT_CHASE_MAX_PCT   = 0.0008  # 0.08% máximo permitido tras ruptura
 
 # Ciclo matemático de gestión (estilo Masaniello simplificado)
 CYCLE_MAX_OPERATIONS     = 6     # reinicio duro al completar 6 operaciones
@@ -257,6 +268,9 @@ MARTIN_RESOLVE_GRACE_SEC = 5.0
 MARTIN_RESOLVE_TIMEOUT_SEC = 8.0
 MARTIN_RESOLVE_RETRY_SEC = 5.0
 MARTIN_RESOLVE_MAX_ATTEMPTS = 3
+MG_EXTERNAL_ENABLED = True
+MG_PREFIRE_SECONDS = 2.0
+MG_MONITOR_POLL_SECONDS = 0.5
 
 # STRAT-B (Spring Sweep) en paralelo (modo espejo por defecto)
 STRAT_B_CAN_TRADE      = True
@@ -354,6 +368,7 @@ class MAState:
     trend: str         # "UP" | "DOWN" | "FLAT"
     cross: str         # "GOLDEN" | "DEATH" | "NONE"
     avg_body: float = 0.0  # Promedio de cuerpos de última ventana (para impulsos OB)
+    price: float = 0.0     # Precio de cierre actual (para filtro de posición vs MAs)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -955,6 +970,14 @@ class ConsolidationBot:
         self.session_start_balance: Optional[float] = None
         self.current_balance:       Optional[float] = None
         self.martingale:            MartingaleCalculator = MartingaleCalculator()
+        self.mg_engine = MartingaleEngine(
+            get_price=self._get_current_price,
+            place_martin_order=self._external_mg_place_order,
+            log=lambda msg: log.info(msg),
+            prefire_sec=MG_PREFIRE_SECONDS,
+            poll_sec=MG_MONITOR_POLL_SECONDS,
+            enabled=MG_EXTERNAL_ENABLED,
+        )
         self.session_stop_hit:      bool = False
         self.cycle_id:              int = 1
         self.cycle_ops:             int = 0
@@ -986,8 +1009,10 @@ class ConsolidationBot:
         # Blacklist temporal de activos por racha de pérdidas.
         # Hub para registrar candidatos en tiempo real
         self.hub = HubScanner()
-        self.last_scan_strat_a: List[CandidateData] = []
-        self.last_scan_strat_b: List[CandidateData] = []
+        # Vincula el hub al motor de martingala para actualizar panel GALE
+        self.mg_engine._hub = self.hub
+        self.last_scan_strat_a: List[CandidateEntry] = []
+        self.last_scan_strat_b: List[CandidateEntry] = []
         self.asset_loss_streaks: dict[str, int] = {}
         self.asset_blacklist_until: dict[str, float] = {}
         # Estado técnico por activo para filtros adicionales.
@@ -995,6 +1020,9 @@ class ConsolidationBot:
         self.ma_state_by_asset: dict[str, MAState] = {}
         self._trade_tasks: set[asyncio.Task[Any]] = set()
         self.greylist_assets = set(GREYLIST_ASSETS)
+        # Offset de reloj servidor: diferencia entre ts de última vela y reloj local (segundos).
+        # Se actualiza con cada fetch de velas para compensar drift del reloj local.
+        self._clock_offset: float = 0.0
         if greylist_assets is not None:
             self.greylist_assets = {a.strip() for a in greylist_assets if a and a.strip()}
 
@@ -1089,6 +1117,7 @@ class ConsolidationBot:
                 self.client,
                 asset,
                 60,
+                BROKEN_FOLLOWUP_1M_COUNT,
                 timeout_sec=CANDLE_FETCH_1M_TIMEOUT_SEC,
             )
             payload = json.loads(capture_file.read_text(encoding="utf-8"))
@@ -1123,6 +1152,8 @@ class ConsolidationBot:
         self.session_start_balance = float(balance)
         self.current_balance = float(balance)
         self.martingale.set_balance(float(balance))
+        self.mg_engine.set_balance(float(balance))
+        self.hub.state.known_balance = float(balance)
         if self.cycle_start_balance is None:
             self.cycle_start_balance = float(balance)
 
@@ -1171,12 +1202,61 @@ class ConsolidationBot:
 
         return amount, expected_profit
 
+    def _candidate_trigger_distance_pct(self, candidate: CandidateEntry) -> Optional[float]:
+        """Distancia relativa del precio actual al gatillo operativo del candidato."""
+        price = self.last_known_price.get(candidate.asset)
+        if price is None or price <= 0:
+            return None
+
+        zone = candidate.zone
+        entry_mode = str(getattr(candidate, "_entry_mode", "rebound_floor") or "rebound_floor")
+        direction = str(candidate.direction or "").lower()
+
+        if entry_mode == "rebound_floor" or direction == "call":
+            if zone.floor <= 0:
+                return None
+            return abs(price - zone.floor) / zone.floor
+
+        if entry_mode == "rebound_ceiling" or direction == "put":
+            if zone.ceiling <= 0:
+                return None
+            return abs(price - zone.ceiling) / zone.ceiling
+
+        if entry_mode == "breakout_above":
+            if zone.ceiling <= 0:
+                return None
+            if price < zone.ceiling:
+                return None
+            return (price - zone.ceiling) / zone.ceiling
+
+        if entry_mode == "breakout_below":
+            if zone.floor <= 0:
+                return None
+            if price > zone.floor:
+                return None
+            return (zone.floor - price) / zone.floor
+
+        return None
+
+    def _is_candidate_near_trigger(self, candidate: CandidateEntry) -> bool:
+        """True si el activo está lo suficientemente cerca para posible ejecución."""
+        distance = self._candidate_trigger_distance_pct(candidate)
+        if distance is None:
+            return False
+
+        entry_mode = str(getattr(candidate, "_entry_mode", "rebound_floor") or "rebound_floor")
+        if entry_mode.startswith("breakout"):
+            return distance <= HUB_BREAKOUT_CHASE_MAX_PCT
+        return distance <= HUB_NEAR_ENTRY_TOLERANCE_PCT
+
     def _record_hub_scan_cycle(self, total_assets: int) -> None:
         """Actualiza el estado del HUB con los candidatos del ciclo actual."""
         try:
             strat_a_for_hub = []
-            for candidate in self.last_scan_strat_a[:5]:
+            sorted_a = sorted(self.last_scan_strat_a, key=lambda c: c.score, reverse=True)
+            for candidate in sorted_a[:5]:
                 try:
+                    dist = self._candidate_trigger_distance_pct(candidate)
                     cd = CandidateData(
                         strategy="STRAT-A",
                         asset=candidate.asset,
@@ -1191,18 +1271,22 @@ class ConsolidationBot:
                         entry_mode=getattr(
                             candidate,
                             "_entry_mode",
-                            candidate.mode.value if hasattr(candidate, "mode") else "rebound_floor",
+                            "rebound_floor",
                         ),
                         confidence=None,
                         signal_type=None,
+                        raw_reason="scan",
+                        dist_pct=dist,
                     )
                     strat_a_for_hub.append(cd)
                 except Exception as exc:
                     log.debug("HUB: Error converting STRAT-A candidate: %s", exc)
 
             strat_b_for_hub = []
-            for candidate in self.last_scan_strat_b[:5]:
+            sorted_b = sorted(self.last_scan_strat_b, key=lambda c: c.score, reverse=True)
+            for candidate in sorted_b[:5]:
                 try:
+                    dist = self._candidate_trigger_distance_pct(candidate)
                     cd = CandidateData(
                         strategy="STRAT-B",
                         asset=candidate.asset,
@@ -1217,6 +1301,8 @@ class ConsolidationBot:
                         entry_mode=getattr(candidate, "_entry_mode", "rebound_floor"),
                         confidence=getattr(candidate, "_reversal_strength", None),
                         signal_type=getattr(candidate, "_reversal_pattern", None),
+                        raw_reason="scan",
+                        dist_pct=dist,
                     )
                     strat_b_for_hub.append(cd)
                 except Exception as exc:
@@ -1619,6 +1705,26 @@ class ConsolidationBot:
         
         return points, info
 
+    def _update_clock_offset(self, candles: List[Candle], tf_sec: int) -> None:
+        """
+        Ajusta el offset entre reloj local y timestamps del broker.
+        Usa la ultima vela disponible y suaviza para evitar saltos bruscos.
+        """
+        if not candles or tf_sec <= 0:
+            return
+
+        last_ts = int(candles[-1].ts)
+        now_ts = time.time()
+        expected_open = (int(now_ts) // int(tf_sec)) * int(tf_sec)
+        raw_offset = float(last_ts - expected_open)
+
+        # Evitar offsets invalidos por respuestas viejas o ruido.
+        if raw_offset < -5.0 or raw_offset > 5.0:
+            return
+
+        alpha = 0.30
+        self._clock_offset = (alpha * raw_offset) + ((1.0 - alpha) * self._clock_offset)
+
     def _compute_ma_state(self, asset: str, candles_5m: List[Candle]) -> Optional[MAState]:
         if len(candles_5m) < MA_SLOW_PERIOD:
             log.debug("[MA] %s sin suficientes velas 5m (%d < %d)", asset, len(candles_5m), MA_SLOW_PERIOD)
@@ -1651,7 +1757,7 @@ class ConsolidationBot:
         bodies = [float(c.body) for c in candles_5m[-lookback_window:]]
         avg_body = mean(bodies) if bodies else 0.0
 
-        state = MAState(ma35=float(ma35), ma50=float(ma50), trend=trend, cross=cross, avg_body=float(avg_body))
+        state = MAState(ma35=float(ma35), ma50=float(ma50), trend=trend, cross=cross, avg_body=float(avg_body), price=float(price))
         self.ma_state_by_asset[asset] = state
         return state
 
@@ -1661,6 +1767,7 @@ class ConsolidationBot:
             return 0.0, "sin datos"
 
         points = 0.0
+        price = ma_state.price
         if direction == "call":
             if ma_state.trend == "UP":
                 points += 6.0
@@ -1676,7 +1783,38 @@ class ConsolidationBot:
             if ma_state.cross == "DEATH":
                 points += 4.0
 
-        info = f"trend={ma_state.trend} cross={ma_state.cross} ma35={ma_state.ma35:.5f} ma50={ma_state.ma50:.5f}"
+        # ── Penalización por posición del precio vs MAs ──────────────────────
+        # CALL con precio ENCIMA de ambas MAs en tendencia bajista:
+        # el precio está sobreextendido al alza en un entorno bajista → falsa ruptura.
+        if direction == "call" and ma_state.trend == "DOWN" and price > 0:
+            if price > ma_state.ma50:
+                points -= 25.0  # precio claramente en zona de venta para PUT
+            elif price > ma_state.ma35:
+                points -= 15.0  # precio sobre MA rápida en bajista
+
+        # PUT con precio DEBAJO de ambas MAs en tendencia alcista:
+        # el precio está sobreextendido a la baja en un entorno alcista → falsa ruptura.
+        if direction == "put" and ma_state.trend == "UP" and price > 0:
+            if price < ma_state.ma50:
+                points -= 25.0  # precio claramente en zona de compra para CALL
+            elif price < ma_state.ma35:
+                points -= 15.0  # precio bajo MA rápida en alcista
+
+        position_tag = ""
+        if price > 0:
+            if price > ma_state.ma50:
+                position_tag = " px>MA50"
+            elif price > ma_state.ma35:
+                position_tag = " px>MA35"
+            elif price < ma_state.ma50:
+                position_tag = " px<MA50"
+            elif price < ma_state.ma35:
+                position_tag = " px<MA35"
+
+        info = (
+            f"trend={ma_state.trend} cross={ma_state.cross} "
+            f"ma35={ma_state.ma35:.5f} ma50={ma_state.ma50:.5f}{position_tag}"
+        )
         return points, info
 
     @staticmethod
@@ -1765,6 +1903,52 @@ class ConsolidationBot:
             return False
         return True
 
+    def _to_mg_open_trade(self, trade: TradeState) -> MGOpenTrade:
+        return MGOpenTrade(
+            asset=trade.asset,
+            direction=trade.direction,
+            entry_price=trade.entry_price,
+            opened_at=trade.opened_at,
+            duration_sec=int(trade.duration_sec),
+            payout=int(trade.payout),
+            amount=float(trade.amount),
+            stage=trade.stage,
+            strategy_origin=trade.strategy_origin,
+            ceiling=trade.ceiling,
+            floor=trade.floor,
+            score_original=float(trade.score_original),
+        )
+
+    async def _external_mg_place_order(self, trade: MGOpenTrade, amount: float) -> bool:
+        if not self._martin_session_available():
+            return False
+
+        zone = ConsolidationZone(
+            asset=trade.asset,
+            ceiling=trade.ceiling,
+            floor=trade.floor,
+            bars_inside=0,
+            detected_at=time.time(),
+            range_pct=0.0,
+        )
+        payout_now = await self._get_asset_payout(trade.asset, trade.payout)
+        mg_amount = self._cap_martin_amount(amount, self.current_balance)
+        if mg_amount <= 0:
+            return False
+
+        return await self._enter(
+            trade.asset,
+            trade.direction,
+            mg_amount,
+            zone,
+            "MG externo | monitor en vivo (prefire)",
+            "martin",
+            strategy_origin=trade.strategy_origin,
+            duration_sec=int(trade.duration_sec),
+            payout=payout_now,
+            score_original=float(trade.score_original),
+        )
+
     def _track_task(self, task: asyncio.Task[Any]) -> None:
         self._trade_tasks.add(task)
         task.add_done_callback(self._on_background_task_done)
@@ -1791,6 +1975,7 @@ class ConsolidationBot:
             t for t in (list(self._trade_tasks) + list(self._followup_capture_tasks))
             if not t.done()
         ]
+        await self.mg_engine.shutdown()
         if not pending:
             return
         for t in pending:
@@ -1900,8 +2085,21 @@ class ConsolidationBot:
 
             price = await self._get_current_price(asset)
             if price is None:
+                try:
+                    self.hub.update_active_trade_timer(secs_left, entry_price=trade.entry_price)
+                except Exception:
+                    pass
                 await asyncio.sleep(MARTIN_MONITOR_INTERVAL_SEC)
                 continue
+
+            try:
+                self.hub.update_active_trade_timer(
+                    secs_left,
+                    current_price=price,
+                    entry_price=trade.entry_price,
+                )
+            except Exception:
+                pass
 
             losing_probably = (
                 price < trade.entry_price * (1.0 - MARTIN_ALERT_PCT)
@@ -2141,6 +2339,7 @@ class ConsolidationBot:
 
         self.current_balance = bal
         self.martingale.set_balance(bal)
+        self.mg_engine.set_balance(bal)
         if not self.session_start_balance or self.session_start_balance <= 0:
             return False
 
@@ -2347,13 +2546,24 @@ class ConsolidationBot:
 
         now = time.time()
         next_open = ((int(now) // TF_1M) + 1) * TF_1M
-        wait_sec = max(0.0, next_open - now)
+        # Ajustar con offset de reloj y adelantar ENTRY_PRE_SEND_SEC para llegar al broker a tiempo.
+        # now_adj usa el reloj calibrado con las últimas velas del servidor Quotex.
+        now_adj = now + self._clock_offset
+        next_open_adj = ((int(now_adj) // TF_1M) + 1) * TF_1M
+        # Esperar hasta ENTRY_PRE_SEND_SEC antes del open: la orden llega al broker ~al mismo tiempo.
+        wait_sec = max(0.0, next_open_adj - now_adj - ENTRY_PRE_SEND_SEC)
         if wait_sec > 0:
-            log.info("⏳ Esperando apertura de vela 1m: %.2fs", wait_sec)
+            if abs(self._clock_offset) >= 0.1:
+                log.info(
+                    "⏳ Esperando apertura 1m: %.2fs (offset reloj=%.2fs, pre-send=%.2fs)",
+                    wait_sec, self._clock_offset, ENTRY_PRE_SEND_SEC,
+                )
+            else:
+                log.info("⏳ Esperando apertura de vela 1m: %.2fs (pre-send=%.2fs)", wait_sec, ENTRY_PRE_SEND_SEC)
             await asyncio.sleep(wait_sec)
 
         send_ts = time.time()
-        lag_sec = send_ts - next_open
+        lag_sec = (send_ts + self._clock_offset) - next_open_adj
         time_since_open = send_ts % TF_1M
         secs_to_close = max(0.0, TF_1M - time_since_open)
 
@@ -2620,7 +2830,7 @@ class ConsolidationBot:
         strat_b_total = 0
         strat_b_insufficient = 0
         strat_b_timeout = 0  # fetches 1m que devolvieron 0 velas (timeout)
-        strat_b_hits: list[tuple[str, int, float]] = []
+        strat_b_hits: list[tuple[str, int, float, str, str]] = []
         strat_b_nearmiss: list[tuple[str, int, float, str]] = []
         
         # Limpiar registro de candidatos para este ciclo
@@ -2741,6 +2951,9 @@ class ConsolidationBot:
                 strat_b_total += 1
                 candles_1m = await _fetch_1m_limited(sym)
                 candles_1m_collected[sym] = candles_1m
+                # Calibrar reloj local contra timestamps del servidor Quotex.
+                if candles_1m:
+                    self._update_clock_offset(candles_1m, TF_1M)
                 if len(candles_1m_collected) > SCAN_CANDLES_BUFFER_MAX:
                     candles_1m_collected.pop(next(iter(candles_1m_collected)), None)
                 strat_b_signal = False
@@ -3242,20 +3455,22 @@ class ConsolidationBot:
                 )
                 candidate.candles_h1 = h1_candles
 
-                candidate._reversal_pattern = pattern_name  # type: ignore[attr-defined]
-                candidate._reversal_strength = strength  # type: ignore[attr-defined]
-                candidate._reversal_confirms = confirms  # type: ignore[attr-defined]
-                candidate._entry_mode = entry_mode  # type: ignore[attr-defined]
-                candidate._signal_ts_1m = candles_1m[-1].ts if candles_1m else None  # type: ignore[attr-defined]
+                setattr(candidate, "_reversal_pattern", pattern_name)
+                setattr(candidate, "_reversal_strength", strength)
+                setattr(candidate, "_reversal_confirms", confirms)
+                setattr(candidate, "_entry_mode", entry_mode)
+                setattr(candidate, "_signal_ts_1m", candles_1m[-1].ts if candles_1m else None)
 
-                candidate._amount = amount  # type: ignore[attr-defined]
-                candidate._stage = stage  # type: ignore[attr-defined]
-                candidate._ma_state = ma_state  # type: ignore[attr-defined]
-                candidate._order_blocks = blocks  # type: ignore[attr-defined]
-                candidate._ob_tf = ob_tf_label  # type: ignore[attr-defined]
-                candidate._force_execute = bool(
-                    FORCE_EXECUTE_STRONG_BREAKOUT and stage == "breakout" and breakout_strength_ok
-                )  # type: ignore[attr-defined]
+                setattr(candidate, "_amount", amount)
+                setattr(candidate, "_stage", stage)
+                setattr(candidate, "_ma_state", ma_state)
+                setattr(candidate, "_order_blocks", blocks)
+                setattr(candidate, "_ob_tf", ob_tf_label)
+                setattr(
+                    candidate,
+                    "_force_execute",
+                    bool(FORCE_EXECUTE_STRONG_BREAKOUT and stage == "breakout" and breakout_strength_ok),
+                )
 
                 score_candidate(candidate)
 
@@ -3310,13 +3525,13 @@ class ConsolidationBot:
                 if ob_points != 0:
                     candidate.score = round(candidate.score + ob_points, 1)
                     candidate.score_breakdown["order_block"] = round(ob_points, 1)
-                candidate._ob_info = f"tf={ob_tf_label} | {ob_info}"  # type: ignore[attr-defined]
+                setattr(candidate, "_ob_info", f"tf={ob_tf_label} | {ob_info}")
 
                 ma_points, ma_info = self._score_ma(direction, ma_state)
                 if ma_points != 0:
                     candidate.score = round(candidate.score + ma_points, 1)
                     candidate.score_breakdown["ma_filter"] = round(ma_points, 1)
-                candidate._ma_info = ma_info  # type: ignore[attr-defined]
+                setattr(candidate, "_ma_info", ma_info)
 
                 log.info(
                     "[OB] %s tf=%s dir=%s ajuste=%+.1f | %s",
@@ -3413,11 +3628,8 @@ class ConsolidationBot:
                 log.info("⏳→✅ %d candidato(s) de pending_reversals agregados al ciclo.", len(pending_confirmed))
                 candidates.extend(pending_confirmed)
 
-        candidates, pending_martin_entered = await self._process_pending_martin(candidates)
-        if pending_martin_entered:
-            await sleep_with_inline_countdown(COOLDOWN_BETWEEN_ENTRIES, "⏳ Cooldown post-martin diferido")
-            self._record_hub_scan_cycle(total_assets_available)
-            return
+        # Flujo legacy de martin diferido desactivado: la martingala ahora vive en mg_engine.
+        self.pending_martin.clear()
 
         prev_threshold = self.current_score_threshold
         session_threshold = self._update_dynamic_threshold()
@@ -3508,6 +3720,36 @@ class ConsolidationBot:
                 "⚠ Modo FORCE_BREAKOUT: %d ruptura(s) fuerte(s) enviadas aun con score bajo umbral.",
                 len(forced_breakouts),
             )
+
+        # Filtro final live: operar solo activos cerca del gatillo real.
+        near_selected: list[CandidateEntry] = []
+        moved_away: list[CandidateEntry] = []
+        for c in selected:
+            if bool(getattr(c, "_force_execute", False)) or self._is_candidate_near_trigger(c):
+                near_selected.append(c)
+            else:
+                moved_away.append(c)
+
+        if moved_away:
+            for c in moved_away:
+                distance = self._candidate_trigger_distance_pct(c)
+                dist_txt = f"{distance * 100:.3f}%" if distance is not None else "n/a"
+                log.info(
+                    "⏭ %s %s fuera de ventana de disparo (%s) — se pospone.",
+                    c.direction.upper(),
+                    c.asset,
+                    dist_txt,
+                )
+                journal.log_candidate(
+                    c,
+                    decision="REJECTED_WINDOW",
+                    reject_reason=f"fuera de ventana near-trigger ({dist_txt})",
+                    amount=getattr(c, "_amount", 0.0),
+                    stage=getattr(c, "_stage", "initial"),
+                    strategy=self._strategy_snapshot(),
+                )
+
+        selected = near_selected
 
         # Registrar rechazados por score
         for c in rejected:
@@ -3679,7 +3921,11 @@ class ConsolidationBot:
 
     async def _resolve_trade(self, trade: "TradeState", sym: str) -> None:
         """
-        Consulta el resultado de una operación expirada al broker
+        Constry:
+                self.hub.close_active_trade()
+            except Exception:
+                pass
+            ulta el resultado de una operación expirada al broker
         y actualiza el journal con WIN / LOSS / UNRESOLVED sin bloquear el bot.
         """
         if trade.resolved:
@@ -3771,68 +4017,19 @@ class ConsolidationBot:
                 self.stats["martin_losses"] += 1
 
         self._register_asset_outcome(sym, outcome)
-
-        # Actualizar estado de compensación para la próxima entrada
-        if outcome == "WIN":
-            self.compensation_pending = False
-            self.last_closed_outcome  = "WIN"
-            self.pending_martin.pop(sym, None)
-            # Registrar ganancia en Martingale Calculator
-            self.martingale.register_win(trade.amount, trade.payout)
-            log.info("✅ WIN registrado — próxima entrada usará monto inicial")
-        elif outcome == "LOSS":
-            self.compensation_pending = True
-            self.last_closed_amount   = trade.amount
-            self.last_closed_outcome  = "LOSS"
-            # Registrar pérdida en Martingale Calculator
-            _, loss_status = self.martingale.register_loss(trade.amount)
-            if loss_status == "RESET_3_LOSSES":
-                # Reset operativo completo tras 3 pérdidas en saldo bajo.
-                self.compensation_pending = False
-                self.pending_martin.pop(sym, None)
-                log.warning(
-                    "🔁 %s: gale reiniciado tras 3 pérdidas con saldo bajo; "
-                    "se vuelve al ciclo base de +$2",
-                    sym,
-                )
-            skip_martin = False
-            log.info(
-                "💔 LOSS registrado ($%.2f) — próxima entrada usará monto de compensación dinámico",
-                trade.amount,
-            )
-            if (not trade.martin_fired) and trade.stage != "martin":
-                if trade.score_original < 70.0:
-                    log.info(
-                        "⛔ %s: martingala omitida — score original %.1f < 70.0",
-                        sym,
-                        trade.score_original,
-                    )
-                    skip_martin = True
-                if not self._martin_session_available():
-                    skip_martin = True
-                if not skip_martin:
-                    payout_now = await self._get_asset_payout(sym, trade.payout)
-                    martin_amount, _ = self._compute_compensation_amount(payout_now, trade.amount)
-                    martin_amount = self._cap_martin_amount(martin_amount, self.current_balance)
-                    entered = await self._try_enter_martin_now(
-                        asset=sym,
-                        amount=martin_amount,
-                        original_loss=trade.amount,
-                        strategy_origin=trade.strategy_origin,
-                        score_original=trade.score_original,
-                        payout_hint=payout_now,
-                    )
-                    if not entered:
-                        self.pending_martin[sym] = MartinPending(
-                            asset=sym,
-                            amount=martin_amount,
-                            original_loss=trade.amount,
-                            score_original=trade.score_original,
-                            created_at=datetime.now(tz=BROKER_TZ),
-                        )
+        self.compensation_pending = False
+        self.last_closed_amount = float(trade.amount)
+        self.last_closed_outcome = outcome
+        self.pending_martin.pop(sym, None)
+        self.mg_engine.on_trade_close(self._to_mg_open_trade(trade), outcome, profit)
 
         if self.trades.get(sym) is trade:
             self.trades.pop(sym, None)
+        try:
+            self.hub.record_trade_result(sym, outcome, profit)
+            self.hub.close_active_trade()
+        except Exception:
+            pass
 
         # Avisar si hay candidatos vigilados listos para considerar en el próximo escaneo.
         if self.watched_candidates:
@@ -3983,9 +4180,18 @@ class ConsolidationBot:
             score_original=float(score_original),
         )
         trade = self.trades[sym]
+        try:
+            self.hub.record_entry(
+                strategy=strategy_origin,
+                asset=sym,
+                direction=direction,
+                duration_sec=int(duration_sec),
+                entry_price=open_price,
+            )
+        except Exception as exc:
+            log.debug("HUB: no se pudo registrar entrada activa %s: %s", sym, exc)
         self._track_task(asyncio.create_task(self._resolve_trade_after_expiry(sym, trade), name=f"resolve:{sym}:{stage}"))
-        if strategy_origin == "STRAT-A" and stage == "initial":
-            self._track_task(asyncio.create_task(self._monitor_trade_live(sym, trade), name=f"monitor:{sym}"))
+        self.mg_engine.on_trade_open(self._to_mg_open_trade(trade))
         # Actualizar el journal con el order_id real del broker (aunque sea vacío)
         if journal_cid:
             stored_oid = oid if oid else f"REF-{order_ref}" if order_ref else "BROKER_NO_ID"
@@ -4098,6 +4304,9 @@ async def sleep_with_inline_countdown(wait_seconds: float, label: str) -> None:
 
 def seconds_until_next_scan(now_ts: Optional[float] = None) -> float:
     """Calcula segundos hasta el próximo scan alineado a vela de 5m."""
+    if LIVE_SCAN_MODE:
+        return max(0.5, float(LIVE_SCAN_SLEEP_SEC))
+
     now = time.time() if now_ts is None else float(now_ts)
     if ALIGN_SCAN_TO_CANDLE:
         next_open = ((int(now) // TF_5M) + 1) * TF_5M
@@ -4137,6 +4346,7 @@ async def main(
     loop_forever: bool,
     greylist_assets: Optional[set[str]] = None,
     on_cycle_end: Optional[Any] = None,
+    on_bot_ready: Optional[Any] = None,
 ) -> Optional[ConsolidationBot]:
     if not EMAIL or not PASSWORD:
         print("ERROR: Falta QUOTEX_EMAIL / QUOTEX_PASSWORD en el .env")
@@ -4150,7 +4360,7 @@ async def main(
     log.info("║  Modo    : %-34s║", "LIVE" if not dry_run else "DRY-RUN")
     log.info("║  Velas   : %-2d min  Rango: %.1f%%  Timeout: %dmin ║",
              MIN_CONSOLIDATION_BARS, MAX_RANGE_PCT * 100, MAX_CONSOLIDATION_MIN)
-    log.info("║  Montos  : dinámicos (MartingaleCalculator)   ║")
+    log.info("║  Montos  : base + MG externo independiente     ║")
     log.info("║  Payout  : %d%%  |  Vol filtro: %.1fx avg body ║",
              MIN_PAYOUT, VOLUME_MULTIPLIER)
     log.info("╚══════════════════════════════════════════════╝")
@@ -4182,13 +4392,22 @@ async def main(
     if start_balance is not None:
         bot.set_session_start_balance(start_balance)
 
+    # Notificar que el bot ya existe y tiene balance (antes del primer scan).
+    if on_bot_ready is not None:
+        try:
+            result = on_bot_ready(bot)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception:
+            pass
+
     # Reconciliar pendientes históricos al arrancar para limpiar métricas.
     await bot.reconcile_pending_candidates()
 
     try:
         # Alinear también el PRIMER escaneo al reloj de vela para evitar señales
         # fuera de ventana al iniciar el bot en un segundo arbitrario.
-        if loop_forever and ALIGN_SCAN_TO_CANDLE:
+        if loop_forever and ALIGN_SCAN_TO_CANDLE and not LIVE_SCAN_MODE:
             first_wait = seconds_until_next_scan(time.time())
             await sleep_with_inline_countdown(first_wait, "Sincronizando primer escaneo")
             log.info("Sincronización completada. Iniciando escaneo.")
@@ -4232,14 +4451,19 @@ async def main(
                 log.info("Ciclo único completado. Agrega --loop para modo 24/7.")
                 break
 
-            if ALIGN_SCAN_TO_CANDLE:
+            if LIVE_SCAN_MODE:
+                sleep_for = max(0.5, float(LIVE_SCAN_SLEEP_SEC))
+            elif ALIGN_SCAN_TO_CANDLE:
                 sleep_for = seconds_until_next_scan(time.time())
             else:
                 elapsed = time.time() - cycle_start
                 sleep_for = max(5.0, SCAN_INTERVAL_SEC - elapsed)
 
             try:
-                await sleep_with_inline_countdown(sleep_for, "Próximo escaneo")
+                if LIVE_SCAN_MODE:
+                    await asyncio.sleep(sleep_for)
+                else:
+                    await sleep_with_inline_countdown(sleep_for, "Próximo escaneo")
             except asyncio.CancelledError:
                 log.info("Loop cancelado por interrupción del usuario.")
                 break

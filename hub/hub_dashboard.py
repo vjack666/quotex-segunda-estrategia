@@ -5,211 +5,428 @@ from __future__ import annotations
 import os
 import sys
 from datetime import datetime, timezone
-from typing import List
+from typing import List, Optional
 
-from .hub_models import CandidateData, HubState
+from .hub_models import CandidateData, GaleState, HubState
 
+try:
+    from rich.console import Console
+    from rich.layout import Layout
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+    _RICH_OK = True
+except Exception:  # pragma: no cover
+    Console = None  # type: ignore[assignment]
+    Layout = None   # type: ignore[assignment]
+    Live = None     # type: ignore[assignment]
+    Panel = None    # type: ignore[assignment]
+    Table = None    # type: ignore[assignment]
+    Text = None     # type: ignore[assignment]
+    _RICH_OK = False
+
+
+# ── colores ANSI (fallback y compat) ─────────────────────────────────────────
+_RESET   = "\033[0m"
+_BOLD    = "\033[1m"
+_DIM     = "\033[2m"
+_CYAN    = "\033[96m"
+_GREEN   = "\033[92m"
+_YELLOW  = "\033[93m"
+_RED     = "\033[91m"
+_BLUE    = "\033[94m"
+_MAGENTA = "\033[95m"
+
+
+# ── helpers Rich markup ───────────────────────────────────────────────────────
+
+def _direction_markup(direction: str) -> str:
+    d = direction.upper()
+    return f"[bold green]{d}[/bold green]" if d == "CALL" else f"[bold red]{d}[/bold red]"
+
+
+def _dist_markup(dist_pct: Optional[float]) -> str:
+    """Color según cercanía al trigger: verde ≤0.10%, amarillo ≤0.30%, dim si lejos."""
+    if dist_pct is None:
+        return "[dim]  --  [/dim]"
+    pct = dist_pct * 100.0
+    if pct <= 0.10:
+        return f"[bold green]{pct:.2f}%[/bold green]"
+    if pct <= 0.30:
+        return f"[yellow]{pct:.2f}%[/yellow]"
+    return f"[dim]{pct:.2f}%[/dim]"
+
+
+_ENTRY_ABBREV = {
+    "rebound_floor":          "reb_floor",
+    "rebound_ceiling":        "reb_ceil",
+    "breakout_above":         "brk_above",
+    "breakout_below":         "brk_below",
+    "spring":                 "spring",
+    "upthrust":               "upthrust",
+    "wyckoff_early_spring":   "wyk_spring",
+    "wyckoff_early_upthrust": "wyk_upthr",
+    "none":                   "—",
+}
+
+
+def _abbrev(mode: str) -> str:
+    return _ENTRY_ABBREV.get(mode, mode[:10])
+
+
+# ── tablas Rich ───────────────────────────────────────────────────────────────
+
+def _build_strat_a_table(candidates: List[CandidateData]) -> "Table":
+    t = Table(show_header=True, header_style="bold cyan", box=None, padding=(0, 1), expand=True)
+    t.add_column("#",      width=2,  justify="right")
+    t.add_column("Activo", width=14, no_wrap=True)
+    t.add_column("Dir",    width=6)
+    t.add_column("Score",  width=6,  justify="right")
+    t.add_column("P%",     width=4,  justify="right")
+    t.add_column("Dist",   width=7,  justify="right")
+    t.add_column("Modo",   width=11, no_wrap=True)
+    t.add_column("Patron", min_width=12)
+
+    if not candidates:
+        t.add_row("[dim]—[/dim]", "[dim]Sin candidatos en este escaneo[/dim]",
+                  "", "", "", "", "", "")
+        return t
+
+    for i, c in enumerate(candidates[:5], 1):
+        s_col = "green" if c.score >= 65 else "yellow" if c.score >= 50 else "red"
+        p_col = "green" if c.payout >= 80 else "yellow" if c.payout >= 70 else "red"
+        t.add_row(
+            str(i),
+            f"[bold]{c.asset}[/bold]",
+            _direction_markup(c.direction),
+            f"[{s_col}]{c.score:.1f}[/{s_col}]",
+            f"[{p_col}]{c.payout}[/{p_col}]",
+            _dist_markup(c.dist_pct),
+            f"[dim]{_abbrev(c.entry_mode)}[/dim]",
+            f"[dim]{c.pattern[:18]}[/dim]",
+        )
+    return t
+
+
+def _build_strat_b_table(candidates: List[CandidateData]) -> "Table":
+    t = Table(show_header=True, header_style="bold magenta", box=None, padding=(0, 1), expand=True)
+    t.add_column("#",      width=2,  justify="right")
+    t.add_column("Activo", width=14, no_wrap=True)
+    t.add_column("Dir",    width=6)
+    t.add_column("Conf%",  width=6,  justify="right")
+    t.add_column("P%",     width=4,  justify="right")
+    t.add_column("Dist",   width=7,  justify="right")
+    t.add_column("Señal",  width=11, no_wrap=True)
+    t.add_column("Patron", min_width=12)
+
+    if not candidates:
+        t.add_row("[dim]—[/dim]", "[dim]Sin candidatos en este escaneo[/dim]",
+                  "", "", "", "", "", "")
+        return t
+
+    for i, c in enumerate(candidates[:5], 1):
+        conf  = 0.0 if c.confidence is None else c.confidence * 100.0
+        c_col = "green" if conf >= 70 else "yellow" if conf >= 60 else "red"
+        p_col = "green" if c.payout >= 80 else "yellow" if c.payout >= 70 else "red"
+        signal = _abbrev(c.signal_type or c.entry_mode or "none")
+        t.add_row(
+            str(i),
+            f"[bold]{c.asset}[/bold]",
+            _direction_markup(c.direction),
+            f"[{c_col}]{conf:.1f}[/{c_col}]",
+            f"[{p_col}]{c.payout}[/{p_col}]",
+            _dist_markup(c.dist_pct),
+            f"[dim]{signal}[/dim]",
+            f"[dim]{c.pattern[:18]}[/dim]",
+        )
+    return t
+
+
+def _build_status_table(state: HubState, balance: float) -> "Table":
+    now = datetime.now(tz=timezone.utc).strftime("%H:%M:%S")
+    cycle_id = 0 if state.last_scan is None else state.last_scan.cycle_id
+    ops = state.last_scan.cycle_ops if state.last_scan else 0
+
+    t = Table.grid(padding=(0, 2))
+    t.add_column(); t.add_column(); t.add_column(); t.add_column(); t.add_column()
+    t.add_row(
+        f"[cyan]UTC {now}[/cyan]",
+        f"[magenta]Scans {state.total_scans}[/magenta]",
+        f"[yellow]Ciclo #{cycle_id}[/yellow]",
+        f"[blue]Balance ${balance:.2f}[/blue]",
+        f"Ops [cyan]{ops}[/cyan]  |  "
+        f"[bold green]{state.live_wins}W[/bold green]"
+        f"[dim]/[/dim]"
+        f"[bold red]{state.live_losses}L[/bold red]",
+    )
+
+    if state.active_trade_asset:
+        secs = int(state.active_trade_time_remaining_sec or 0)
+        direction = (state.active_trade_direction or "").upper()
+        row = f"[bold red]▶ ACTIVA {state.active_trade_asset} {direction} {secs}s[/bold red]"
+        if state.active_trade_entry_price is not None:
+            row += f"  EP {state.active_trade_entry_price:.5f}"
+        if state.active_trade_current_price is not None:
+            row += f"  PX {state.active_trade_current_price:.5f}"
+        if state.active_trade_delta_pct is not None:
+            dc = "green" if state.active_trade_delta_pct >= 0 else "red"
+            row += f"  [{dc}]Δ {state.active_trade_delta_pct:+.2f}%[/{dc}]"
+        t.add_row(row, "", "", "", "")
+
+    elif state.last_trade_outcome is not None:
+        outcome = state.last_trade_outcome
+        asset   = state.last_trade_asset or "?"
+        profit  = state.last_trade_profit or 0.0
+        if outcome == "WIN":
+            result = f"[bold green]✔ LAST WIN  {asset}  +${profit:.2f}[/bold green]"
+        elif outcome == "LOSS":
+            result = f"[bold red]✘ LAST LOSS  {asset}  -${abs(profit):.2f}[/bold red]"
+        else:
+            result = f"[yellow]» LAST {outcome}  {asset}[/yellow]"
+        t.add_row(result, "", "", "", "")
+
+    return t
+
+
+def _build_gale_panel(g: "GaleState") -> "Panel":
+    """Construye el panel GALE con estado del martingale pendiente."""
+    expected_profit = g.amount * (g.payout / 100.0)
+    secs = int(g.seconds_until_fire)
+    dir_markup = _direction_markup(g.direction)
+    gale_num = g.cycle_losses + 1  # Gale #1, #2, etc.
+
+    t = Table.grid(padding=(0, 2))
+    t.add_column(style="bold")
+    t.add_column()
+    t.add_row("[bold yellow]Par[/bold yellow]",      f"[bold white]{g.asset}[/bold white]  {dir_markup}")
+    t.add_row("[bold yellow]Gale #[/bold yellow]",   f"[bold magenta]{gale_num}[/bold magenta]  [dim](acumulado para +$2)[/dim]")
+    t.add_row("[bold yellow]Tiempo[/bold yellow]",   f"[bold red]{secs}s[/bold red]")
+    t.add_row("[bold yellow]Monto[/bold yellow]",    f"[bold cyan]${g.amount:.2f}[/bold cyan]")
+    t.add_row("[bold yellow]Ganancia[/bold yellow]", f"[bold green]+${expected_profit:.2f}[/bold green]  [dim](payout {g.payout}%)[/dim]")
+
+    return Panel(
+        t,
+        title="[bold yellow]⚡ GALE PENDIENTE[/bold yellow]",
+        border_style="yellow",
+        padding=(0, 1),
+    )
+
+
+def _build_layout(state: HubState, balance: float) -> "Layout":
+    layout = Layout()
+
+    if state.gale_pending is not None:
+        layout.split_column(
+            Layout(name="header", size=5),
+            Layout(name="body",   ratio=1),
+            Layout(name="gale",   size=9),
+            Layout(name="footer", size=1),
+        )
+    else:
+        layout.split_column(
+            Layout(name="header", size=5),
+            Layout(name="body",   ratio=1),
+            Layout(name="footer", size=1),
+        )
+
+    layout["body"].split_row(Layout(name="strat_a"), Layout(name="strat_b"))
+
+    layout["header"].update(
+        Panel(
+            _build_status_table(state, balance),
+            title="[bold cyan]QUOTEX BOT HUB — LIVE[/bold cyan]",
+            border_style="cyan",
+        )
+    )
+
+    a_count = len(state.strat_a_watching)
+    a_inner = Table.grid(expand=True)
+    a_inner.add_column()
+    a_inner.add_row(Text.from_markup("[dim]Score · Dir · Dist-trigger · Modo · Patron[/dim]"))
+    a_inner.add_row(_build_strat_a_table(state.strat_a_watching))
+    layout["strat_a"].update(
+        Panel(
+            a_inner,
+            title=f"[bold cyan]STRAT-A | CONSOLIDACION[/bold cyan]  [dim]({a_count})[/dim]",
+            border_style="cyan",
+            padding=(0, 1),
+        )
+    )
+
+    b_count = len(state.strat_b_watching)
+    b_inner = Table.grid(expand=True)
+    b_inner.add_column()
+    b_inner.add_row(Text.from_markup("[dim]Conf · Dir · Dist-trigger · Señal · Patron[/dim]"))
+    b_inner.add_row(_build_strat_b_table(state.strat_b_watching))
+    layout["strat_b"].update(
+        Panel(
+            b_inner,
+            title=f"[bold magenta]STRAT-B | SPRING/WYCKOFF[/bold magenta]  [dim]({b_count})[/dim]",
+            border_style="magenta",
+            padding=(0, 1),
+        )
+    )
+
+    layout["footer"].update(
+        Text(
+            "CTRL+C para salir  |  Escaneo continuo  |  "
+            "● verde=≤0.10%  ● amarillo=≤0.30%  ● dim=lejos del trigger",
+            justify="center",
+            style="dim",
+        )
+    )
+
+    if state.gale_pending is not None:
+        layout["gale"].update(_build_gale_panel(state.gale_pending))
+
+    return layout
+
+
+# ── clase pública ─────────────────────────────────────────────────────────────
 
 class HubDashboard:
-    """Renderiza el HUB con dos paneles: STRAT-A y STRAT-B."""
+    """Renderiza el HUB con Rich Layout (dos paneles lado a lado)."""
 
-    RESET = "\033[0m"
-    BOLD = "\033[1m"
-    DIM = "\033[2m"
-    CYAN = "\033[96m"
-    GREEN = "\033[92m"
-    YELLOW = "\033[93m"
-    RED = "\033[91m"
-    BLUE = "\033[94m"
-    MAGENTA = "\033[95m"
+    # Compat: exponer constantes ANSI que main.py u otro código puede referenciar
+    RESET   = _RESET
+    BOLD    = _BOLD
+    DIM     = _DIM
+    CYAN    = _CYAN
+    GREEN   = _GREEN
+    YELLOW  = _YELLOW
+    RED     = _RED
+    BLUE    = _BLUE
+    MAGENTA = _MAGENTA
 
     TOTAL_WIDTH = 180
-    BOX_WIDTH = 89
-    BOX_ROWS = 10
-    _screen_initialized = False
+    _console: Optional["Console"] = None
+    _live: Optional["Live"] = None
 
     @classmethod
-    def clear_screen(cls) -> None:
-        os.system("cls" if os.name == "nt" else "clear")
+    def _get_console(cls) -> "Console":
+        if cls._console is None:
+            cls._console = Console(force_terminal=True, legacy_windows=False)
+        return cls._console
+
+    @classmethod
+    def _ensure_live(cls) -> "Live":
+        if cls._live is None:
+            cls._live = Live(
+                Text(""),
+                console=cls._get_console(),
+                auto_refresh=False,
+                refresh_per_second=8,
+                transient=False,
+                screen=False,
+                vertical_overflow="crop",
+                redirect_stdout=False,
+                redirect_stderr=False,
+            )
+            cls._live.start()
+        return cls._live
+
+    @classmethod
+    def shutdown(cls) -> None:
+        """Cierra el render live limpiamente."""
+        if cls._live is not None:
+            try:
+                cls._live.stop()
+            except Exception:
+                pass
+        cls._live = None
+        cls._console = None
+
+    @classmethod
+    def display(cls, state: HubState, balance: float = 0.0) -> None:
+        """Renderiza o actualiza el dashboard en el terminal."""
+        if not _RICH_OK:
+            cls._display_fallback(state, balance)
+            return
+        try:
+            renderable = _build_layout(state, balance)
+            live = cls._ensure_live()
+            live.update(renderable, refresh=True)
+        except Exception:
+            cls._display_fallback(state, balance)
+
+    # ── fallback ANSI ─────────────────────────────────────────────────────────
+    _last_text: str = ""
+    _screen_initialized: bool = False
+
+    @classmethod
+    def _display_fallback(cls, state: HubState, balance: float) -> None:
+        text = cls._render_fallback(state, balance)
+        if text == cls._last_text:
+            return
+        if not cls._screen_initialized:
+            import os as _os
+            _os.system("cls" if _os.name == "nt" else "clear")
+            cls._screen_initialized = True
+        sys.stdout.write("\033[H\033[J" + text + "\n")
+        sys.stdout.flush()
+        cls._last_text = text
+
+    @classmethod
+    def _render_fallback(cls, state: HubState, balance: float) -> str:
+        now = datetime.now(tz=timezone.utc).strftime("%H:%M:%S")
+        lines = [
+            f"{_BOLD}{_CYAN}{'=' * 80}{_RESET}",
+            f"{_BOLD}{_MAGENTA}QUOTEX BOT HUB - LIVE{_RESET}",
+            f"UTC {now} | Scans {state.total_scans} | Balance ${balance:.2f} | "
+            f"{_GREEN}{state.live_wins}W{_RESET}/{_RED}{state.live_losses}L{_RESET}",
+            "",
+        ]
+        for label, candidates in [("STRAT-A", state.strat_a_watching),
+                                   ("STRAT-B", state.strat_b_watching)]:
+            lines.append(f"{_BOLD}--- {label} ---{_RESET}")
+            if not candidates:
+                lines.append("  Sin candidatos en este escaneo")
+            else:
+                for i, c in enumerate(candidates[:5], 1):
+                    dist = f"{c.dist_pct * 100:.2f}%" if c.dist_pct is not None else "--"
+                    lines.append(
+                        f"  {i}. {c.asset:<12} {c.direction:<4} "
+                        f"S:{c.score:.1f} P:{c.payout}% Dist:{dist}"
+                    )
+            lines.append("")
+        lines.append(f"{_DIM}CTRL+C para salir{_RESET}")
+        return "\n".join(lines)
+
+    # ── compat: métodos usados por main.py / código legacy ───────────────────
 
     @classmethod
     def display_text(cls, text: str) -> None:
-        """Refresca en sitio para evitar parpadeo por limpiar pantalla completa."""
-        if not cls._screen_initialized:
-            cls.clear_screen()
-            cls._screen_initialized = True
-
-        # Cursor al origen + limpiar desde cursor hasta el final.
-        sys.stdout.write("\033[H\033[J")
-        sys.stdout.write(text)
-        if not text.endswith("\n"):
-            sys.stdout.write("\n")
-        sys.stdout.flush()
-
-    @classmethod
-    def _safe_trim(cls, text: str, width: int) -> str:
-        if len(text) <= width:
-            return text
-        if width <= 3:
-            return text[:width]
-        return text[: width - 3] + "..."
+        """Acepta texto ANSI y lo renderiza (compat con main.py legacy)."""
+        if _RICH_OK:
+            try:
+                live = cls._ensure_live()
+                live.update(Text.from_ansi(text), refresh=True)
+                return
+            except Exception:
+                pass
+        if text != cls._last_text:
+            sys.stdout.write("\033[H\033[J" + text)
+            sys.stdout.flush()
+            cls._last_text = text
 
     @classmethod
-    def _box_top(cls, title: str, width: int) -> str:
-        title_plain = cls._safe_trim(title, width - 4)
-        raw = f" {title_plain} "
-        left = max(0, (width - 2 - len(raw)) // 2)
-        right = max(0, width - 2 - len(raw) - left)
-        return f"╔{'═' * left}{cls.BOLD}{raw}{cls.RESET}{'═' * right}╗"
-
-    @classmethod
-    def _box_mid(cls, content: str, width: int) -> str:
-        clipped = cls._safe_trim(content, width - 4)
-        return f"║ {clipped.ljust(width - 4)} ║"
-
-    @classmethod
-    def _box_bottom(cls, width: int) -> str:
-        return f"╚{'═' * (width - 2)}╝"
-
-    @classmethod
-    def _direction_tag(cls, direction: str) -> str:
-        value = direction.upper()
-        if value == "CALL":
-            return f"{cls.GREEN}{value}{cls.RESET}"
-        return f"{cls.RED}{value}{cls.RESET}"
-
-    _ENTRY_MODE_ABBREV = {
-        "rebound_floor":           "reb_floor",
-        "rebound_ceiling":         "reb_ceil",
-        "breakout_above":          "brk_above",
-        "breakout_below":          "brk_below",
-        "spring":                  "spring",
-        "upthrust":                "upthrust",
-        "wyckoff_early_spring":    "wyk_spring",
-        "wyckoff_early_upthrust":  "wyk_upthr",
-        "none":                    "—",
-    }
-
-    @classmethod
-    def _abbrev_mode(cls, mode: str) -> str:
-        return cls._ENTRY_MODE_ABBREV.get(mode, mode[:10])
-
-    @classmethod
-    def _format_strat_a_row(cls, rank: int, candidate: CandidateData) -> str:
-        direction = cls._direction_tag(candidate.direction)
-        mode = cls._abbrev_mode(candidate.entry_mode)
-        return (
-            f"{rank}. {candidate.asset:<10} {direction:<14} "
-            f"S:{candidate.score:5.1f} P:{candidate.payout:>2}% "
-            f"{mode:<10} {candidate.pattern[:14]}"
-        )
-
-    @classmethod
-    def _format_strat_b_row(cls, rank: int, candidate: CandidateData) -> str:
-        direction = cls._direction_tag(candidate.direction)
-        conf = 0.0 if candidate.confidence is None else candidate.confidence * 100.0
-        signal = cls._abbrev_mode(candidate.signal_type or candidate.entry_mode)
-        return (
-            f"{rank}. {candidate.asset:<10} {direction:<14} "
-            f"C:{conf:5.1f}% P:{candidate.payout:>2}% "
-            f"{signal:<10} {candidate.pattern[:16]}"
-        )
-
-    @classmethod
-    def _render_strategy_box(
-        cls,
-        *,
-        title: str,
-        subtitle: str,
-        candidates: List[CandidateData],
-        formatter,
-        width: int,
-    ) -> List[str]:
-        lines: List[str] = [cls._box_top(title, width)]
-        lines.append(cls._box_mid(subtitle, width))
-        lines.append(cls._box_mid("", width))
-
-        if not candidates:
-            lines.append(cls._box_mid("Sin candidatos en este escaneo", width))
-        else:
-            for idx, candidate in enumerate(candidates[:5], start=1):
-                lines.append(cls._box_mid(formatter(idx, candidate), width))
-
-        while len(lines) < cls.BOX_ROWS:
-            lines.append(cls._box_mid("", width))
-
-        lines.append(cls._box_bottom(width))
-        return lines
+    def render_full_dashboard(cls, state: HubState, balance: float = 0.0) -> str:
+        """Compat: devuelve texto ANSI (usado por código que no llama a display())."""
+        return cls._render_fallback(state, balance)
 
     @classmethod
     def render_status_bar(cls, state: HubState, balance: float = 0.0) -> str:
         now = datetime.now(tz=timezone.utc).strftime("%H:%M:%S")
         cycle_id = 0 if state.last_scan is None else state.last_scan.cycle_id
-
-        info = [
-            f"{cls.CYAN}UTC {now}{cls.RESET}",
-            f"{cls.MAGENTA}Scans {state.total_scans}{cls.RESET}",
-            f"{cls.YELLOW}Cycle #{cycle_id}{cls.RESET}",
-            f"{cls.BLUE}Balance ${balance:.2f}{cls.RESET}",
-        ]
-
-        if state.last_scan is not None:
-            info.append(
-                f"Ops {state.last_scan.cycle_ops} | "
-                f"{cls.GREEN}{state.last_scan.cycle_wins}W{cls.RESET}/"
-                f"{cls.RED}{state.last_scan.cycle_losses}L{cls.RESET}"
-            )
-
-        if state.active_trade_asset:
-            seconds = int(state.active_trade_time_remaining_sec or 0)
-            direction = (state.active_trade_direction or "").upper()
-            info.append(
-                f"{cls.RED}ACTIVA {state.active_trade_asset} {direction} {seconds}s{cls.RESET}"
-            )
-
-        return " | ".join(info)
+        return (
+            f"{_CYAN}UTC {now}{_RESET} | "
+            f"{_MAGENTA}Scans {state.total_scans}{_RESET} | "
+            f"{_YELLOW}Ciclo #{cycle_id}{_RESET} | "
+            f"{_BLUE}Balance ${balance:.2f}{_RESET} | "
+            f"{_GREEN}{state.live_wins}W{_RESET}/{_RED}{state.live_losses}L{_RESET}"
+        )
 
     @classmethod
-    def render_full_dashboard(cls, state: HubState, balance: float = 0.0) -> str:
-        top = f"{cls.BOLD}{cls.CYAN}{'=' * cls.TOTAL_WIDTH}{cls.RESET}"
-        lines: List[str] = [
-            top,
-            f"{cls.BOLD}{cls.MAGENTA}QUOTEX BOT HUB - LIVE{cls.RESET}",
-            top,
-            cls.render_status_bar(state, balance),
-            "",
-        ]
-
-        left = cls._render_strategy_box(
-            title="STRAT-A | CONSOLIDACION",
-            subtitle="Score, payout, modo de entrada, patron",
-            candidates=state.strat_a_watching,
-            formatter=cls._format_strat_a_row,
-            width=cls.BOX_WIDTH,
-        )
-        right = cls._render_strategy_box(
-            title="STRAT-B | SPRING/WYCKOFF",
-            subtitle="Confidence, payout, tipo de senal, patron",
-            candidates=state.strat_b_watching,
-            formatter=cls._format_strat_b_row,
-            width=cls.BOX_WIDTH,
-        )
-
-        rows = max(len(left), len(right))
-        for i in range(rows):
-            left_row = left[i] if i < len(left) else " " * cls.BOX_WIDTH
-            right_row = right[i] if i < len(right) else " " * cls.BOX_WIDTH
-            lines.append(f"{left_row}  {right_row}")
-
-        lines.extend(
-            [
-                "",
-                f"{cls.DIM}CTRL+C para salir | Escaneo continuo | Candidatos se refrescan por ciclo{cls.RESET}",
-                top,
-            ]
-        )
-        return "\n".join(lines)
-
-    @classmethod
-    def display(cls, state: HubState, balance: float = 0.0) -> None:
-        cls.display_text(cls.render_full_dashboard(state, balance))
+    def clear_screen(cls) -> None:
+        os.system("cls" if os.name == "nt" else "clear")

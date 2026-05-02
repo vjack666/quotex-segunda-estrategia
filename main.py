@@ -24,7 +24,7 @@ if str(SRC_DIR) not in sys.path:
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="QUOTEX executor 24/7 (consolidation + martingala + risk)",
+        description="QUOTEX executor 24/7 (consolidation + mg externo + risk)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--real", action="store_true", help="Operar en cuenta REAL (default: DEMO)")
@@ -35,7 +35,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Modo HUB: solo lectura (sin enviar ordenes), loop de 60s para monitoreo",
     )
 
-    # Gestión de capital / martingala
+    # Gestion de capital / motor martingala externo
     p.add_argument(
         "--amount-initial",
         type=float,
@@ -47,6 +47,23 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=2.0,
         help="Incremento objetivo por ciclo para la calculadora de riesgo",
+    )
+    p.add_argument(
+        "--mg-disabled",
+        action="store_true",
+        help="Desactiva el motor externo de martingala en background",
+    )
+    p.add_argument(
+        "--mg-prefire-sec",
+        type=float,
+        default=2.0,
+        help="Segundos antes del cierre para preparar/ejecutar martin",
+    )
+    p.add_argument(
+        "--mg-poll-sec",
+        type=float,
+        default=0.5,
+        help="Intervalo de monitoreo en vivo del motor martin",
     )
     p.add_argument("--max-loss-session", type=float, default=0.20, help="Stop-loss de sesión (fracción)")
 
@@ -90,6 +107,9 @@ def _apply_runtime_config(args: argparse.Namespace) -> None:
     # directamente sobre la calculadora dinámica de riesgo.
     MartingaleCalculator.MIN_ORDER_AMOUNT = max(0.01, float(args.amount_initial))
     MartingaleCalculator.INCREMENT = max(0.01, float(args.amount_martin))
+    cb.MG_EXTERNAL_ENABLED = not bool(args.mg_disabled)
+    cb.MG_PREFIRE_SECONDS = max(0.5, float(args.mg_prefire_sec))
+    cb.MG_MONITOR_POLL_SECONDS = max(0.2, float(args.mg_poll_sec))
 
     cb.CYCLE_MAX_OPERATIONS = int(args.cycle_ops)
     cb.CYCLE_TARGET_WINS = int(args.cycle_wins)
@@ -110,38 +130,19 @@ def _apply_runtime_config(args: argparse.Namespace) -> None:
 
 
 async def _render_hub_once(bot=None) -> None:
-    """Renderiza el panel HUB desde bot.hub o desde el log."""
-
-    # Si tenemos acceso a bot.hub, usar eso directamente
-    if bot is not None and hasattr(bot, 'hub'):
-        try:
-            from hub.hub_dashboard import HubDashboard
-            state = bot.hub.get_state()
-            if getattr(state, "total_scans", 0) > 0 or getattr(state, "last_scan", None) is not None:
-                balance = bot.current_balance or 0.0
-                HubDashboard.display(state, balance=balance)
-                return
-        except Exception as exc:
-            log_msg = f"[HUB] Error al renderizar desde bot.hub: {exc}"
-            if hasattr(bot, 'log'):
-                # Si bot tiene log, usarlo
-                pass
-            print(log_msg)
-    
-    # Fallback: parsear el log file
+    """Renderiza el panel HUB desde bot.hub (o estado vacío si bot aún no existe)."""
+    from hub.hub_dashboard import HubDashboard
+    from hub.hub_models import HubState
     try:
-        from hub.parser import HubLogParser
-        from hub.render import render_dashboard
-        log_path = ROOT / "consolidation_bot.log"
-        parser = HubLogParser()
-        with open(log_path, encoding="utf-8", errors="replace") as fh:
-            lines = fh.readlines()
-        snap = parser.parse_lines(lines[-600:])
-        panel = render_dashboard(snap)
-        from hub.hub_dashboard import HubDashboard
-        HubDashboard.display_text(panel)
-    except Exception as exc:
-        print(f"[HUB] Error al renderizar el panel: {exc}")
+        if bot is not None and hasattr(bot, 'hub'):
+            state = bot.hub.get_state()
+            balance = state.known_balance
+        else:
+            state = HubState()
+            balance = 0.0
+        HubDashboard.display(state, balance=balance)
+    except Exception:
+        pass
 
 
 def _configure_hub_console(cb) -> None:
@@ -166,51 +167,74 @@ def _configure_hub_console(cb) -> None:
     logging.getLogger("websocket").setLevel(logging.CRITICAL)
 
 
-def _render_empty_hub() -> None:
-    """Muestra la estructura del HUB antes del primer escaneo."""
-    from hub.hub_dashboard import HubDashboard
-    from hub.hub_models import HubState
-
-    HubDashboard.display(HubState(), balance=0.0)
-
-
-def _render_loading_hub(tick: int) -> None:
-    """Muestra HUB vacio con barra de progreso durante el primer escaneo."""
-    from hub.hub_dashboard import HubDashboard
-    from hub.hub_models import HubState
-
-    width = 28
-    fill = tick % (width + 1)
-    bar = "#" * fill + "." * (width - fill)
-    panel = HubDashboard.render_full_dashboard(HubState(), balance=0.0)
-    HubDashboard.display_text(panel + f"\nPrimer escaneo en progreso [{bar}]\n")
-
 
 async def _run_cycle_with_loading(cb, *, dry_run: bool, real_account: bool):
-    """Ejecuta un ciclo y muestra barra de carga hasta que termine."""
+    """Ejecuta un ciclo y refresca el HUB hasta que termine."""
     task = asyncio.create_task(
         cb.main(
             dry_run=dry_run,
             real_account=real_account,
             loop_forever=False,
-            on_cycle_end=_on_cycle_end,
+            on_cycle_end=_render_hub_once,
         )
     )
 
-    tick = 0
     while not task.done():
-        _render_loading_hub(tick)
-        tick += 1
+        await _render_hub_once()
         await asyncio.sleep(1)
 
     return await task
 
 
+async def _hub_ticker(bot_ref: list, interval: float = 5.0) -> None:
+    """Refresca el HUB en segundo plano cada `interval` segundos sin esperar ciclos.
+    Si llega un resultado de trade (WIN/LOSS) antes del intervalo, re-renderiza al instante.
+    """
+    while True:
+        try:
+            bot = bot_ref[0] if bot_ref else None
+
+            # Obtener el evento del scanner si está disponible.
+            trade_event = None
+            if bot is not None and hasattr(bot, 'hub') and hasattr(bot.hub, 'trade_result_event'):
+                trade_event = bot.hub.trade_result_event
+
+            if trade_event is not None:
+                # Esperar lo que llegue primero: resultado de trade o el intervalo normal.
+                sleep_task = asyncio.create_task(asyncio.sleep(interval))
+                event_wait = asyncio.create_task(trade_event.wait())
+                done, pending = await asyncio.wait(
+                    {sleep_task, event_wait},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for t in pending:
+                    t.cancel()
+                # Limpiar el evento para el siguiente ciclo.
+                trade_event.clear()
+            else:
+                await asyncio.sleep(interval)
+
+            bot = bot_ref[0] if bot_ref else None
+            if bot is not None:
+                await _render_hub_once(bot)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            pass
+
+
 async def _run_forever_with_initial_loading(cb, *, dry_run: bool, real_account: bool):
-    """Ejecuta loop continuo mostrando barra de carga hasta finalizar el primer ciclo."""
+    """Ejecuta loop continuo mostrando el HUB hasta finalizar el primer ciclo."""
     first_cycle_done = asyncio.Event()
+    # Referencia mutable al bot para que el ticker siempre use la instancia actual.
+    bot_ref: list = [None]
+
+    def _on_bot_ready(bot):
+        """Llamado apenas el bot se conecta y conoce el balance (antes del primer scan)."""
+        bot_ref[0] = bot
 
     async def _on_cycle_end_with_event(bot):
+        bot_ref[0] = bot
         await _render_hub_once(bot)
         if not first_cycle_done.is_set():
             first_cycle_done.set()
@@ -221,20 +245,21 @@ async def _run_forever_with_initial_loading(cb, *, dry_run: bool, real_account: 
             real_account=real_account,
             loop_forever=True,
             on_cycle_end=_on_cycle_end_with_event,
+            on_bot_ready=_on_bot_ready,
         )
     )
 
-    tick = 0
+    # Render de carga hasta que termina el primer ciclo.
     while not first_cycle_done.is_set() and not task.done():
-        _render_loading_hub(tick)
-        tick += 1
+        await _render_hub_once(bot_ref[0])
         await asyncio.sleep(1)
 
-    return await task
-
-
-async def _on_cycle_end(bot) -> None:
-    await _render_hub_once(bot)
+    # Ticker de fondo: refresca el HUB cada 5s independiente de los ciclos.
+    ticker = asyncio.create_task(_hub_ticker(bot_ref, interval=5.0))
+    try:
+        return await task
+    finally:
+        ticker.cancel()
 
 
 async def _run(args: argparse.Namespace) -> None:
@@ -246,7 +271,7 @@ async def _run(args: argparse.Namespace) -> None:
 
     # El HUB se muestra siempre desde el inicio para evitar pantalla en blanco.
     _configure_hub_console(cb)
-    _render_empty_hub()
+    await _render_hub_once()
 
     # En modo HUB no se ejecutan ordenes (dry_run=True), solo lectura/analisis.
     dry_run = hub_readonly
@@ -305,3 +330,9 @@ if __name__ == "__main__":
         raise
     except KeyboardInterrupt:
         raise SystemExit(0)
+    finally:
+        try:
+            from hub.hub_dashboard import HubDashboard
+            HubDashboard.shutdown()
+        except Exception:
+            pass

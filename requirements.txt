@@ -8,3 +8,4 @@ beautifulsoup4>=4.13.5
 lxml>=6.0.2
 setuptools<81
 websockets<14
+rich>=13.7.1

@@ -51,6 +51,7 @@ class CandidateData:
     confidence: Optional[float] = None
     signal_type: Optional[str] = None
     raw_reason: Optional[str] = None
+    dist_pct: Optional[float] = None  # distancia % del precio al trigger (None si sin precio)
 
     def __post_init__(self) -> None:
         self.strategy = str(self.strategy).strip().upper()
@@ -144,6 +145,18 @@ class HubScanSnapshot:
 
 
 @dataclass
+class GaleState:
+    """Estado de un gale pendiente (a punto de dispararse) para mostrar en el HUB."""
+
+    asset: str               # par en martingala
+    direction: str           # call | put
+    amount: float            # monto calculado del gale
+    payout: int              # payout % del activo
+    seconds_until_fire: float  # segundos restantes para ejecutar
+    cycle_losses: int        # número de gales acumulados en este ciclo
+
+
+@dataclass
 class HubState:
     """Estado global del HUB en ejecución."""
 
@@ -153,12 +166,23 @@ class HubState:
     active_trade_asset: Optional[str] = None
     active_trade_direction: Optional[str] = None
     active_trade_time_remaining_sec: Optional[float] = None
+    active_trade_entry_price: Optional[float] = None
+    active_trade_current_price: Optional[float] = None
+    active_trade_delta_pct: Optional[float] = None
+    last_trade_outcome: Optional[str] = None   # "WIN" | "LOSS" | "UNRESOLVED"
+    last_trade_asset: Optional[str] = None
+    last_trade_profit: Optional[float] = None
     total_scans: int = 0
     last_update: datetime = field(default_factory=_utc_now)
+    live_wins: int = 0
+    live_losses: int = 0
+    gale_pending: Optional["GaleState"] = None
+    known_balance: float = 0.0  # último balance conocido (se actualiza al conectar y en cada scan)
 
 
 __all__ = [
     "CandidateData",
+    "GaleState",
     "HubScanSnapshot",
     "HubState",
     "VALID_DIRECTIONS",

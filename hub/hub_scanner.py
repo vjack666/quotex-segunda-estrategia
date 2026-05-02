@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from typing import Any, List, Mapping, Optional, Sequence
 import logging
 
-from .hub_models import CandidateData, HubScanSnapshot, HubState
+from .hub_models import CandidateData, GaleState, HubScanSnapshot, HubState
 
 log = logging.getLogger("hub_scanner")
 
@@ -17,6 +18,9 @@ class HubScanner:
     def __init__(self) -> None:
         self.state = HubState()
         self.scan_count = 0
+        # Evento que se activa inmediatamente cuando cierra un trade (WIN/LOSS).
+        # El hub_ticker lo espera para re-renderizar sin esperar el intervalo normal.
+        self.trade_result_event: asyncio.Event = asyncio.Event()
 
     @staticmethod
     def _to_candidate(strategy: str, item: CandidateData | Mapping[str, Any]) -> CandidateData:
@@ -66,6 +70,8 @@ class HubScanner:
         self.state.strat_b_watching = strat_b_top5
         self.state.total_scans += 1
         self.state.last_update = now
+        if balance is not None:
+            self.state.known_balance = float(balance)
 
         # Crear snapshot del escaneo
         snapshot = HubScanSnapshot(
@@ -97,11 +103,15 @@ class HubScanner:
         asset: str,
         direction: str,
         duration_sec: int,
+        entry_price: Optional[float] = None,
     ) -> None:
         """Registra que se abrió una entrada."""
         self.state.active_trade_asset = asset.upper()
         self.state.active_trade_direction = direction.lower()
         self.state.active_trade_time_remaining_sec = float(duration_sec)
+        self.state.active_trade_entry_price = float(entry_price) if entry_price is not None else None
+        self.state.active_trade_current_price = None
+        self.state.active_trade_delta_pct = None
 
         # Al abrir entrada, se remueve de la vista actual para evitar doble señal visual.
         if strategy.upper() == "STRAT-A":
@@ -118,15 +128,79 @@ class HubScanner:
             strategy.upper(), direction.upper(), asset.upper(), duration_sec,
         )
 
-    def update_active_trade_timer(self, secs_remaining: float) -> None:
-        """Actualiza el temporizador de la entrada activa."""
+    def update_active_trade_timer(
+        self,
+        secs_remaining: float,
+        current_price: Optional[float] = None,
+        entry_price: Optional[float] = None,
+    ) -> None:
+        """Actualiza temporizador y telemetría de la entrada activa."""
         self.state.active_trade_time_remaining_sec = max(0.0, secs_remaining)
 
+        # Solo sobreescribir entry_price si se pasa explícitamente (no borrarlo cada tick).
+        if entry_price is not None:
+            self.state.active_trade_entry_price = float(entry_price)
+
+        if current_price is not None:
+            current = float(current_price)
+            self.state.active_trade_current_price = current
+            entry = self.state.active_trade_entry_price
+            if entry and entry > 0:
+                self.state.active_trade_delta_pct = ((current - entry) / entry) * 100.0
+
+    def record_trade_result(
+        self,
+        asset: str,
+        outcome: str,
+        profit: float = 0.0,
+    ) -> None:
+        """Guarda el resultado del último trade para mostrarlo en el HUB."""
+        self.state.last_trade_asset = asset.upper()
+        self.state.last_trade_outcome = outcome  # "WIN" | "LOSS" | "UNRESOLVED"
+        self.state.last_trade_profit = float(profit)
+
+        # Incrementar contadores en tiempo real (no esperar al próximo scan cycle).
+        if outcome == "WIN":
+            self.state.live_wins += 1
+        elif outcome == "LOSS":
+            self.state.live_losses += 1
+
+        # Señalizar al ticker para que re-renderice el HUB de inmediato.
+        self.trade_result_event.set()
+
+        log.info("RESULT %s %s profit=%.2f", asset.upper(), outcome, profit)
+
     def close_active_trade(self) -> None:
-        """Cierra la entrada activa."""
+        """Cierra la entrada activa (limpia campos de trade en curso)."""
         self.state.active_trade_asset = None
         self.state.active_trade_direction = None
         self.state.active_trade_time_remaining_sec = None
+        self.state.active_trade_entry_price = None
+        self.state.active_trade_current_price = None
+        self.state.active_trade_delta_pct = None
+
+    def update_gale_state(
+        self,
+        asset: str,
+        direction: str,
+        amount: float,
+        payout: int,
+        seconds_until_fire: float,
+        cycle_losses: int,
+    ) -> None:
+        """Registra el estado del gale pendiente para mostrarlo en el panel GALE."""
+        self.state.gale_pending = GaleState(
+            asset=asset.upper(),
+            direction=str(direction).lower(),
+            amount=float(amount),
+            payout=int(payout),
+            seconds_until_fire=max(0.0, float(seconds_until_fire)),
+            cycle_losses=int(cycle_losses),
+        )
+
+    def clear_gale_state(self) -> None:
+        """Limpia el panel GALE (después de disparar o cuando el trade cierra en WIN)."""
+        self.state.gale_pending = None
 
     def get_state(self) -> HubState:
         """Devuelve el estado actual del HUB."""
