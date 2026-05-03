@@ -21,11 +21,12 @@ class MartingaleCalculator:
     """Calculadora de Martingale para ciclos de trading con incremento fijo."""
 
     # Configuración fija
-    INCREMENT = 2.00  # Incremento por ciclo ($2)
-    MIN_ORDER_AMOUNT = 1.00  # Monto mínimo de orden
+    INCREMENT = 2.00  # Incremento por ciclo ($2) (fallback)
+    GROWTH_PCT = 0.02  # Objetivo por operación: 2% de la cuenta base de sesión
+    MIN_ORDER_AMOUNT = 1.01  # Monto mínimo de orden (broker requiere > $1.00)
     MAX_RISK_PCT = 0.10  # Máximo 10% del saldo por operación
     PRECISION_CENTS = 0.01  # Redondear a centavos
-    RESET_BALANCE_THRESHOLD = 100.0  # Si saldo <= umbral y hay 3 pérdidas, reinicia ciclo
+    MAX_CONSECUTIVE_ENTRIES = 3  # Máximo de entradas consecutivas en el ciclo (base + gales)
 
     def __init__(self, current_balance: Optional[float] = None):
         """
@@ -35,16 +36,40 @@ class MartingaleCalculator:
         self.current_balance = current_balance
         self.cycle_target = None  # Objetivo del ciclo actual
         self.cycle_losses = 0  # Contador de pérdidas en el ciclo
+        self.session_base_balance = float(current_balance) if current_balance is not None else None
+        self.fixed_increment_amount: Optional[float] = None
         # Inicializar objetivo si hay saldo
         if current_balance is not None and current_balance >= 0:
             self._reset_cycle()
 
-    def set_balance(self, balance: float) -> None:
-        """Actualiza el saldo actual y resetea el ciclo."""
+    def set_balance(self, balance: float, *, reset_cycle: bool = True) -> None:
+        """Actualiza el saldo actual y opcionalmente resetea el ciclo."""
         if balance < 0:
             balance = 0
         self.current_balance = balance
+        if reset_cycle:
+            self._reset_cycle()
+
+    def sync_balance(self, balance: float) -> None:
+        """Sincroniza saldo sin reiniciar contador/objetivo del ciclo."""
+        self.set_balance(balance, reset_cycle=False)
+
+    def configure_growth_target(self, base_balance: float, pct: float = 0.02) -> None:
+        """Configura objetivo fijo por operación (2% de la cuenta base de sesión)."""
+        safe_base = max(0.0, float(base_balance))
+        safe_pct = max(0.0, float(pct))
+        self.session_base_balance = safe_base
+        fixed_amount = self._round_up_to_cents(safe_base * safe_pct)
+        self.fixed_increment_amount = max(self.MIN_ORDER_AMOUNT, fixed_amount)
+        self.GROWTH_PCT = safe_pct
         self._reset_cycle()
+
+    def _target_increment_amount(self) -> float:
+        if self.fixed_increment_amount is not None and self.fixed_increment_amount > 0:
+            return float(self.fixed_increment_amount)
+        if self.session_base_balance is not None and self.session_base_balance > 0:
+            return max(self.MIN_ORDER_AMOUNT, self._round_up_to_cents(self.session_base_balance * self.GROWTH_PCT))
+        return float(self.INCREMENT)
 
     def _reset_cycle(self) -> None:
         """Resetea el ciclo con nuevo objetivo."""
@@ -66,15 +91,15 @@ class MartingaleCalculator:
         """
         if self.current_balance is None:
             return 0
+        return self._calculate_objective_from_balance(float(self.current_balance))
 
-        # Si es un número par exacto (entero), sumar INCREMENT
-        if (self.current_balance == int(self.current_balance) and 
-            int(self.current_balance) % 2 == 0):
-            return float(int(self.current_balance + self.INCREMENT))
+    def _calculate_objective_from_balance(self, balance: float) -> float:
+        """Calcula el objetivo de ciclo para un balance dado (sin mutar estado)."""
+        if balance < 0:
+            balance = 0.0
 
-        # Si no es par exacto, ir al próximo par
-        target = ceil(self.current_balance / self.INCREMENT) * self.INCREMENT
-        return float(int(target))  # Asegura número entero sin decimales
+        increment = self._target_increment_amount()
+        return self._round_up_to_cents(balance + increment)
 
     def _round_up_to_cents(self, amount: float) -> float:
         """Redondea hacia arriba a centavos."""
@@ -105,6 +130,9 @@ class MartingaleCalculator:
         if self.cycle_target is None:
             self.cycle_target = self._calculate_objective()
 
+        if self.cycle_losses >= self.MAX_CONSECUTIVE_ENTRIES:
+            return 0, "MAX_CONSECUTIVE_REACHED"
+
         # Verificar si ya alcanzamos el objetivo
         if self.current_balance >= self.cycle_target:
             # Ciclo completado, resetear para próximo
@@ -131,7 +159,38 @@ class MartingaleCalculator:
 
         return investment, "OK"
 
-    def register_win(self, amount_invested: float, payout_pct: int) -> Tuple[float, str]:
+    def preview_investment(self, payout_pct: int, balance_override: float) -> Tuple[float, str]:
+        """Calcula inversión para un balance proyectado sin mutar el estado interno.
+
+        Se usa para escenarios como GALE en curso, donde hay una pérdida probable
+        aún no confirmada por el broker.
+        """
+        projected_balance = max(0.0, float(balance_override))
+        cycle_target = self._calculate_objective_from_balance(projected_balance)
+
+        if projected_balance >= cycle_target:
+            return 0, "CYCLE_COMPLETE"
+
+        profit_needed = cycle_target - projected_balance
+        payout_rate = max(0.01, float(payout_pct) / 100.0)
+        raw_investment = profit_needed / payout_rate
+
+        investment = self._round_up_to_cents(raw_investment)
+        investment = max(self.MIN_ORDER_AMOUNT, investment)
+
+        risk_limit = projected_balance * self.MAX_RISK_PCT
+        if investment > risk_limit:
+            return investment, f"RISK_EXCEEDED|limit={risk_limit:.2f}"
+
+        return investment, "OK"
+
+    def register_win(
+        self,
+        amount_invested: float,
+        payout_pct: int,
+        *,
+        apply_target_balance: bool = True,
+    ) -> Tuple[float, str]:
         """
         Registra ganancia y cierra ciclo.
         El saldo se ajusta EXACTAMENTE al objetivo (número par entero, sin decimales).
@@ -147,13 +206,14 @@ class MartingaleCalculator:
             return 0, "ERROR_NO_BALANCE"
 
         old_balance = self.current_balance
-        cycle_target = self.cycle_target if self.cycle_target else old_balance + 2
+        cycle_target = self.cycle_target if self.cycle_target else old_balance + self._target_increment_amount()
 
-        # IMPORTANTE: Fuerza el saldo exacto al objetivo (cierre limpio sin decimales)
-        # Esto asegura que siempre cierre en un número par exacto
-        self.current_balance = round(cycle_target)  # Redondea al entero más cercano
+        if apply_target_balance:
+            # Modo simulado: fuerza cierre exacto al objetivo del ciclo.
+            self.current_balance = round(cycle_target, 2)
 
         # Resetea ciclo para próxima ronda
+        self.cycle_losses = 0
         self._reset_cycle()
 
         log.info(
@@ -163,7 +223,7 @@ class MartingaleCalculator:
 
         return self.current_balance, "CYCLE_CLOSED"
 
-    def register_loss(self, amount_invested: float) -> Tuple[float, str]:
+    def register_loss(self, amount_invested: float, *, apply_balance_change: bool = True) -> Tuple[float, str]:
         """
         Registra pérdida y calcula próximo gale.
 
@@ -177,28 +237,36 @@ class MartingaleCalculator:
             return 0, "ERROR_NO_BALANCE"
 
         old_balance = self.current_balance
-        self.current_balance -= amount_invested
+        if apply_balance_change:
+            self.current_balance -= amount_invested
 
         if self.current_balance < 0:
             self.current_balance = 0
 
         self.cycle_losses += 1
 
-        # Regla de reset: 3 pérdidas seguidas si saldo <= $100
-        if self.current_balance <= self.RESET_BALANCE_THRESHOLD and self.cycle_losses >= 3:
+        # Regla de reset: máximo de entradas consecutivas alcanzado.
+        if self.cycle_losses >= self.MAX_CONSECUTIVE_ENTRIES:
             log.warning(
-                "🔄 RESET por 3 pérdidas (saldo: %.2f <= $%.0f)",
-                self.current_balance,
-                self.RESET_BALANCE_THRESHOLD,
+                "🔄 RESET por máximo de entradas consecutivas (%d)",
+                self.MAX_CONSECUTIVE_ENTRIES,
             )
             self._reset_cycle()
-            return self.current_balance, "RESET_3_LOSSES"
+            return self.current_balance, "MAX_CONSECUTIVE_REACHED"
+
+        if self.current_balance <= 0:
+            log.warning(
+                "🔄 RESET por saldo no operativo (%.2f)",
+                self.current_balance,
+            )
+            self._reset_cycle()
+            return self.current_balance, "RESET_NO_BALANCE"
 
         log.info(
             "❌ LOSS (gale %d): %.2f - %.2f = %.2f (objetivo: %.2f)",
             self.cycle_losses,
             old_balance,
-            amount_invested,
+            amount_invested if apply_balance_change else 0.0,
             self.current_balance,
             self.cycle_target,
         )

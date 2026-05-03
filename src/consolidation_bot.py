@@ -283,7 +283,8 @@ BROKER_TZ = timezone(timedelta(hours=-3))
 BROKER_TZ_LABEL = "UTC-3"
 
 # Gestión de monto dinámico para cerrar en enteros y evitar centavos residuales.
-MIN_ORDER_AMOUNT       = 1.00
+# Broker OTC: monto mínimo aceptado estrictamente mayor a $1.00.
+MIN_ORDER_AMOUNT       = 1.01
 MARTIN_MAX_PCT_BALANCE = 0.20  # cap global: martingala <= 20% del balance actual
 MARTIN_MAX_ATTEMPTS_SESSION = 2
 MARTIN_LOW_BALANCE_THRESHOLD = 100.0
@@ -312,6 +313,10 @@ BROKEN_CAPTURE_DIR = Path(__file__).resolve().parent.parent / "data" / "vela_ops
 BROKEN_FOLLOWUP_DELAY_SEC = 15 * 60
 # Guardar 40 velas post-evento permite validar patrones 40/40 de forma consistente.
 BROKEN_FOLLOWUP_1M_COUNT = 40
+
+# Control de impresión del contador en consola (evita mezclar texto con HUB).
+INLINE_COUNTDOWN_STDOUT = True
+INLINE_COUNTDOWN_LOG_TICKS = True
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1143,13 +1148,13 @@ class ConsolidationBot:
                 place_order_fn=self._gale_place_order_bridge,
                 calculator=self.martingale,
                 get_balance_fn=self._gale_get_balance_bridge,
+                get_time_fn=self._broker_now_ts,
                 dry_run=dry_run,
                 on_status_fn=self._gale_on_status_bridge,
                 on_clear_fn=self._gale_on_clear_bridge,
             )
         else:
             self._gale_watcher = None
-        self._gale_tasks: set[asyncio.Task] = set()
         self.asset_loss_streaks: dict[str, int] = {}
         self.asset_blacklist_until: dict[str, float] = {}
         # Estado técnico por activo para filtros adicionales.
@@ -1161,6 +1166,8 @@ class ConsolidationBot:
         # Se actualiza con cada fetch de velas para compensar drift del reloj local.
         self._clock_offset: float = 0.0
         self._candle_phase_sec: int = 0
+        self._last_hub_balance_refresh_ts: float = 0.0
+        self._hub_balance_refresh_min_interval_sec: float = 3.0
         if greylist_assets is not None:
             self.greylist_assets = {a.strip() for a in greylist_assets if a and a.strip()}
 
@@ -1290,6 +1297,7 @@ class ConsolidationBot:
         self.session_start_balance = float(balance)
         self.current_balance = float(balance)
         self.martingale.set_balance(float(balance))
+        self.martingale.configure_growth_target(float(balance), pct=0.02)
         self.hub.state.known_balance = float(balance)
         if self.cycle_start_balance is None:
             self.cycle_start_balance = float(balance)
@@ -1304,7 +1312,7 @@ class ConsolidationBot:
         Retorna (monto, ganancia_esperada).
         """
         if self.current_balance is not None:
-            self.martingale.set_balance(self.current_balance)
+            self.martingale.sync_balance(self.current_balance)
 
         amount, status = self.martingale.calculate_investment(payout_pct)
 
@@ -1325,7 +1333,7 @@ class ConsolidationBot:
         """
         # Registra pérdida anterior
         if self.current_balance is not None:
-            self.martingale.set_balance(self.current_balance)
+            self.martingale.sync_balance(self.current_balance)
 
         # Calcula inversión para el próximo gale
         amount, status = self.martingale.calculate_investment(payout_pct)
@@ -2004,6 +2012,10 @@ class ConsolidationBot:
         alpha = 0.30
         self._clock_offset = (alpha * raw_offset) + ((1.0 - alpha) * self._clock_offset)
 
+    def _broker_now_ts(self) -> float:
+        """Reloj operativo del broker: reloj local calibrado con offset observado."""
+        return time.time() + self._clock_offset
+
     def _compute_ma_state(self, asset: str, candles_5m: List[Candle]) -> Optional[MAState]:
         if len(candles_5m) < MA_SLOW_PERIOD:
             log.debug("[MA] %s sin suficientes velas 5m (%d < %d)", asset, len(candles_5m), MA_SLOW_PERIOD)
@@ -2315,7 +2327,7 @@ class ConsolidationBot:
         alerted = False
         recovery_logged = False
         while not trade.resolved:
-            elapsed = time.time() - trade.opened_at
+            elapsed = self._broker_now_ts() - trade.opened_at
             secs_left = trade.duration_sec - elapsed
             if secs_left <= 0 or trade.martin_fired:
                 return
@@ -2404,7 +2416,7 @@ class ConsolidationBot:
             await asyncio.sleep(MARTIN_MONITOR_INTERVAL_SEC)
 
     async def _resolve_trade_after_expiry(self, asset: str, trade: TradeState) -> None:
-        wait_sec = max(0.0, trade.duration_sec + MARTIN_RESOLVE_GRACE_SEC - (time.time() - trade.opened_at))
+        wait_sec = max(0.0, trade.duration_sec + MARTIN_RESOLVE_GRACE_SEC - (self._broker_now_ts() - trade.opened_at))
         if wait_sec > 0:
             if wait_sec > 1.0:
                 await sleep_with_inline_countdown(wait_sec, "Entrada sincronizada 1m")
@@ -2585,7 +2597,8 @@ class ConsolidationBot:
             self.set_session_start_balance(bal)
 
         self.current_balance = bal
-        self.martingale.set_balance(bal)
+        self.martingale.sync_balance(bal)
+        self.hub.state.known_balance = bal
         if not self.session_start_balance or self.session_start_balance <= 0:
             return False
 
@@ -2600,6 +2613,28 @@ class ConsolidationBot:
             )
             return True
         return False
+
+    async def refresh_balance_for_hub(self, force: bool = False) -> bool:
+        """Refresco rápido y acotado del balance para el HUB (sin bloquear el loop)."""
+        if self.dry_run:
+            if self.current_balance is not None:
+                self.hub.state.known_balance = float(self.current_balance)
+            return False
+
+        now_ts = time.time()
+        if not force and (now_ts - self._last_hub_balance_refresh_ts) < self._hub_balance_refresh_min_interval_sec:
+            return False
+
+        try:
+            bal = float(await asyncio.wait_for(self.client.get_balance(), timeout=1.2))
+        except Exception:
+            return False
+
+        self._last_hub_balance_refresh_ts = now_ts
+        self.current_balance = bal
+        self.martingale.sync_balance(bal)
+        self.hub.state.known_balance = bal
+        return True
 
     async def reconcile_pending_candidates(self, max_age_minutes: Optional[float] = None) -> None:
         """
@@ -2852,10 +2887,7 @@ class ConsolidationBot:
             )
 
         phase = int(self._candle_phase_sec % TF_1M)
-        now = time.time()
-        # Ajustar con offset de reloj y adelantar ENTRY_PRE_SEND_SEC para llegar al broker a tiempo.
-        # now_adj usa el reloj calibrado con las últimas velas del servidor Quotex.
-        now_adj = now + self._clock_offset
+        now_adj = self._broker_now_ts()
         next_open_adj = ((int(now_adj - phase) // TF_1M) + 1) * TF_1M + phase
         is_otc = bool(asset and "_otc" in str(asset).lower())
         # En OTC no conviene pre-send: la expiración es en segundos relativos y puede caer en vela previa.
@@ -2876,9 +2908,9 @@ class ConsolidationBot:
                 )
             await asyncio.sleep(wait_sec)
 
-        send_ts = time.time()
-        lag_sec = (send_ts + self._clock_offset) - next_open_adj
-        time_since_open = (send_ts + self._clock_offset - phase) % TF_1M
+        send_adj = self._broker_now_ts()
+        lag_sec = send_adj - next_open_adj
+        time_since_open = (send_adj - phase) % TF_1M
         secs_to_close = max(0.0, TF_1M - time_since_open)
 
         if lag_sec > ENTRY_MAX_LAG_SEC or secs_to_close <= ENTRY_REJECT_LAST_SEC:
@@ -2930,7 +2962,7 @@ class ConsolidationBot:
             )
 
         phase = int(self._candle_phase_sec % TF_1M)
-        now_adj = time.time() + self._clock_offset
+        now_adj = self._broker_now_ts()
         current_open_adj = (int(now_adj - phase) // TF_1M) * TF_1M + phase
         time_since_open = max(0.0, now_adj - current_open_adj)
         secs_to_close = max(0.0, TF_1M - time_since_open)
@@ -4380,6 +4412,21 @@ class ConsolidationBot:
         log.info("🏁 %s %s $%.2f | saldo: $%.2f", sym, outcome, profit, balance_now)
         self._update_cycle_after_result(outcome=outcome, profit=profit)
 
+        # Sincronizar calculadora con resultado real del broker.
+        try:
+            if outcome == "WIN":
+                self.martingale.sync_balance(self.current_balance if self.current_balance is not None else 0.0)
+                self.martingale.register_win(
+                    trade.amount,
+                    int(trade.payout or MIN_PAYOUT),
+                    apply_target_balance=False,
+                )
+            elif outcome == "LOSS":
+                self.martingale.sync_balance(self.current_balance if self.current_balance is not None else 0.0)
+                self.martingale.register_loss(trade.amount, apply_balance_change=False)
+        except Exception as exc:
+            log.debug("No se pudo actualizar ciclo de martingale tras %s: %s", outcome, exc)
+
         if outcome == "WIN":
             if trade.strategy_origin == "STRAT-B":
                 self.stats["strat_b_wins"] += 1
@@ -4444,7 +4491,7 @@ class ConsolidationBot:
                 self.trades.pop(sym, None)
             return False
 
-        elapsed = time.time() - trade.opened_at
+        elapsed = self._broker_now_ts() - trade.opened_at
 
         if elapsed > (trade.duration_sec + MARTIN_RESOLVE_GRACE_SEC + 15.0):
             await self._resolve_trade(trade, sym)
@@ -4568,7 +4615,12 @@ class ConsolidationBot:
             try:
                 done_fut.result()
             except Exception as exc:
-                log.error("GaleWatcher task falló (%s): %s", stage, exc)
+                log.error(
+                    "GaleWatcher task falló (%s): %s",
+                    stage,
+                    exc,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
 
         fut.add_done_callback(_done_callback)
 
@@ -4878,6 +4930,12 @@ async def sleep_with_inline_countdown(wait_seconds: float, label: str) -> None:
 
     end_at = time.monotonic() + total
     last_logged_sec: Optional[int] = None
+
+    # Modo silencioso para convivir con render de dashboard sin ensuciar salida.
+    if not INLINE_COUNTDOWN_STDOUT and not INLINE_COUNTDOWN_LOG_TICKS:
+        await asyncio.sleep(total)
+        return
+
     try:
         while True:
             remaining = max(0.0, end_at - time.monotonic())
@@ -4886,12 +4944,13 @@ async def sleep_with_inline_countdown(wait_seconds: float, label: str) -> None:
                 t_str = f"{rem_sec // 60}m{rem_sec % 60:02d}s"
             else:
                 t_str = f"{rem_sec:>3d}s"
-            sys.stdout.write(f"\r[INFO] {label} en {t_str}   ")
-            sys.stdout.flush()
+            if INLINE_COUNTDOWN_STDOUT:
+                sys.stdout.write(f"\r[INFO] {label} en {t_str}   ")
+                sys.stdout.flush()
 
             # Fallback visible en logs: cada 10s y cuenta final 5..1.
             # En algunas consolas de Windows el \r inline no se aprecia estable.
-            if rem_sec != last_logged_sec and (rem_sec % 10 == 0 or rem_sec <= 5):
+            if INLINE_COUNTDOWN_LOG_TICKS and rem_sec != last_logged_sec and (rem_sec % 10 == 0 or rem_sec <= 5):
                 log.info("⏳ %s en %s", label, t_str.strip())
                 last_logged_sec = rem_sec
 
@@ -4900,22 +4959,30 @@ async def sleep_with_inline_countdown(wait_seconds: float, label: str) -> None:
             await asyncio.sleep(min(1.0, remaining))
     finally:
         # Limpiar la línea dinámica y dejar una línea nueva limpia para logs.
-        sys.stdout.write("\r" + (" " * 100) + "\r\n")
-        sys.stdout.flush()
+        if INLINE_COUNTDOWN_STDOUT:
+            sys.stdout.write("\r" + (" " * 100) + "\r\n")
+            sys.stdout.flush()
 
 
-def seconds_until_next_scan(now_ts: Optional[float] = None) -> float:
+def seconds_until_next_scan(
+    now_ts: Optional[float] = None,
+    *,
+    clock_offset_sec: float = 0.0,
+    phase_sec: int = 0,
+) -> float:
     """Calcula segundos hasta el próximo scan alineado a vela de 5m."""
     if LIVE_SCAN_MODE:
         return max(0.5, float(LIVE_SCAN_SLEEP_SEC))
 
     now = time.time() if now_ts is None else float(now_ts)
+    now_adj = now + float(clock_offset_sec)
+    phase = int(phase_sec % TF_5M)
     if ALIGN_SCAN_TO_CANDLE:
-        next_open = ((int(now) // TF_5M) + 1) * TF_5M
+        next_open = ((int(now_adj - phase) // TF_5M) + 1) * TF_5M + phase
         target_scan = next_open - SCAN_LEAD_SEC
-        if target_scan <= now:
+        if target_scan <= now_adj:
             target_scan += TF_5M
-        return max(1.0, target_scan - now)
+        return max(1.0, target_scan - now_adj)
     return max(5.0, SCAN_INTERVAL_SEC)
 
 
@@ -5010,7 +5077,11 @@ async def main(
         # Alinear también el PRIMER escaneo al reloj de vela para evitar señales
         # fuera de ventana al iniciar el bot en un segundo arbitrario.
         if loop_forever and ALIGN_SCAN_TO_CANDLE and not LIVE_SCAN_MODE:
-            first_wait = seconds_until_next_scan(time.time())
+            first_wait = seconds_until_next_scan(
+                time.time(),
+                clock_offset_sec=bot._clock_offset,
+                phase_sec=bot._candle_phase_sec,
+            )
             await sleep_with_inline_countdown(first_wait, "Sincronizando primer escaneo")
             log.info("Sincronización completada. Iniciando escaneo.")
 
@@ -5056,7 +5127,11 @@ async def main(
             if LIVE_SCAN_MODE:
                 sleep_for = max(0.5, float(LIVE_SCAN_SLEEP_SEC))
             elif ALIGN_SCAN_TO_CANDLE:
-                sleep_for = seconds_until_next_scan(time.time())
+                sleep_for = seconds_until_next_scan(
+                    time.time(),
+                    clock_offset_sec=bot._clock_offset,
+                    phase_sec=bot._candle_phase_sec,
+                )
             else:
                 elapsed = time.time() - cycle_start
                 sleep_for = max(5.0, SCAN_INTERVAL_SEC - elapsed)

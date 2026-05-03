@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import sys
 import time
-from datetime import datetime, timezone
+import os
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, List, Optional
 
 from .hub_models import CandidateData, HubState
@@ -82,6 +84,76 @@ _RED     = "\033[91m"
 _BLUE    = "\033[94m"
 _MAGENTA = "\033[95m"
 
+_LOG_TAIL_LINES = 8
+_LOG_TAIL_MAX_BYTES = 64 * 1024
+_LOG_RECENT_WINDOW_MIN = 20
+_LOG_RECENT_WINDOW_SEC = _LOG_RECENT_WINDOW_MIN * 60
+_BOT_LOG_DIR = Path(__file__).resolve().parent.parent / "data" / "logs" / "bot"
+
+_LOG_CACHE_FILE: Optional[Path] = None
+_LOG_CACHE_MTIME: float = -1.0
+_LOG_CACHE_SIZE: int = -1
+_LOG_CACHE_LINES: List[str] = []
+
+_LOG_NOISE_PATTERNS = (
+    "Traceback (most recent call last):",
+    "raise KeyboardInterrupt()",
+    "KeyboardInterrupt",
+    "asyncio\\runners.py",
+    "Task was destroyed but it is pending!",
+    "ssl_Mutual_exclusion_write",
+    "task: <Task cancelling",
+    "coro=<main() running at",
+    "send_websocket_request(data)",
+    "site-packages\\pyquotex\\api.py\", line 421",
+)
+
+
+def _is_noise_trace_line(line: str) -> bool:
+    txt = line.strip()
+    if not txt:
+        return False
+    if txt.startswith("File \"") and ("asyncio\\runners.py" in txt or "site-packages\\pyquotex\\api.py" in txt):
+        return True
+    if txt.startswith("return self.send_websocket_request"):
+        return True
+    if txt.startswith("or self.state.ssl_Mutual_exclusion_write"):
+        return True
+    if txt.startswith("task: <Task cancelling"):
+        return True
+    # Fragmentos de caret/tilde que quedan de tracebacks multilinea en consola.
+    if set(txt) <= {"^", "~"}:
+        return True
+    if set(txt) == {"^"}:
+        return True
+    return False
+
+
+def _is_recent_log_line(line: str) -> bool:
+    """True si la línea con prefijo HH:MM:SS cae dentro de la ventana reciente."""
+    txt = line.strip()
+    if len(txt) < 8:
+        return True
+
+    hhmmss = txt[:8]
+    if not (hhmmss[2] == ":" and hhmmss[5] == ":"):
+        return True
+
+    try:
+        hh = int(hhmmss[0:2])
+        mm = int(hhmmss[3:5])
+        ss = int(hhmmss[6:8])
+        now = datetime.now()
+        stamp = now.replace(hour=hh, minute=mm, second=ss, microsecond=0)
+
+        # Si por desfase de reloj queda en "futuro", asumir día anterior.
+        if stamp > now + timedelta(minutes=1):
+            stamp = stamp - timedelta(days=1)
+
+        return (now - stamp) <= timedelta(minutes=_LOG_RECENT_WINDOW_MIN)
+    except Exception:
+        return True
+
 
 # ── helpers Rich markup ───────────────────────────────────────────────────────
 
@@ -117,6 +189,96 @@ _ENTRY_ABBREV = {
 
 def _abbrev(mode: str) -> str:
     return _ENTRY_ABBREV.get(mode, mode[:10])
+
+
+def _latest_bot_log_file() -> Optional[Path]:
+    if not _BOT_LOG_DIR.exists():
+        return None
+    try:
+        files = [p for p in _BOT_LOG_DIR.glob("consolidation_bot-*.log") if p.is_file()]
+    except Exception:
+        return None
+    if not files:
+        return None
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return files[0]
+
+
+def _read_tail_lines(path: Path, line_count: int) -> List[str]:
+    """Lee las ultimas N lineas de forma eficiente sin cargar todo el archivo."""
+    if line_count <= 0:
+        return []
+    try:
+        with path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            file_size = fh.tell()
+            if file_size <= 0:
+                return []
+
+            to_read = min(file_size, _LOG_TAIL_MAX_BYTES)
+            fh.seek(-to_read, os.SEEK_END)
+            chunk = fh.read(to_read)
+
+        text = chunk.decode("utf-8", errors="replace")
+        lines = text.splitlines()
+        return lines[-line_count:]
+    except Exception:
+        return []
+
+
+def _live_log_lines() -> List[str]:
+    """Retorna lineas de log cacheadas y actualizadas cuando el archivo cambia."""
+    global _LOG_CACHE_FILE, _LOG_CACHE_MTIME, _LOG_CACHE_SIZE, _LOG_CACHE_LINES
+
+    path = _latest_bot_log_file()
+    if path is None:
+        return ["(sin archivo de log en data/logs/bot)"]
+
+    try:
+        stat = path.stat()
+        mtime = float(stat.st_mtime)
+        size = int(stat.st_size)
+    except Exception:
+        return [f"(no se pudo leer metadata de {path.name})"]
+
+    # Si el archivo no tuvo actividad reciente, evitar mostrar errores historicos.
+    if (time.time() - mtime) > _LOG_RECENT_WINDOW_SEC:
+        return ["(sin eventos recientes)"]
+
+    if _LOG_CACHE_FILE != path:
+        _LOG_CACHE_FILE = path
+        _LOG_CACHE_MTIME = -1.0
+        _LOG_CACHE_SIZE = -1
+
+    if mtime != _LOG_CACHE_MTIME or size != _LOG_CACHE_SIZE:
+        _LOG_CACHE_LINES = _read_tail_lines(path, _LOG_TAIL_LINES)
+        _LOG_CACHE_MTIME = mtime
+        _LOG_CACHE_SIZE = size
+
+    if not _LOG_CACHE_LINES:
+        return [f"({path.name} vacio)"]
+
+    filtered: List[str] = []
+    for ln in _LOG_CACHE_LINES:
+        if any(pat in ln for pat in _LOG_NOISE_PATTERNS) or _is_noise_trace_line(ln):
+            continue
+        if not _is_recent_log_line(ln):
+            continue
+        filtered.append(ln if ln.strip() else " ")
+
+    if not filtered:
+        return ["(sin eventos nuevos; ruido Ctrl+C filtrado)"]
+
+    return filtered
+
+
+def _waiting_first_order(state: HubState) -> bool:
+    """True cuando el sistema aun no tuvo una operacion real para mostrar."""
+    return (
+        not state.gale.active
+        and state.active_trade_asset is None
+        and state.last_trade_outcome is None
+    )
 
 
 # ── tablas Rich ───────────────────────────────────────────────────────────────
@@ -292,12 +454,41 @@ def _build_gale_panel(state: HubState) -> "Panel":
     else:
         fired_mu = "[dim]En espera...[/dim]" if secs > 1 else "[bold yellow]⏳ Por disparar[/bold yellow]"
 
+    safety = str(getattr(g, "safety_status", "OK") or "OK").upper()
+    if safety == "OK":
+        safety_mu = "[bold green]OK[/bold green]"
+    elif safety == "RIESGO":
+        safety_mu = "[bold red]RIESGO[/bold red]"
+    elif safety == "LIMITE":
+        safety_mu = "[bold yellow]LIMITE[/bold yellow]"
+    elif safety == "CICLO":
+        safety_mu = "[cyan]CICLO[/cyan]"
+    else:
+        safety_mu = "[bold red]ERROR[/bold red]"
+
     t.add_row("Activo:",   f"{g.asset.upper()}  {dir_mu}  [dim]payout {g.payout}%[/dim]")
     t.add_row("Entrada:",  f"EP [bold]{g.entry_price:.5f}[/bold]  PX [bold]{g.current_price:.5f}[/bold]  {delta_mu}")
     t.add_row("Estado:",   status_mu)
     t.add_row("⏱ Tiempo:",  time_mu)
     t.add_row("Monto:",    f"Base ${g.amount_invested:.2f}  →  Gale {gale_mu}")
     t.add_row("Disparo:",  fired_mu)
+    t.add_row("Seguridad:", safety_mu)
+
+    # objetivo del ciclo y consecutivas
+    if g.cycle_target_amount > 0:
+        objetivo_mu = f"[bold green]+${g.cycle_target_amount:.2f}[/bold green]"
+    else:
+        objetivo_mu = "[dim]calculando...[/dim]"
+    max_consec = 3
+    used = min(g.consecutive_count, max_consec)
+    if used >= max_consec:
+        consec_mu = f"[bold red]{used}/{max_consec}[/bold red]  [dim](límite)[/dim]"
+    elif used >= 2:
+        consec_mu = f"[bold yellow]{used}/{max_consec}[/bold yellow]"
+    else:
+        consec_mu = f"[bold]{used}/{max_consec}[/bold]"
+    t.add_row("Objetivo:",     objetivo_mu)
+    t.add_row("Consecutivas:", consec_mu)
 
     border = "red" if g.is_losing else "green"
     if g.gale_fired:
@@ -305,6 +496,32 @@ def _build_gale_panel(state: HubState) -> "Panel":
     title_suffix = "  [bold red]● ACTIVO[/bold red]" if g.active else ""
     return panel_cls(t, title=f"[bold yellow]GALE WATCHER[/bold yellow]{title_suffix}",
                      border_style=border, padding=(0, 1))
+
+
+def _build_logs_panel(state: HubState) -> "Panel":
+    """Mini terminal: muestra tail en vivo del log principal del bot."""
+    panel_cls = _require_panel_class()
+    table_cls = _require_table_class()
+    text_cls = _require_text_class()
+
+    # Antes de la primera orden, mantener panel limpio para no confundir
+    # con errores historicos de sesiones anteriores.
+    if _waiting_first_order(state):
+        lines = ["(en espera de primera operacion)"]
+    else:
+        lines = _live_log_lines()
+    inner = table_cls.grid(expand=True)
+    inner.add_column()
+
+    for line in lines:
+        inner.add_row(text_cls(line, style="dim", overflow="ellipsis", no_wrap=True))
+
+    return panel_cls(
+        inner,
+        title="[bold white]MINI TERMINAL LOGS[/bold white] [dim](tail en vivo)[/dim]",
+        border_style="white",
+        padding=(0, 1),
+    )
 
 
 def _build_layout(state: HubState, balance: float) -> "Layout":
@@ -318,6 +535,7 @@ def _build_layout(state: HubState, balance: float) -> "Layout":
         layout_cls(name="header", size=5),
         layout_cls(name="body",   ratio=1),
         layout_cls(name="gale",   size=8),
+        layout_cls(name="logs",   size=10),
         layout_cls(name="footer", size=1),
     )
 
@@ -360,6 +578,7 @@ def _build_layout(state: HubState, balance: float) -> "Layout":
     )
 
     layout["gale"].update(_build_gale_panel(state))
+    layout["logs"].update(_build_logs_panel(state))
 
     layout["footer"].update(
         text_cls(
@@ -392,6 +611,16 @@ class HubDashboard:
     TOTAL_WIDTH = 180
     _console: Optional["Console"] = None
     _live: Optional["Live"] = None
+    _render_mode: str = "live"  # live | static | fallback
+
+    @classmethod
+    def configure(cls, render_mode: str = "live") -> None:
+        mode = str(render_mode or "live").strip().lower()
+        if mode not in {"live", "static", "fallback"}:
+            mode = "live"
+        if cls._render_mode != mode:
+            cls.shutdown()
+        cls._render_mode = mode
 
     @classmethod
     def _get_console(cls) -> "Console":
@@ -436,13 +665,18 @@ class HubDashboard:
     @classmethod
     def display(cls, state: HubState, balance: float = 0.0) -> None:
         """Renderiza o actualiza el dashboard en el terminal."""
-        if not _RICH_OK:
+        if cls._render_mode == "fallback" or not _RICH_OK:
             cls._display_fallback(state, balance)
             return
         try:
             renderable = _build_layout(state, balance)
-            live = cls._ensure_live()
-            live.update(renderable, refresh=True)
+            if cls._render_mode == "static":
+                console = cls._get_console()
+                console.clear()
+                console.print(renderable)
+            else:
+                live = cls._ensure_live()
+                live.update(renderable, refresh=True)
         except Exception:
             cls._display_fallback(state, balance)
 
@@ -461,20 +695,15 @@ class HubDashboard:
             _os.system("cls" if _os.name == "nt" else "clear")
             cls._screen_initialized = True
 
-        new_lines = text.splitlines()
-        previous_lines = cls._last_line_count
-
-        sys.stdout.write("\033[H")
+        # \033[H  → cursor al origen (fila 1, col 1)
+        # \033[J  → borrar desde cursor hasta el final de pantalla
+        # Esto elimina cualquier residuo del frame anterior sin parpadeo total.
+        sys.stdout.write("\033[H\033[J")
         sys.stdout.write(text)
-
-        extra_lines = max(0, previous_lines - len(new_lines))
-        if extra_lines:
-            sys.stdout.write("\n" + "\n".join(" " * 120 for _ in range(extra_lines)))
-
         sys.stdout.write("\n")
         sys.stdout.flush()
         cls._last_text = text
-        cls._last_line_count = len(new_lines)
+        cls._last_line_count = len(text.splitlines())
 
     @classmethod
     def _render_fallback(cls, state: HubState, balance: float) -> str:
@@ -517,6 +746,17 @@ class HubDashboard:
                 else (f"{_RED}✗ ERROR{_RESET}" if g.gale_fired
                       else f"{_DIM}En espera{_RESET}")
             )
+            safety = str(getattr(g, "safety_status", "OK") or "OK").upper()
+            if safety == "OK":
+                safety_txt = f"{_GREEN}OK{_RESET}"
+            elif safety == "RIESGO":
+                safety_txt = f"{_RED}RIESGO{_RESET}"
+            elif safety == "LIMITE":
+                safety_txt = f"{_YELLOW}LIMITE{_RESET}"
+            elif safety == "CICLO":
+                safety_txt = f"{_BLUE}CICLO{_RESET}"
+            else:
+                safety_txt = f"{_RED}ERROR{_RESET}"
             lines.append(
                 f"  {g.asset.upper()} {dir_color}{g.direction.upper()}{_RESET}"
                 f"  EP:{g.entry_price:.5f}  PX:{g.current_price:.5f}"
@@ -526,6 +766,23 @@ class HubDashboard:
                 f"  ⏱ {mm:02d}:{ss:02d}  Base:${g.amount_invested:.2f}"
                 f"  Gale:{_YELLOW}${g.gale_amount:.2f}{_RESET}  Disparo:{fired}"
             )
+            lines.append(f"  Seguridad:{safety_txt}")
+            # objetivo ciclo y consecutivas
+            obj = f"+${g.cycle_target_amount:.2f}" if g.cycle_target_amount > 0 else "calculando..."
+            max_c = 3
+            used = min(g.consecutive_count, max_c)
+            c_color = _RED if used >= max_c else (_YELLOW if used >= 2 else "")
+            lines.append(
+                f"  Objetivo:{_GREEN}{obj}{_RESET}"
+                f"  Consecutivas:{c_color}{used}/{max_c}{_RESET}"
+            )
+        lines.append("")
+        lines.append(f"{_BOLD}--- MINI TERMINAL LOGS (tail) ---{_RESET}")
+        if _waiting_first_order(state):
+            lines.append("  (en espera de primera operacion)")
+        else:
+            for ln in _live_log_lines():
+                lines.append(f"  {ln}")
         lines.append("")
         lines.append(f"{_DIM}CTRL+C para salir{_RESET}")
         return "\n".join(lines)

@@ -61,8 +61,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--amount-initial",
         type=float,
-        default=1.0,
-        help="Monto mínimo de orden para la calculadora de riesgo",
+        default=1.01,
+        help="Monto mínimo de orden para la calculadora de riesgo (broker: > $1.00)",
     )
     p.add_argument(
         "--amount-martin",
@@ -123,6 +123,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=180.0,
         help="Minutos para bloquear reentrada en la misma estructura (0 desactiva)",
     )
+    p.add_argument(
+        "--hub-render",
+        choices=("auto", "live", "static", "fallback"),
+        default="auto",
+        help="Modo de render del HUB (auto en Windows usa static para evitar duplicados)",
+    )
     return p
 
 
@@ -134,7 +140,8 @@ def _apply_runtime_config(args: argparse.Namespace) -> None:
 
     # La gestión de montos ya no usa variables globales del bot; se configura
     # directamente sobre la calculadora dinámica de riesgo.
-    MartingaleCalculator.MIN_ORDER_AMOUNT = max(0.01, float(args.amount_initial))
+    # El broker exige monto estrictamente mayor a $1.00.
+    MartingaleCalculator.MIN_ORDER_AMOUNT = max(1.01, float(args.amount_initial))
     MartingaleCalculator.INCREMENT = max(0.01, float(args.amount_martin))
 
     cb.CYCLE_MAX_OPERATIONS = int(args.cycle_ops)
@@ -178,19 +185,25 @@ async def _render_hub_once(bot=None) -> None:
 
 def _configure_hub_console(cb) -> None:
     """Reduce el ruido del logger en consola para que el dashboard quede visible."""
+    # Desactivar contador inline para no mezclar texto con el render del HUB.
+    if hasattr(cb, "INLINE_COUNTDOWN_STDOUT"):
+        cb.INLINE_COUNTDOWN_STDOUT = False
+    if hasattr(cb, "INLINE_COUNTDOWN_LOG_TICKS"):
+        cb.INLINE_COUNTDOWN_LOG_TICKS = False
+
     # Handler de consola definido en consolidation_bot.py
     stdout_handler = getattr(cb, "_stdout_handler", None)
     if stdout_handler is not None:
         stdout_handler.setLevel(logging.ERROR)
 
-    # Logger principal del bot
+    # Mantener logs de archivo en INFO para forensia/sentinel.
     bot_log = getattr(cb, "log", None)
     if bot_log is not None:
-        bot_log.setLevel(logging.ERROR)
+        bot_log.setLevel(logging.INFO)
 
     # Root logger y librerias ruidosas
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.ERROR)
+    root_logger.setLevel(logging.INFO)
     for handler in root_logger.handlers:
         if isinstance(handler, logging.StreamHandler):
             handler.setLevel(logging.ERROR)
@@ -247,6 +260,11 @@ async def _hub_ticker(bot_ref: list, interval: float = 1.0) -> None:
 
             bot = bot_ref[0] if bot_ref else None
             if bot is not None:
+                if hasattr(bot, "refresh_balance_for_hub"):
+                    try:
+                        await bot.refresh_balance_for_hub()
+                    except Exception:
+                        pass
                 await _render_hub_once(bot)
         except asyncio.CancelledError:
             return
@@ -310,6 +328,14 @@ async def _run(args: argparse.Namespace) -> None:
     _apply_runtime_config(args)
     hub_readonly = bool(args.hub_readonly)
     run_once = bool(args.once)
+
+    from hub.hub_dashboard import HubDashboard
+    render_mode = str(args.hub_render or "auto").strip().lower()
+    if render_mode == "auto":
+        # En PowerShell/Windows, fallback ANSI es el más estable y evita
+        # duplicados visuales de bloques Rich en refresh continuo.
+        render_mode = "fallback" if os.name == "nt" else "live"
+    HubDashboard.configure(render_mode)
 
     # El HUB se muestra siempre desde el inicio para evitar pantalla en blanco.
     _configure_hub_console(cb)

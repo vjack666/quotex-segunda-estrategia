@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
 
 log = logging.getLogger(__name__)
@@ -80,6 +80,7 @@ PlaceOrderFn = Callable[..., Awaitable[tuple]]
 
 # Firma: get_balance() -> float  (puede ser sync o async)
 GetBalanceFn = Callable[[], float | Awaitable[float]]
+NowFn = Callable[[], float]
 
 
 # Firma: async/sync on_status(**campos) -> None  (notifica al hub en cada tick)
@@ -160,6 +161,7 @@ class GaleWatcher:
         place_order_fn:   PlaceOrderFn,
         calculator,
         get_balance_fn:   GetBalanceFn,
+        get_time_fn:      Optional[NowFn] = None,
         dry_run:          bool = False,
         on_status_fn:     OnStatusFn = None,
         on_clear_fn:      OnClearFn  = None,
@@ -168,16 +170,44 @@ class GaleWatcher:
         self._place_order  = place_order_fn
         self._calculator   = calculator
         self._get_balance  = get_balance_fn
+        self._now_fn       = get_time_fn
         self.dry_run       = dry_run
         self._on_status    = on_status_fn   # llamado en cada tick con estado del gale
         self._on_clear     = on_clear_fn    # llamado al terminar la vigilancia
         self.gale_fired    = False   # bandera: ya se disparó el gale en esta sesión
+        self._safety_status = "OK"
+
+    def _now_ts(self) -> float:
+        """Fuente de tiempo del watcher (idealmente calibrada al broker)."""
+        if self._now_fn is not None:
+            try:
+                return float(self._now_fn())
+            except Exception:
+                pass
+        return time.time()
+
+    def _secs_remaining(self, trade: TradeInfo, expires_at: Optional[float] = None) -> float:
+        close_ts = float(expires_at) if expires_at is not None else (trade.opened_at + trade.duration_sec)
+        return max(0.0, close_ts - self._now_ts())
+
+    def _calc_cycle_target_amount(self) -> float:
+        """Devuelve el monto objetivo del ciclo actual (ganancia esperada en $)."""
+        c = self._calculator
+        try:
+            base = getattr(c, "session_base_balance", None) or getattr(c, "current_balance", 0.0)
+            pct  = getattr(c, "GROWTH_TARGET_PCT", getattr(c, "GROWTH_PCT", 0.02))
+            if base and base > 0:
+                return round(base * pct, 2)
+        except Exception:
+            pass
+        return 0.0
 
     # ── callback helpers ─────────────────────────────────────────────────
 
     def _notify_status(self, trade: TradeInfo, price: Optional[float],
                        gale_amount: float = 0.0, gale_fired: bool = False,
-                       gale_success: bool = False, gale_order_id: str = "") -> None:
+                       gale_success: bool = False, gale_order_id: str = "",
+                       secs_remaining_override: Optional[float] = None) -> None:
         """Llama a on_status_fn si está configurado; ignora errores."""
         if self._on_status is None:
             return
@@ -192,7 +222,11 @@ class GaleWatcher:
                 direction=trade.direction,
                 entry_price=trade.entry_price,
                 current_price=current,
-                secs_remaining=trade.secs_remaining,
+                secs_remaining=(
+                    float(secs_remaining_override)
+                    if secs_remaining_override is not None
+                    else self._secs_remaining(trade)
+                ),
                 duration_sec=trade.duration_sec,
                 payout=trade.payout,
                 amount_invested=trade.amount,
@@ -202,6 +236,9 @@ class GaleWatcher:
                 gale_fired=gale_fired,
                 gale_success=gale_success,
                 gale_order_id=gale_order_id,
+                consecutive_count=getattr(self._calculator, "cycle_losses", 0) + 1,
+                cycle_target_amount=self._calc_cycle_target_amount(),
+                safety_status=self._safety_status,
             )
             if asyncio.iscoroutine(result):
                 asyncio.ensure_future(result)
@@ -228,7 +265,7 @@ class GaleWatcher:
         Se suma GALE_OTC_POST_OPEN_SEC para entrar justo después del open (igual que
         la estrategia principal).
         """
-        anchor = float(from_ts if from_ts is not None else time.time())
+        anchor = float(from_ts if from_ts is not None else self._now_ts())
         return ((int(anchor) // GALE_5M_TF_SEC) + 1) * GALE_5M_TF_SEC + GALE_OTC_POST_OPEN_SEC
 
     async def _current_price(self, asset: str) -> Optional[float]:
@@ -284,42 +321,59 @@ class GaleWatcher:
             log.debug("GaleWatcher: error obteniendo balance: %s", exc)
             return None
 
-    def _gale_amount(self, payout: int, balance: Optional[float]) -> Optional[float]:
+    def _gale_amount(self, payout: int, balance: Optional[float], pending_loss: float = 0.0) -> Optional[float]:
         """
         Calcula el monto del gale usando MartingaleCalculator.
         Devuelve None si no se puede calcular (riesgo excedido, etc.).
         """
-        if balance is not None:
-            try:
-                self._calculator.set_balance(balance)
-            except Exception:
-                pass
-
         try:
-            amount, status = self._calculator.calculate_investment(payout)
+            if balance is not None and hasattr(self._calculator, "preview_investment"):
+                projected_balance = max(0.0, float(balance) - max(0.0, float(pending_loss)))
+                amount, status = self._calculator.preview_investment(payout, projected_balance)
+            else:
+                if balance is not None:
+                    try:
+                        self._calculator.set_balance(balance)
+                    except Exception:
+                        pass
+                amount, status = self._calculator.calculate_investment(payout)
         except Exception as exc:
             log.error("GaleWatcher: error en MartingaleCalculator: %s", exc)
+            self._safety_status = "ERROR"
             return None
 
         if status == "OK":
+            self._safety_status = "OK"
             return amount
         if status == "CYCLE_COMPLETE":
             log.info("GaleWatcher: ciclo completo — no se requiere gale")
+            self._safety_status = "CICLO"
+            return None
+        if status == "MAX_CONSECUTIVE_REACHED":
+            log.warning(
+                "GaleWatcher: límite de 3 entradas consecutivas alcanzado — "
+                "se cancela GALE y continúa nueva búsqueda"
+            )
+            self._safety_status = "LIMITE"
             return None
         if "RISK_EXCEEDED" in status:
             log.warning(
                 "GaleWatcher: monto del gale excede límite de riesgo (%s) — gale cancelado",
                 status,
             )
+            self._safety_status = "RIESGO"
             return None
         if status.startswith("ERROR"):
             log.error("GaleWatcher: error en calculadora: %s", status)
+            self._safety_status = "ERROR"
             return None
 
         # Cualquier otro status: igual retornar monto si es > 0
         if amount > 0:
             log.warning("GaleWatcher: calculadora retornó status '%s' pero amount=%.2f — usando", status, amount)
+            self._safety_status = "OK"
             return amount
+        self._safety_status = "ERROR"
         return None
 
     # ── loop principal ────────────────────────────────────────────────────
@@ -339,27 +393,34 @@ class GaleWatcher:
         direction = trade.direction
         last_good_price: Optional[float] = None
 
+        # Ancla operacional: instante exacto en que el watcher recibe la operación
+        # dentro del sistema. Desde aquí, el reloj es siempre "5m - elapsed".
+        # No modifica la lógica de entrada inicial, sólo la temporización del GALE.
+        system_opened_at = self._now_ts()
+        expires_at = system_opened_at + float(trade.duration_sec)
+
         # ── calcular targets de disparo ───────────────────────────────────
         # Target primario: próximo open de 5m calculado desde la hora del ticket
         # (opened_at), no desde "ahora", para evitar drift visual/operativo.
         # Target final: T-1s como red de seguridad para no perder el gale.
-        primary_target_ts = self._next_5m_boundary_ts(trade.opened_at)
-        final_target_ts = max(trade.opened_at, trade.expires_at - GALE_TRIGGER_SEC)
-        use_primary_target = primary_target_ts < trade.expires_at
+        primary_target_ts = self._next_5m_boundary_ts(system_opened_at)
+        final_target_ts = max(system_opened_at, expires_at - GALE_TRIGGER_SEC)
+        use_primary_target = primary_target_ts < expires_at
 
         if not use_primary_target:
             log.info(
                 "🔍 GaleWatcher iniciado | %s %s $%.2f | entry=%.6f | cierre en %.0fs "
                 "| target=T-1s (fallback: próximo 5m después de expiración)",
-                asset, direction.upper(), trade.amount, trade.entry_price, trade.secs_remaining,
+                asset, direction.upper(), trade.amount, trade.entry_price,
+                self._secs_remaining(trade, expires_at=expires_at),
             )
         else:
-            secs_to_target = primary_target_ts - time.time()
+            secs_to_target = primary_target_ts - self._now_ts()
             log.info(
                 "🔍 GaleWatcher iniciado | %s %s $%.2f | entry=%.6f | cierre en %.0fs "
                 "| target=próximo 5m en %.0fs",
                 asset, direction.upper(), trade.amount, trade.entry_price,
-                trade.secs_remaining, secs_to_target,
+                self._secs_remaining(trade, expires_at=expires_at), secs_to_target,
             )
 
         primary_attempted = False
@@ -368,9 +429,9 @@ class GaleWatcher:
 
         # ── loop de monitoreo ────────────────────────────────────────────
         while True:
-            tick_started = time.time()
-            secs_left = trade.secs_remaining
-            now = time.time()
+            tick_started = self._now_ts()
+            secs_left = self._secs_remaining(trade, expires_at=expires_at)
+            now = self._now_ts()
 
             # Operación ya expiró — terminar loop
             if secs_left <= 0:
@@ -394,7 +455,7 @@ class GaleWatcher:
                 log.debug("GaleWatcher %s | %.0fs restantes | precio no disponible", asset, secs_left)
 
             # Notificar al hub con el estado actual
-            self._notify_status(trade, display_price)
+            self._notify_status(trade, display_price, secs_remaining_override=secs_left)
 
             # ── ventanas de disparo ───────────────────────────────────────
             should_try = False
@@ -411,14 +472,14 @@ class GaleWatcher:
                 outcome = await self._fire_gale(trade, display_price)
                 if outcome == "sent":
                     # Después del disparo, esperar hasta expiración y salir
-                    await asyncio.sleep(max(0.0, trade.secs_remaining + 1.0))
+                    await asyncio.sleep(max(0.0, self._secs_remaining(trade, expires_at=expires_at) + 1.0))
                     self._notify_clear()
                     return
 
                 # Sólo reintentar si fue problema técnico (precio o envío).
                 if outcome in ("no_price", "failed_send"):
                     trigger_attempts += 1
-                    next_retry_ts = time.time() + GALE_RETRY_INTERVAL_SEC
+                    next_retry_ts = self._now_ts() + GALE_RETRY_INTERVAL_SEC
                     log.warning(
                         "GaleWatcher %s: intento %d/%d sin envío (%s, %s)",
                         asset,
@@ -432,7 +493,7 @@ class GaleWatcher:
             next_target = final_target_ts
             if use_primary_target and not primary_attempted:
                 next_target = min(primary_target_ts, final_target_ts)
-            secs_to_target = max(0.0, next_target - time.time())
+            secs_to_target = max(0.0, next_target - self._now_ts())
             if secs_to_target <= FAST_POLL_THRESHOLD_SEC:
                 base_sleep = FAST_POLL_INTERVAL_SEC
             else:
@@ -441,7 +502,7 @@ class GaleWatcher:
                 base_sleep = max(FAST_POLL_INTERVAL_SEC, base_sleep)
 
             # Compensa el tiempo gastado en fetch/log para sostener cadencia ~1s.
-            elapsed = time.time() - tick_started
+            elapsed = self._now_ts() - tick_started
             sleep_for = max(0.05, base_sleep - elapsed)
             await asyncio.sleep(sleep_for)
 
@@ -491,7 +552,7 @@ class GaleWatcher:
 
         # ── calcular monto del gale ───────────────────────────────────────
         balance = await self._balance()
-        amount  = self._gale_amount(trade.payout, balance)
+        amount  = self._gale_amount(trade.payout, balance, pending_loss=trade.amount)
 
         if amount is None or amount <= 0:
             log.warning(
@@ -500,7 +561,16 @@ class GaleWatcher:
             )
             return "invalid_amount"
 
-        diff_pct = (price - trade.entry_price) / trade.entry_price * 100.0
+        if trade.entry_price > 0:
+            diff_pct = (price - trade.entry_price) / trade.entry_price * 100.0
+        else:
+            diff_pct = 0.0
+            log.warning(
+                "GaleWatcher %s: entry_price inválido (%.6f); "
+                "se omite delta porcentual para evitar división por cero",
+                asset,
+                trade.entry_price,
+            )
         log.warning(
             "🚨 GALE DISPARADO | %s %s | entry=%.6f actual=%.6f (%.4f%%) | "
             "monto=$%.2f | balance=$%.2f | target 5m",
@@ -541,11 +611,6 @@ class GaleWatcher:
             self._notify_status(trade, last_price, gale_amount=amount,
                                  gale_fired=True, gale_success=True,
                                  gale_order_id=str(order_id or ""))
-            # Registrar pérdida en la calculadora para próximo ciclo
-            try:
-                self._calculator.register_loss(trade.amount)
-            except Exception:
-                pass
             return "sent"
         else:
             log.error(

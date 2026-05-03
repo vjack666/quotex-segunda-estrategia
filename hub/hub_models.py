@@ -160,9 +160,12 @@ class GaleState:
     is_losing:       bool  = False
     delta_pct:       float = 0.0     # variación % precio vs entrada
     updated_at:      float = 0.0     # epoch del último tick recibido desde GaleWatcher
-    gale_fired:      bool  = False   # ya se disparó el gale
-    gale_order_id:   str   = ""      # order_id del gale si fue enviado
-    gale_success:    bool  = False   # True si el broker aceptó el gale
+    gale_fired:          bool  = False   # ya se disparó el gale
+    gale_order_id:       str   = ""      # order_id del gale si fue enviado
+    gale_success:        bool  = False   # True si el broker aceptó el gale
+    consecutive_count:   int   = 0       # entrada actual en el ciclo (1=base, 2=1er gale, 3=2do gale)
+    cycle_target_amount: float = 0.0    # objetivo de ganancia del ciclo ($)
+    safety_status:       str   = "OK"   # estado de seguridad: OK | RIESGO | LIMITE | ERROR
 
 
 @dataclass
