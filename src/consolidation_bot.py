@@ -212,7 +212,7 @@ REALTIME_PRICE_WARN_EVERY_SEC = 15.0
 FALLBACK_PRICE_TIMEOUT_SEC = 1.2
 GALE_BRIDGE_PRICE_TIMEOUT_SEC = 2.2
 GALE_BRIDGE_BALANCE_TIMEOUT_SEC = 1.8
-GALE_BRIDGE_ORDER_TIMEOUT_SEC = 8.0
+GALE_BRIDGE_ORDER_TIMEOUT_SEC = 45.0   # >= max interno place_order (reconexión×3 + buy×30s)
 GALE_BRIDGE_HUB_TIMEOUT_SEC = 0.8
 GALE_BRIDGE_WARN_EVERY_SEC = 5.0
 FETCH_RETRIES            = 2
@@ -342,6 +342,7 @@ class TradeState:
     order_ref:     int   = 0
     opened_at:     float = field(default_factory=time.time)
     opened_at_source: str = "fallback:local_clock"
+    close_ts:      float = 0.0   # timestamp de cierre del broker (0 = no disponible)
     martin_fired:  bool  = False
     stage:         str   = "initial"
     journal_id:    int   = 0
@@ -815,16 +816,70 @@ def _extract_ticket_opened_at_with_source(info: Any, fallback_ts: float) -> tupl
     return float(fallback_ts), "fallback:local_clock"
 
 
+def _extract_ticket_close_ts_with_source(
+    info: Any, opened_at_ts: float, duration_sec: int
+) -> tuple[float, str]:
+    """
+    Intenta obtener el timestamp real de CIERRE desde la respuesta del broker.
+    Si el broker no lo provee, calcula opened_at + duration_sec como fallback.
+    Devuelve (timestamp_cierre, fuente).
+    """
+    if not isinstance(info, dict):
+        return float(opened_at_ts) + float(duration_sec), "calculated:open+duration"
+
+    now = time.time()
+    close_keys = (
+        "closeTime", "close_time", "endTime", "end_time",
+        "closeAt", "close_at", "expireAt", "expire_at",
+        "expirationTime", "expiration_time", "closeTimestamp",
+    )
+    for key in close_keys:
+        raw = info.get(key)
+        if raw is None:
+            continue
+        try:
+            if isinstance(raw, (int, float)):
+                ts = float(raw)
+                if ts > 1e12:
+                    ts /= 1000.0
+                # Válido: entre ahora y 2 horas en el futuro
+                if now - 60.0 <= ts <= now + 7200.0:
+                    return ts, f"broker:{key}"
+            elif isinstance(raw, str):
+                txt = raw.strip()
+                if not txt:
+                    continue
+                if txt.isdigit():
+                    ts = float(txt)
+                    if ts > 1e12:
+                        ts /= 1000.0
+                    if now - 60.0 <= ts <= now + 7200.0:
+                        return ts, f"broker:{key}"
+                    continue
+                iso = txt.replace("Z", "+00:00")
+                dt = datetime.fromisoformat(iso)
+                ts = dt.timestamp()
+                if now - 60.0 <= ts <= now + 7200.0:
+                    return ts, f"broker:{key}"
+        except Exception:
+            continue
+
+    # Fallback: hora de apertura del broker + duración de la orden
+    close_ts = float(opened_at_ts) + float(duration_sec)
+    return close_ts, "calculated:open+duration"
+
+
 async def place_order(
     client: Quotex, asset: str, direction: str,
     amount: float, duration: int, dry_run: bool,
     account_type: str = "PRACTICE",
-) -> Tuple[bool, str, float, int, str, float, str]:
+) -> Tuple[bool, str, float, int, str, float, str, float]:
     if dry_run:
         log.info("  [DRY-RUN] %s %s $%.2f %ds",
                  direction.upper(), asset, amount, duration)
         ts_now = time.time()
-        return True, f"DRY-{int(ts_now)}", 0.0, 0, "", ts_now, "dry_run"
+        close_ts_dry = ts_now + float(duration)
+        return True, f"DRY-{int(ts_now)}", 0.0, 0, "", ts_now, "dry_run", close_ts_dry
 
     # Activos equity OTC (stocks) pueden tener restricciones de horario
     # aunque aparezcan como "open" en el scanner.
@@ -901,7 +956,7 @@ async def place_order(
     ok_reconnect, reconnect_reason = await _force_reconnect("pre-orden")
     if not ok_reconnect:
         log.error("  Reconexión pre-orden fallida: %s", reconnect_reason)
-        return False, "", 0.0, 0, reconnect_reason, 0.0, ""
+        return False, "", 0.0, 0, reconnect_reason, 0.0, "", 0.0
 
     await _log_pre_buy()
 
@@ -924,19 +979,19 @@ async def place_order(
             "abierta en broker. Verificar manualmente.",
             elapsed,
         )
-        return False, "", 0.0, 0, "buy_timeout_30s", 0.0, ""
+        return False, "", 0.0, 0, "buy_timeout_30s", 0.0, "", 0.0
     except Exception as exc:
         elapsed = time.time() - t0
         first_reason = f"buy_exception:{exc}"
         log.error("  Excepción en buy() elapsed=%.2fs: %s", elapsed, exc)
         if not looks_like_connection_issue(first_reason):
-            return False, "", 0.0, 0, first_reason, 0.0, ""
+            return False, "", 0.0, 0, first_reason, 0.0, "", 0.0
 
         log.warning("  ↻ Falla de conexión detectada en buy(); reintentando una vez...")
         ok_reconnect, reconnect_reason = await _force_reconnect("reintento")
         if not ok_reconnect:
             log.error("  Reconexión de reintento fallida: %s", reconnect_reason)
-            return False, "", 0.0, 0, f"{first_reason} | {reconnect_reason}", 0.0, ""
+            return False, "", 0.0, 0, f"{first_reason} | {reconnect_reason}", 0.0, "", 0.0
         await _log_pre_buy()
         t0_retry = time.time()
         try:
@@ -956,18 +1011,27 @@ async def place_order(
                 "  ⏱ buy() reintento sin respuesta en 30s (elapsed=%.1fs)",
                 elapsed_retry,
             )
-            return False, "", 0.0, 0, "buy_timeout_30s_retry", 0.0, ""
+            return False, "", 0.0, 0, "buy_timeout_30s_retry", 0.0, "", 0.0
         except Exception as retry_exc:
             elapsed_retry = time.time() - t0_retry
             retry_reason = f"buy_exception_retry:{retry_exc}"
             log.error("  Excepción en buy() reintento elapsed=%.2fs: %s", elapsed_retry, retry_exc)
-            return False, "", 0.0, 0, retry_reason, 0.0, ""
+            return False, "", 0.0, 0, retry_reason, 0.0, "", 0.0
 
     elapsed = time.time() - t0
 
     if status and isinstance(info, dict):
         log.debug("  Respuesta broker (%.2fs): %s", elapsed, info)
-        opened_at_ts, opened_at_source = _extract_ticket_opened_at_with_source(info, time.time())
+        _local_now = time.time()
+        opened_at_ts, opened_at_source = _extract_ticket_opened_at_with_source(info, _local_now)
+        close_ts, close_ts_source = _extract_ticket_close_ts_with_source(info, opened_at_ts, duration)
+        _offset = opened_at_ts - _local_now
+        log.info(
+            "  ⏱ Ticket: open=%s  close=%s  offset_vs_local=%+.3fs  (src_open=%s  src_close=%s)",
+            datetime.fromtimestamp(opened_at_ts, tz=timezone.utc).strftime("%H:%M:%S.%f")[:-3],
+            datetime.fromtimestamp(close_ts, tz=timezone.utc).strftime("%H:%M:%S.%f")[:-3],
+            _offset, opened_at_source, close_ts_source,
+        )
         order_ref = 0
         for key in ("id_number", "idNumber", "openOrderId", "ticket"):
             raw_val = info.get(key)
@@ -977,7 +1041,7 @@ async def place_order(
                     break
             except (TypeError, ValueError):
                 continue
-        return True, info.get("id", ""), float(info.get("openPrice", 0)), order_ref, "", opened_at_ts, opened_at_source
+        return True, info.get("id", ""), float(info.get("openPrice", 0)), order_ref, "", opened_at_ts, opened_at_source, close_ts
 
     log.error(
         "  Orden rechazada por broker. status=%s info=%s elapsed=%.2fs",
@@ -999,7 +1063,7 @@ async def place_order(
         ok_reconnect, reconnect_reason = await _force_reconnect("reintento")
         if not ok_reconnect:
             log.error("  Reconexión de reintento fallida: %s", reconnect_reason)
-            return False, "", 0.0, 0, f"{reject_reason} | {reconnect_reason}", 0.0, ""
+            return False, "", 0.0, 0, f"{reject_reason} | {reconnect_reason}", 0.0, "", 0.0
 
         await _log_pre_buy()
         t0_retry = time.time()
@@ -1019,17 +1083,26 @@ async def place_order(
                 "  ⏱ buy() reintento sin respuesta en 30s (elapsed=%.1fs)",
                 elapsed_retry,
             )
-            return False, "", 0.0, 0, "buy_timeout_30s_retry", 0.0, ""
+            return False, "", 0.0, 0, "buy_timeout_30s_retry", 0.0, "", 0.0
         except Exception as retry_exc:
             elapsed_retry = time.time() - t0_retry
             retry_reason = f"buy_exception_retry:{retry_exc}"
             log.error("  Excepción en buy() reintento elapsed=%.2fs: %s", elapsed_retry, retry_exc)
-            return False, "", 0.0, 0, retry_reason, 0.0, ""
+            return False, "", 0.0, 0, retry_reason, 0.0, "", 0.0
 
         elapsed_retry = time.time() - t0_retry
         if status_retry and isinstance(info_retry, dict):
             log.info("  ✅ Reintento exitoso en broker (%.2fs)", elapsed_retry)
-            opened_at_ts, opened_at_source = _extract_ticket_opened_at_with_source(info_retry, time.time())
+            _local_now = time.time()
+            opened_at_ts, opened_at_source = _extract_ticket_opened_at_with_source(info_retry, _local_now)
+            close_ts, close_ts_source = _extract_ticket_close_ts_with_source(info_retry, opened_at_ts, duration)
+            _offset = opened_at_ts - _local_now
+            log.info(
+                "  ⏱ Ticket: open=%s  close=%s  offset_vs_local=%+.3fs  (src_open=%s  src_close=%s)",
+                datetime.fromtimestamp(opened_at_ts, tz=timezone.utc).strftime("%H:%M:%S.%f")[:-3],
+                datetime.fromtimestamp(close_ts, tz=timezone.utc).strftime("%H:%M:%S.%f")[:-3],
+                _offset, opened_at_source, close_ts_source,
+            )
             order_ref = 0
             for key in ("id_number", "idNumber", "openOrderId", "ticket"):
                 raw_val = info_retry.get(key)
@@ -1039,7 +1112,7 @@ async def place_order(
                         break
                 except (TypeError, ValueError):
                     continue
-            return True, info_retry.get("id", ""), float(info_retry.get("openPrice", 0)), order_ref, "", opened_at_ts, opened_at_source
+            return True, info_retry.get("id", ""), float(info_retry.get("openPrice", 0)), order_ref, "", opened_at_ts, opened_at_source, close_ts
 
         retry_reason = "broker_rejected_retry"
         if isinstance(info_retry, dict):
@@ -1051,9 +1124,9 @@ async def place_order(
             )
         elif info_retry is not None:
             retry_reason = str(info_retry)
-        return False, "", 0.0, 0, retry_reason, 0.0, ""
+        return False, "", 0.0, 0, retry_reason, 0.0, "", 0.0
 
-    return False, "", 0.0, 0, reject_reason, 0.0, ""
+    return False, "", 0.0, 0, reject_reason, 0.0, "", 0.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4702,7 +4775,7 @@ class ConsolidationBot:
         account_type: str = "PRACTICE",
     ) -> tuple:
         """Wrapper de place_order() para el GaleWatcher."""
-        ok, oid, open_price, order_ref, reason, _opened_at_ts, _opened_at_source = await place_order(
+        ok, oid, open_price, order_ref, reason, _opened_at_ts, _opened_at_source, _close_ts = await place_order(
             self.client,
             asset,
             direction,
@@ -4838,7 +4911,7 @@ class ConsolidationBot:
         log.info("[%s] %s ENTRADA[%s] %s  %s  $%.2f  %ds  | %s",
                  strategy_origin, icon, stage, direction.upper(), sym, amount, duration_sec, reason)
 
-        ok, oid, open_price, order_ref, reject_reason, ticket_opened_at_ts, ticket_opened_at_source = await place_order(
+        ok, oid, open_price, order_ref, reject_reason, ticket_opened_at_ts, ticket_opened_at_source, ticket_close_ts = await place_order(
             self.client,
             sym,
             direction,
@@ -4875,6 +4948,7 @@ class ConsolidationBot:
             score_original=float(score_original),
             opened_at=float(ticket_opened_at_ts or time.time()),
             opened_at_source=str(ticket_opened_at_source or "fallback:local_clock"),
+            close_ts=float(ticket_close_ts or 0.0),
         )
         trade = self.trades[sym]
         try:
@@ -4927,6 +5001,7 @@ class ConsolidationBot:
                 order_id=str(oid or ""),
                 order_ref=int(order_ref or 0),
                 account_type=self.account_type,
+                expires_at_ts=float(trade.close_ts or 0.0),
             )
             self._launch_gale_watch(gale_info, stage)
 

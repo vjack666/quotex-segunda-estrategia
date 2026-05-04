@@ -105,9 +105,12 @@ class TradeInfo:
     order_id:     str    = ""
     order_ref:    int    = 0
     account_type: str    = "PRACTICE"
+    expires_at_ts: float = 0.0   # timestamp de cierre del broker (0 = calcular desde opened_at + duration_sec)
 
     @property
     def expires_at(self) -> float:
+        if self.expires_at_ts > 0.0:
+            return self.expires_at_ts
         return self.opened_at + self.duration_sec
 
     @property
@@ -408,7 +411,21 @@ class GaleWatcher:
                 _trade_ts, _now,
             )
             system_opened_at = _now
-        expires_at = system_opened_at + float(trade.duration_sec)
+
+        # Usar el timestamp de cierre del broker si está disponible.
+        # trade.expires_at ya incorpora expires_at_ts si fue provisto por el broker,
+        # si no, calcula opened_at + duration_sec como fallback.
+        expires_at = trade.expires_at
+        if trade.expires_at_ts > 0.0:
+            log.debug(
+                "GaleWatcher: cierre desde broker ticket=%.1f (en %.0fs)",
+                trade.expires_at_ts, trade.expires_at_ts - _now,
+            )
+        else:
+            log.debug(
+                "GaleWatcher: cierre calculado opened_at+duration=%.1f (en %.0fs)",
+                expires_at, expires_at - _now,
+            )
 
         # ── calcular targets de disparo ───────────────────────────────────
         # Target primario: próximo open de 5m calculado desde la hora del ticket
@@ -624,10 +641,20 @@ class GaleWatcher:
                                  gale_order_id=str(order_id or ""))
             return "sent"
         else:
-            log.error(
-                "❌ GALE RECHAZADO | %s | error=%s",
-                asset, error,
-            )
+            _is_bridge_timeout = "bridge_timeout" in str(error)
+            if _is_bridge_timeout:
+                log.error(
+                    "❌ GALE BRIDGE TIMEOUT | %s | el loop principal tardó > %.0fs en responder "
+                    "— probablemente reconexión o buy() en curso. error=%s",
+                    asset,
+                    45.0,  # GALE_BRIDGE_ORDER_TIMEOUT_SEC
+                    error,
+                )
+            else:
+                log.error(
+                    "❌ GALE RECHAZADO por broker | %s | error=%s",
+                    asset, error,
+                )
             self._notify_status(trade, last_price, gale_amount=amount,
                                  gale_fired=True, gale_success=False)
             self.gale_fired = False
