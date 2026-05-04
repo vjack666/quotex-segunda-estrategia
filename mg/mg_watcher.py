@@ -37,7 +37,7 @@ FAST_POLL_INTERVAL_SEC = 1.0
 
 # Segundos antes del cierre en que se dispara el gale (fallback si el próximo
 # boundary de 5 min cae después de la expiración)
-GALE_TRIGGER_SEC = 1.0
+GALE_TRIGGER_SEC = 3.0
 
 # Cuadrícula de 5 minutos (24 h ÷ 5 min = 288 slots en UTC)
 GALE_5M_TF_SEC = 300
@@ -61,8 +61,8 @@ PRICE_FETCH_TIMEOUT_SEC = 0.85
 PRICE_FETCH_RETRIES_CRITICAL = 3
 
 # Reintentos de disparo del gale en la ventana final si hubo fallo técnico.
-GALE_MAX_TRIGGER_ATTEMPTS = 3
-GALE_RETRY_INTERVAL_SEC = 1.0
+GALE_MAX_TRIGGER_ATTEMPTS = 5
+GALE_RETRY_INTERVAL_SEC = 0.5
 
 # Guardia de sanidad de precio durante vigilancia del trade.
 # Si el precio se desvía demasiado del entry en una operación de 5m,
@@ -505,17 +505,29 @@ class GaleWatcher:
                     return
 
                 # Sólo reintentar si fue problema técnico (precio o envío).
+                # Nota: también aplica cuando el intento fue target_5m y falló —
+                # en ese caso habilitamos la ventana final como fallback inmediato.
                 if outcome in ("no_price", "failed_send"):
                     trigger_attempts += 1
                     next_retry_ts = self._now_ts() + GALE_RETRY_INTERVAL_SEC
-                    log.warning(
-                        "GaleWatcher %s: intento %d/%d sin envío (%s, %s)",
-                        asset,
-                        trigger_attempts,
-                        GALE_MAX_TRIGGER_ATTEMPTS,
-                        reason,
-                        outcome,
-                    )
+                    # Si falló en target_5m, bajar el umbral final para reintentar pronto
+                    if reason == "target_5m":
+                        final_target_ts = min(final_target_ts, self._now_ts() + GALE_RETRY_INTERVAL_SEC)
+                        log.warning(
+                            "GaleWatcher %s: disparo target_5m falló (%s) — "
+                            "activando ventana de reintento en %.1fs (intento %d/%d)",
+                            asset, outcome, GALE_RETRY_INTERVAL_SEC,
+                            trigger_attempts, GALE_MAX_TRIGGER_ATTEMPTS,
+                        )
+                    else:
+                        log.warning(
+                            "GaleWatcher %s: intento %d/%d sin envío (%s, %s)",
+                            asset,
+                            trigger_attempts,
+                            GALE_MAX_TRIGGER_ATTEMPTS,
+                            reason,
+                            outcome,
+                        )
 
             # ── determinar intervalo de polling ───────────────────────────
             next_target = final_target_ts
@@ -608,9 +620,8 @@ class GaleWatcher:
         )
 
         # ── colocar la orden ─────────────────────────────────────────────
-        self.gale_fired = True
-
         if self.dry_run:
+            self.gale_fired = True
             log.info(
                 "  [DRY-RUN GALE] %s %s $%.2f %ds",
                 direction.upper(), asset, amount, GALE_DURATION_SEC,
@@ -627,10 +638,11 @@ class GaleWatcher:
             )
         except Exception as exc:
             log.error("GaleWatcher: excepción colocando gale: %s", exc)
-            self.gale_fired = False  # Permitir reintento si hay tiempo
+            # gale_fired permanece False → permite reintento si hay tiempo
             return "failed_send"
 
         if success:
+            self.gale_fired = True  # sólo marcar después de confirmación del broker
             log.info(
                 "✅ GALE COLOCADO | %s %s $%.2f | order_id=%s open_price=%.6f",
                 asset, direction.upper(), amount, order_id, open_price,
@@ -657,5 +669,5 @@ class GaleWatcher:
                 )
             self._notify_status(trade, last_price, gale_amount=amount,
                                  gale_fired=True, gale_success=False)
-            self.gale_fired = False
+            # gale_fired permanece False → permite reintento si hay margen
             return "failed_send"

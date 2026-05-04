@@ -277,6 +277,14 @@ ORDER_BLOCK_CANDLES = 55
 MA_LOOKBACK_CANDLES = 60
 MA_FAST_PERIOD = 35
 MA_SLOW_PERIOD = 50
+# Mínimo de velas 5m necesarias para que el escaneo sea confiable.
+# MA50 requiere 50 velas (250 min) — si el activo no tiene historia suficiente,
+# las lecturas de tendencia y zona serían parciales e imprecisas.
+MIN_CANDLES_FOR_FULL_SCAN = MA_SLOW_PERIOD
+# Distancia máxima que puede haber caído el precio bajo el piso (breakout_below)
+# o subido sobre el techo (breakout_above) al momento de entrar.
+# Si el precio ya se alejó más, el momentum está agotado y se descarta.
+MAX_BREAKOUT_OVEREXTENSION_PCT = 0.0012  # 0.12%
 MA_FLAT_DELTA_PCT = 0.0005
 DRY_RUN_VERBOSE = True
 
@@ -1220,6 +1228,10 @@ class ConsolidationBot:
         self._gale_thread_ready = threading.Event()
         self._gale_futures: set[ConcurrentFuture[Any]] = set()
         self._gale_bridge_last_warn_ts: dict[str, float] = {}
+        # True mientras haya una orden de gale activa en el broker.
+        # Bloquea nuevas entradas de estrategia aunque self.trades ya esté vacío
+        # (la trade base expiró pero el gale todavía está corriendo).
+        self._gale_order_active: bool = False
         # Motor de Gale — vigila operaciones activas y dispara compensación en T-1s
         if _GALE_WATCHER_AVAILABLE:
             self._gale_watcher = GaleWatcher(
@@ -1679,6 +1691,129 @@ class ConsolidationBot:
     @staticmethod
     def _is_put_pattern_blacklisted(direction: str, pattern_name: str) -> bool:
         return direction == "put" and pattern_name in PATTERN_PUT_BLACKLIST
+
+    async def _check_overext_support_bounce(
+        self,
+        rejected_put: "CandidateEntry",
+        selected: list,
+        existing_ids: set,
+        candidates_already_trading: set,
+    ) -> None:
+        """Escenario: PUT rechazado por sobreextensión → buscar soporte cercano → CALL rebote.
+
+        Cuando el precio cayó demasiado bajo el piso de la zona consolidada, el momentum PUT
+        está agotado. Si existe un soporte histórico con múltiples toques cerca del precio
+        actual, se crea un candidato CALL (rebound_floor) que pasa por el pipeline normal
+        de selección y confirmación 1m.
+
+        Condiciones para activar el CALL:
+        - Soporte detectado en velas 2m con ≥ MIN_SUPPORT_TOUCHES toques
+        - Precio actual dentro de MAX_SUPPORT_PROXIMITY_PCT del soporte
+        - El activo no tiene ya una operación activa
+        """
+        MIN_SUPPORT_TOUCHES = 3           # mínimo de toques para considerar el soporte válido
+        MAX_SUPPORT_PROXIMITY_PCT = 0.0008  # precio debe estar ≤ 0.08% del soporte
+
+        asset = rejected_put.asset
+        payout = rejected_put.payout
+
+        if asset in candidates_already_trading:
+            return  # ya operando, no abrir otro
+
+        # Precio actual = último cierre de las velas 5m del candidato rechazado
+        candles_5m = rejected_put.candles
+        if not candles_5m:
+            return
+        current_price = float(candles_5m[-1].close)
+
+        # Fetch velas 2m para detectar soportes históricos
+        try:
+            candles_2m = await fetch_candles_with_retry(
+                self.client,
+                asset,
+                120,
+                90,
+                timeout_sec=CANDLE_FETCH_TIMEOUT_SEC,
+            )
+        except Exception:
+            return
+
+        if not candles_2m:
+            return
+
+        support_price, touches = find_strong_support_2m(candles_2m)
+
+        if support_price is None or touches < MIN_SUPPORT_TOUCHES:
+            log.debug(
+                "[OVEREXT→CALL] %s sin soporte confiable (soporte=%s, toques=%d < %d)",
+                asset, support_price, touches, MIN_SUPPORT_TOUCHES,
+            )
+            return
+
+        # Verificar que el precio actual esté cerca del soporte (no ya muy por encima)
+        proximity = (current_price - support_price) / support_price
+        if proximity < 0 or proximity > MAX_SUPPORT_PROXIMITY_PCT:
+            log.debug(
+                "[OVEREXT→CALL] %s precio %.5f no está sobre soporte %.5f (proximidad=%.4f%%, máx=%.4f%%)",
+                asset, current_price, support_price,
+                proximity * 100, MAX_SUPPORT_PROXIMITY_PCT * 100,
+            )
+            return
+
+        log.info(
+            "🔄 [OVEREXT→CALL] %s: PUT sobreextendido → soporte %.5f detectado "
+            "(%d toques, proximidad=%.4f%%) — creando candidato CALL rebote",
+            asset, support_price, touches, proximity * 100,
+        )
+
+        # Construir zona sintética centrada en el soporte detectado.
+        # Usamos la mitad del spread promedio (0.05%) como rango de la zona.
+        half_range = support_price * 0.0005
+        synthetic_zone = ConsolidationZone(
+            asset=asset,
+            ceiling=round(support_price + half_range, 5),
+            floor=round(support_price - half_range, 5),
+            bars_inside=touches,
+            detected_at=time.time(),
+            range_pct=0.001,
+        )
+
+        call_candidate = CandidateEntry(
+            asset=asset,
+            payout=payout,
+            zone=synthetic_zone,
+            direction="call",
+            candles=candles_5m,
+        )
+        call_candidate.candles_h1 = rejected_put.candles_h1
+        setattr(call_candidate, "_reversal_pattern", "overext_support")
+        setattr(call_candidate, "_reversal_strength", min(1.0, touches / 6.0))
+        setattr(call_candidate, "_reversal_confirms", touches >= MIN_SUPPORT_TOUCHES)
+        setattr(call_candidate, "_entry_mode", "rebound_floor")
+        setattr(call_candidate, "_signal_ts_1m", None)
+        setattr(call_candidate, "_amount", getattr(rejected_put, "_amount", None))
+        setattr(call_candidate, "_stage", "overext_support_bounce")
+        setattr(call_candidate, "_ma_state", getattr(rejected_put, "_ma_state", None))
+        setattr(call_candidate, "_order_blocks", getattr(rejected_put, "_order_blocks", []))
+        setattr(call_candidate, "_ob_tf", getattr(rejected_put, "_ob_tf", "5m"))
+        setattr(call_candidate, "_force_execute", False)
+        setattr(call_candidate, "_support_touches", touches)
+        setattr(call_candidate, "_support_price", support_price)
+
+        score_candidate(call_candidate)
+
+        # Bonus por soporte con múltiples toques (mayor confianza)
+        touch_bonus = min(15.0, touches * 3.0)
+        call_candidate.score = round(call_candidate.score + touch_bonus, 1)
+        call_candidate.score_breakdown["support_touch_bonus"] = touch_bonus
+
+        if id(call_candidate) not in existing_ids:
+            selected.append(call_candidate)
+            existing_ids.add(id(call_candidate))
+            log.info(
+                "✅ [OVEREXT→CALL] %s CALL agregado: score=%.1f (soporte=%.5f, toques=%d, bonus=+%.1f)",
+                asset, call_candidate.score, support_price, touches, touch_bonus,
+            )
 
     def _update_dynamic_threshold(self) -> int:
         if len(self.accepted_scans_window) < ADAPTIVE_THRESHOLD_WINDOW_SCANS:
@@ -2517,7 +2652,7 @@ class ConsolidationBot:
                 break
             pending.scans_waited += 1
             matching = [c for c in remaining if c.asset == asset]
-            if matching and len(self.trades) < MAX_CONCURRENT_TRADES:
+            if matching and len(self.trades) < MAX_CONCURRENT_TRADES and not self._gale_order_active:
                 chosen = max(matching, key=lambda c: c.score)
                 entered = await self._enter(
                     chosen.asset,
@@ -3453,6 +3588,7 @@ class ConsolidationBot:
                     and strat_b_signal
                     and strat_b_conf >= strat_b_required_conf
                     and len(self.trades) < MAX_CONCURRENT_TRADES
+                    and not self._gale_order_active
                 ):
                     b_amount, _ = self._compute_initial_amount(payout)
                     pseudo_zone = ConsolidationZone(
@@ -3532,8 +3668,15 @@ class ConsolidationBot:
                     )
                     await sleep_with_inline_countdown(COOLDOWN_BETWEEN_ENTRIES, "⏳ Cooldown post-orden")
 
-                # STRAT-A requiere historial 5m mínimo para consolidación.
-                if len(candles) < MIN_CONSOLIDATION_BARS + 2:
+                # STRAT-A requiere historial 5m mínimo para consolidación y MA.
+                # MIN_CANDLES_FOR_FULL_SCAN = MA_SLOW_PERIOD (50 velas = ~250 min).
+                # Con menos historia las MAs son parciales y la zona puede ser espuria.
+                if len(candles) < MIN_CANDLES_FOR_FULL_SCAN:
+                    log.debug(
+                        "⏭ %s: historia insuficiente (%d velas < %d requeridas) — skip",
+                        sym, len(candles), MIN_CANDLES_FOR_FULL_SCAN,
+                    )
+                    self.stats["skipped"] += 1
                     continue
 
                 dynamic_max_range = MAX_RANGE_PCT
@@ -4163,15 +4306,47 @@ class ConsolidationBot:
         forced_breakouts = [c for c in candidates if bool(getattr(c, "_force_execute", False))]
         if forced_breakouts:
             existing = {id(c) for c in selected}
+            added = []
             for c in forced_breakouts:
                 if id(c) not in existing:
+                    # F1: force_execute sin reversal NO sobrepasa el umbral de score.
+                    # Un breakout sin confirmación de patrón debe cumplir el score mínimo.
+                    reversal = getattr(c, "_reversal_pattern", "none") or "none"
+                    if reversal == "none" and c.score < session_threshold:
+                        log.info(
+                            "⏭ FORCE_BREAKOUT ignorado: %s %s score=%.1f < %d (sin reversal)",
+                            c.direction.upper(), c.asset, c.score, session_threshold,
+                        )
+                        continue
+                    # F2: sobreextensión — el precio no puede haberse alejado demasiado
+                    # del borde de la zona antes de entrar.
+                    overext = self._candidate_trigger_distance_pct(c)
+                    if overext is not None and overext > MAX_BREAKOUT_OVEREXTENSION_PCT:
+                        log.info(
+                            "⏭ FORCE_BREAKOUT ignorado: %s %s sobreextensión %.3f%% > %.3f%%",
+                            c.direction.upper(), c.asset,
+                            overext * 100, MAX_BREAKOUT_OVEREXTENSION_PCT * 100,
+                        )
+                        # ── ESCENARIO SOBREEXTENSIÓN: buscar soporte cercano → CALL rebote ──
+                        # Si el precio cayó demasiado bajo el piso (PUT sobreextendido),
+                        # puede estar llegando a un soporte histórico.
+                        # Si ese soporte tiene múltiples toques, es una oportunidad CALL.
+                        if c.direction == "put":
+                            await self._check_overext_support_bounce(
+                                c, selected, existing, candidates_already_trading=set(
+                                    t.asset for t in self.trades.values()
+                                ),
+                            )
+                        continue
                     selected.append(c)
                     existing.add(id(c))
-            rejected = [c for c in rejected if id(c) not in {id(x) for x in forced_breakouts}]
-            log.warning(
-                "⚠ Modo FORCE_BREAKOUT: %d ruptura(s) fuerte(s) enviadas aun con score bajo umbral.",
-                len(forced_breakouts),
-            )
+                    added.append(c)
+            rejected = [c for c in rejected if id(c) not in {id(x) for x in added}]
+            if added:
+                log.warning(
+                    "⚠ Modo FORCE_BREAKOUT: %d ruptura(s) fuerte(s) enviadas (filtros F1/F2 OK).",
+                    len(added),
+                )
 
         # Filtro final live: operar solo activos cerca del gatillo real.
         near_selected: list[CandidateEntry] = []
@@ -4236,10 +4411,14 @@ class ConsolidationBot:
                  len(selected), len(candidates))
 
         # 5) Ejecutar seleccionados
-        if len(self.trades) >= MAX_CONCURRENT_TRADES:
+        if len(self.trades) >= MAX_CONCURRENT_TRADES or self._gale_order_active:
+            _block_reason = (
+                f"gale activo en broker" if self._gale_order_active
+                else f"{len(self.trades)}/{MAX_CONCURRENT_TRADES} trades"
+            )
             log.info(
-                "🛑 Límite alcanzado (%d/%d). Se posponen nuevas entradas.",
-                len(self.trades), MAX_CONCURRENT_TRADES,
+                "🛑 Límite alcanzado (%s). Se posponen nuevas entradas.",
+                _block_reason,
             )
             # Guardar el mejor candidato como "vigilado" para entrar cuando cierre el trade activo.
             best_watched = max(selected, key=lambda x: x.score)
@@ -4267,11 +4446,12 @@ class ConsolidationBot:
             return
 
         for winner in selected:
-            if len(self.trades) >= MAX_CONCURRENT_TRADES:
+            if len(self.trades) >= MAX_CONCURRENT_TRADES or self._gale_order_active:
+                _br = "gale activo" if self._gale_order_active else f"trades abiertos={len(self.trades)}/{MAX_CONCURRENT_TRADES}"
                 journal.log_candidate(
                     winner,
                     decision="REJECTED_LIMIT",
-                    reject_reason=f"trades abiertos={len(self.trades)}/{MAX_CONCURRENT_TRADES}",
+                    reject_reason=_br,
                     amount=getattr(winner, "_amount", 0.0),
                     stage=getattr(winner, "_stage", "initial"),
                     strategy=self._strategy_snapshot(),
@@ -4723,6 +4903,9 @@ class ConsolidationBot:
     async def _gale_on_clear_bridge(self) -> None:
         async def _inner() -> None:
             self.hub.clear_gale_state()
+            # El GaleWatcher terminó su ciclo — ya no hay gale activo en el broker.
+            self._gale_order_active = False
+            log.debug("_gale_on_clear_bridge: gale terminado — _gale_order_active=False")
 
         try:
             await self._run_on_main_loop_bounded(
@@ -4784,6 +4967,11 @@ class ConsolidationBot:
             self.dry_run,
             account_type=account_type,
         )
+        if ok:
+            # Marcar que hay una orden de gale activa en el broker.
+            # Esto bloquea nuevas entradas de estrategia mientras el gale corre.
+            self._gale_order_active = True
+            log.debug("_gale_place_order: gale confirmado — _gale_order_active=True")
         return ok, oid, open_price, order_ref, reason
 
     async def _gale_get_balance(self) -> float:
