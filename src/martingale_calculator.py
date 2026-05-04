@@ -24,9 +24,11 @@ class MartingaleCalculator:
     INCREMENT = 2.00  # Incremento por ciclo ($2) (fallback)
     GROWTH_PCT = 0.02  # Objetivo por operación: 2% de la cuenta base de sesión
     MIN_ORDER_AMOUNT = 1.01  # Monto mínimo de orden (broker requiere > $1.00)
+    MIN_ORDER_AMOUNT_LOW_BALANCE = 2.00  # Mínimo cuando saldo < LOW_BALANCE_THRESHOLD
+    LOW_BALANCE_THRESHOLD = 100.0  # Umbral de saldo bajo
     MAX_RISK_PCT = 0.10  # Máximo 10% del saldo por operación
     PRECISION_CENTS = 0.01  # Redondear a centavos
-    MAX_CONSECUTIVE_ENTRIES = 3  # Máximo de entradas consecutivas en el ciclo (base + gales)
+    MAX_CONSECUTIVE_ENTRIES = 4  # Máximo de entradas: base + 3 gales seguidos
 
     def __init__(self, current_balance: Optional[float] = None):
         """
@@ -54,13 +56,19 @@ class MartingaleCalculator:
         """Sincroniza saldo sin reiniciar contador/objetivo del ciclo."""
         self.set_balance(balance, reset_cycle=False)
 
+    def _dynamic_min_order(self, balance: float) -> float:
+        """Devuelve el mínimo de orden según el saldo actual."""
+        if balance < self.LOW_BALANCE_THRESHOLD:
+            return self.MIN_ORDER_AMOUNT_LOW_BALANCE
+        return self.MIN_ORDER_AMOUNT
+
     def configure_growth_target(self, base_balance: float, pct: float = 0.02) -> None:
         """Configura objetivo fijo por operación (2% de la cuenta base de sesión)."""
         safe_base = max(0.0, float(base_balance))
         safe_pct = max(0.0, float(pct))
         self.session_base_balance = safe_base
         fixed_amount = self._round_up_to_cents(safe_base * safe_pct)
-        self.fixed_increment_amount = max(self.MIN_ORDER_AMOUNT, fixed_amount)
+        self.fixed_increment_amount = max(self._dynamic_min_order(safe_base), fixed_amount)
         self.GROWTH_PCT = safe_pct
         self._reset_cycle()
 
@@ -150,7 +158,7 @@ class MartingaleCalculator:
 
         # Redondear hacia arriba a centavos
         investment = self._round_up_to_cents(raw_investment)
-        investment = max(self.MIN_ORDER_AMOUNT, investment)
+        investment = max(self._dynamic_min_order(self.current_balance), investment)
 
         # Verificar regla del 10%
         risk_limit = self.current_balance * self.MAX_RISK_PCT
@@ -176,7 +184,7 @@ class MartingaleCalculator:
         raw_investment = profit_needed / payout_rate
 
         investment = self._round_up_to_cents(raw_investment)
-        investment = max(self.MIN_ORDER_AMOUNT, investment)
+        investment = max(self._dynamic_min_order(projected_balance), investment)
 
         risk_limit = projected_balance * self.MAX_RISK_PCT
         if investment > risk_limit:

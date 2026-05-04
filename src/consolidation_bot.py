@@ -210,6 +210,11 @@ REALTIME_PRICE_TIMEOUT_SEC = 3.0
 REALTIME_PRICE_STALE_SEC = 4.0
 REALTIME_PRICE_WARN_EVERY_SEC = 15.0
 FALLBACK_PRICE_TIMEOUT_SEC = 1.2
+GALE_BRIDGE_PRICE_TIMEOUT_SEC = 2.2
+GALE_BRIDGE_BALANCE_TIMEOUT_SEC = 1.8
+GALE_BRIDGE_ORDER_TIMEOUT_SEC = 8.0
+GALE_BRIDGE_HUB_TIMEOUT_SEC = 0.8
+GALE_BRIDGE_WARN_EVERY_SEC = 5.0
 FETCH_RETRIES            = 2
 FETCH_RETRY_BACKOFF_SEC  = 0.35
 ORDER_SEND_RETRIES       = 1
@@ -1141,6 +1146,7 @@ class ConsolidationBot:
         self._gale_thread_loop: Optional[asyncio.AbstractEventLoop] = None
         self._gale_thread_ready = threading.Event()
         self._gale_futures: set[ConcurrentFuture[Any]] = set()
+        self._gale_bridge_last_warn_ts: dict[str, float] = {}
         # Motor de Gale — vigila operaciones activas y dispara compensación en T-1s
         if _GALE_WATCHER_AVAILABLE:
             self._gale_watcher = GaleWatcher(
@@ -4543,6 +4549,9 @@ class ConsolidationBot:
             main_loop = asyncio.get_running_loop()
             self._main_loop = main_loop
 
+        if main_loop.is_closed() or not main_loop.is_running():
+            raise RuntimeError("Main loop no disponible para bridge GALE")
+
         current = asyncio.get_running_loop()
         if main_loop is current:
             return await coro
@@ -4550,8 +4559,39 @@ class ConsolidationBot:
         fut = asyncio.run_coroutine_threadsafe(coro, main_loop)
         return await asyncio.wrap_future(fut)
 
+    async def _run_on_main_loop_bounded(
+        self,
+        coro: Awaitable[Any],
+        *,
+        timeout_sec: float,
+        bridge_name: str,
+    ) -> Any:
+        """Ejecuta un bridge en loop principal con timeout duro y cancelación segura."""
+        try:
+            return await asyncio.wait_for(self._run_on_main_loop(coro), timeout=timeout_sec)
+        except asyncio.TimeoutError as exc:
+            now = time.time()
+            if not hasattr(self, "_gale_bridge_last_warn_ts"):
+                self._gale_bridge_last_warn_ts = {}
+            last = float(self._gale_bridge_last_warn_ts.get(bridge_name, 0.0))
+            if (now - last) >= GALE_BRIDGE_WARN_EVERY_SEC:
+                log.warning(
+                    "Gale bridge timeout (%s): %.1fs; se aplica fallback no bloqueante",
+                    bridge_name,
+                    timeout_sec,
+                )
+                self._gale_bridge_last_warn_ts[bridge_name] = now
+            raise TimeoutError(f"bridge timeout: {bridge_name}") from exc
+
     async def _gale_fetch_price_bridge(self, asset: str) -> Optional[float]:
-        result = await self._run_on_main_loop(self._get_current_price(asset))
+        try:
+            result = await self._run_on_main_loop_bounded(
+                self._get_current_price(asset),
+                timeout_sec=GALE_BRIDGE_PRICE_TIMEOUT_SEC,
+                bridge_name="fetch_price",
+            )
+        except Exception:
+            return None
         if result is None:
             return None
         try:
@@ -4567,31 +4607,58 @@ class ConsolidationBot:
         duration: int,
         account_type: str = "PRACTICE",
     ) -> tuple:
-        return await self._run_on_main_loop(
-            self._gale_place_order(
-                asset=asset,
-                direction=direction,
-                amount=amount,
-                duration=duration,
-                account_type=account_type,
+        try:
+            return await self._run_on_main_loop_bounded(
+                self._gale_place_order(
+                    asset=asset,
+                    direction=direction,
+                    amount=amount,
+                    duration=duration,
+                    account_type=account_type,
+                ),
+                timeout_sec=GALE_BRIDGE_ORDER_TIMEOUT_SEC,
+                bridge_name="place_order",
             )
-        )
+        except Exception as exc:
+            return False, "", 0.0, 0, f"bridge_timeout:{exc}"
 
     async def _gale_get_balance_bridge(self) -> float:
-        result = await self._run_on_main_loop(self._gale_get_balance())
-        return float(result or 0.0)
+        try:
+            result = await self._run_on_main_loop_bounded(
+                self._gale_get_balance(),
+                timeout_sec=GALE_BRIDGE_BALANCE_TIMEOUT_SEC,
+                bridge_name="get_balance",
+            )
+            return float(result or 0.0)
+        except Exception:
+            # Fallback inmediato para no congelar watcher.
+            return float(self.current_balance or 0.0)
 
     async def _gale_on_status_bridge(self, **kwargs) -> None:
         async def _inner() -> None:
             self.hub.update_gale_state(**kwargs)
 
-        await self._run_on_main_loop(_inner())
+        try:
+            await self._run_on_main_loop_bounded(
+                _inner(),
+                timeout_sec=GALE_BRIDGE_HUB_TIMEOUT_SEC,
+                bridge_name="hub_status",
+            )
+        except Exception:
+            pass
 
     async def _gale_on_clear_bridge(self) -> None:
         async def _inner() -> None:
             self.hub.clear_gale_state()
 
-        await self._run_on_main_loop(_inner())
+        try:
+            await self._run_on_main_loop_bounded(
+                _inner(),
+                timeout_sec=GALE_BRIDGE_HUB_TIMEOUT_SEC,
+                bridge_name="hub_clear",
+            )
+        except Exception:
+            pass
 
     def _launch_gale_watch(self, gale_info: Any, stage: str) -> None:
         if self._gale_watcher is None:

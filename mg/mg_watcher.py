@@ -17,6 +17,7 @@ Flujo:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 from dataclasses import dataclass
@@ -314,7 +315,7 @@ class GaleWatcher:
     async def _balance(self) -> Optional[float]:
         try:
             result = self._get_balance()
-            if asyncio.iscoroutine(result):
+            if inspect.isawaitable(result):
                 return float(await result)
             return float(result)
         except Exception as exc:
@@ -351,7 +352,7 @@ class GaleWatcher:
             return None
         if status == "MAX_CONSECUTIVE_REACHED":
             log.warning(
-                "GaleWatcher: límite de 3 entradas consecutivas alcanzado — "
+                "GaleWatcher: límite de entradas consecutivas alcanzado (base + 3 gales) — "
                 "se cancela GALE y continúa nueva búsqueda"
             )
             self._safety_status = "LIMITE"
@@ -393,10 +394,20 @@ class GaleWatcher:
         direction = trade.direction
         last_good_price: Optional[float] = None
 
-        # Ancla operacional: instante exacto en que el watcher recibe la operación
-        # dentro del sistema. Desde aquí, el reloj es siempre "5m - elapsed".
-        # No modifica la lógica de entrada inicial, sólo la temporización del GALE.
-        system_opened_at = self._now_ts()
+        # Ancla operacional: usa el timestamp del broker del ticket para evitar
+        # desplazamiento si el watcher arranca con latencia respecto al trade real.
+        # Fallback a self._now_ts() si trade.opened_at está corrupto o es futuro.
+        _now = self._now_ts()
+        _trade_ts = float(trade.opened_at) if trade.opened_at else 0.0
+        if 0 < _trade_ts <= _now + 2.0:
+            # Plausible: el trade abrió en el pasado (o máx 2s en el futuro por drift de reloj)
+            system_opened_at = _trade_ts
+        else:
+            log.warning(
+                "GaleWatcher: trade.opened_at=%.1f fuera de rango (ahora=%.1f) — usando reloj local",
+                _trade_ts, _now,
+            )
+            system_opened_at = _now
         expires_at = system_opened_at + float(trade.duration_sec)
 
         # ── calcular targets de disparo ───────────────────────────────────

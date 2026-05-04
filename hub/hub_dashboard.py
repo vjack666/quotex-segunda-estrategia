@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, List, Optional
 
 from .hub_models import CandidateData, HubState
+from src.martingale_calculator import MartingaleCalculator
 
 if TYPE_CHECKING:
     from rich.console import Console
@@ -479,11 +480,11 @@ def _build_gale_panel(state: HubState) -> "Panel":
         objetivo_mu = f"[bold green]+${g.cycle_target_amount:.2f}[/bold green]"
     else:
         objetivo_mu = "[dim]calculando...[/dim]"
-    max_consec = 3
+    max_consec = MartingaleCalculator.MAX_CONSECUTIVE_ENTRIES
     used = min(g.consecutive_count, max_consec)
     if used >= max_consec:
         consec_mu = f"[bold red]{used}/{max_consec}[/bold red]  [dim](límite)[/dim]"
-    elif used >= 2:
+    elif used >= max_consec - 1:
         consec_mu = f"[bold yellow]{used}/{max_consec}[/bold yellow]"
     else:
         consec_mu = f"[bold]{used}/{max_consec}[/bold]"
@@ -769,9 +770,9 @@ class HubDashboard:
             lines.append(f"  Seguridad:{safety_txt}")
             # objetivo ciclo y consecutivas
             obj = f"+${g.cycle_target_amount:.2f}" if g.cycle_target_amount > 0 else "calculando..."
-            max_c = 3
+            max_c = MartingaleCalculator.MAX_CONSECUTIVE_ENTRIES
             used = min(g.consecutive_count, max_c)
-            c_color = _RED if used >= max_c else (_YELLOW if used >= 2 else "")
+            c_color = _RED if used >= max_c else (_YELLOW if used >= max_c - 1 else "")
             lines.append(
                 f"  Objetivo:{_GREEN}{obj}{_RESET}"
                 f"  Consecutivas:{c_color}{used}/{max_c}{_RESET}"
