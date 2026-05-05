@@ -51,7 +51,7 @@ from datetime import timedelta
 from math import ceil
 from pathlib import Path
 from statistics import mean
-from typing import Any, Awaitable, Deque, List, Optional, Tuple
+from typing import Any, Awaitable, Coroutine, Deque, List, Optional, Tuple
 
 # ── Cargar .env ───────────────────────────────────────────────────────────────
 for _candidate in (Path(__file__).parent / ".env", Path(__file__).parent.parent / ".env"):
@@ -79,6 +79,13 @@ from trade_journal import get_journal
 from martingale_calculator import MartingaleCalculator
 from hub.hub_scanner import HubScanner
 from hub.hub_models import CandidateData
+
+try:
+    from estrategia_30s import detector as strat_c_detector
+    _STRAT_C_AVAILABLE = True
+except Exception:
+    strat_c_detector = None  # type: ignore
+    _STRAT_C_AVAILABLE = False
 
 # Motor de Gale — ruta relativa al ROOT del proyecto
 import sys as _sys
@@ -168,7 +175,7 @@ MIN_PAYOUT             = 80      # payout mínimo %
 DURATION_SEC           = 300     # duración fija de cada opción binaria (5 min)
 SCAN_INTERVAL_SEC      = 60      # segundos entre escaneos completos
 CONNECT_RETRIES        = 3       # reintentos de conexión con delay
-MAX_CONCURRENT_TRADES  = 1       # máximo de operaciones abiertas simultáneas
+MAX_CONCURRENT_TRADES  = 2       # máximo de operaciones abiertas simultáneas (1 por estrategia)
 COOLDOWN_BETWEEN_ENTRIES = 30    # espera entre órdenes exitosas (segundos)
 LIVE_SCAN_MODE           = True  # escaneo continuo "super live" guiado por flujo de Quotex
 LIVE_SCAN_SLEEP_SEC      = 1.0   # pausa mínima entre ciclos live para no saturar WS
@@ -180,6 +187,7 @@ ENTRY_OTC_POST_OPEN_SEC  = 0.20  # en OTC enviar levemente DESPUES del open para
 ALIGN_SCAN_TO_CANDLE     = False # escaneo cada 60s (SCAN_INTERVAL_SEC)
 SCAN_LEAD_SEC            = 35.0  # escanear ~35s antes del próximo open de 5m
 MAX_LOSS_SESSION         = 0.20  # detener sesión si drawdown alcanza 20%
+ENABLE_SESSION_STOP_LOSS = False  # entrenamiento: no frenar por drawdown
 
 # Filtro "cerca de disparo" para HUB/ejecución.
 HUB_NEAR_ENTRY_TOLERANCE_PCT = 0.0010  # 0.10% alrededor de piso/techo de zona
@@ -242,6 +250,15 @@ REBOUND_MIN_STRENGTH_PUT  = 0.65
 REJECTION_CANDLE_MIN_BODY = 0.40    # body >= 40% del rango para confirmar rebote
 REJECTION_CALL_MIN_LOWER_WICK = 0.30
 REJECTION_PUT_MIN_UPPER_WICK = 0.30
+# Ventana recomendada para ejecutar rechazo M1 dentro de la vela actual.
+# Basado en operativa discrecional: esperar segundo 30 para capturar reversión
+# intravela con margen hasta el cierre.
+REJECTION_ENTRY_WINDOW_ENABLED = True
+REJECTION_ENTRY_WINDOW_START_SEC = 30
+REJECTION_ENTRY_WINDOW_END_SEC = 41
+# Clasificación de calidad del rechazo: parcial vs total.
+REJECTION_TOTAL_MIN_BODY_RATIO = 0.55
+REJECTION_ALLOW_PARTIAL = True
 ZONE_AGE_REBOUND_MIN = 20
 ZONE_AGE_BREAKOUT_MIN = 8
 ZONE_MIN_AGE_MIN = ZONE_AGE_REBOUND_MIN
@@ -252,9 +269,9 @@ GREYLIST_ASSETS = {"USDDZD_otc"}
 PATTERN_PUT_BLACKLIST = {"bearish_engulfing"}
 STRICT_PATTERN_CHECK = True
 
-ADAPTIVE_THRESHOLD_BASE = 65
-ADAPTIVE_THRESHOLD_LOW = 62
-ADAPTIVE_THRESHOLD_HIGH = 68
+ADAPTIVE_THRESHOLD_BASE = 60
+ADAPTIVE_THRESHOLD_LOW = 58
+ADAPTIVE_THRESHOLD_HIGH = 64
 ADAPTIVE_THRESHOLD_WINDOW_SCANS = 10
 
 ASSET_LOSS_STREAK_LIMIT = 3
@@ -320,6 +337,12 @@ STRAT_B_MIN_CONFIDENCE_EARLY = 0.62
 STRAT_B_ALLOW_WYCKOFF_EARLY = True
 STRAT_B_LOG_TOP_N      = 3
 STRAT_B_PREVIEW_MIN_CONF = 0.45
+
+# STRAT-C (Rechazo M1 en ventana de 30s)
+STRAT_C_CAN_TRADE      = False
+STRAT_C_DURATION_SEC   = 60
+STRAT_C_MIN_SCORE      = 4.0
+STRAT_C_LOG_TOP_N      = 3
 
 # Captura forense de velas para eventos BROKEN_* (auditoría operativa)
 BROKEN_CAPTURE_DIR = Path(__file__).resolve().parent.parent / "data" / "vela_ops"
@@ -1163,8 +1186,10 @@ class ConsolidationBot:
             "scans": 0, "entries": 0, "martins": 0,
             "expired_zones": 0, "skipped": 0, "filtered_sensor": 0,
             "strat_a_signals": 0, "strat_b_signals": 0,
+            "strat_c_signals": 0,
             "strat_a_wins": 0, "strat_a_losses": 0,
             "strat_b_wins": 0, "strat_b_losses": 0,
+            "strat_c_wins": 0, "strat_c_losses": 0,
             "score_rejected_age": 0,   # candidatos rechazados por penaliz. antigüedad
             "score_rejected_score": 0, # candidatos rechazados por score < umbral
             "rejected_young_zone": 0,
@@ -1183,6 +1208,9 @@ class ConsolidationBot:
         self.session_start_balance: Optional[float] = None
         self.current_balance:       Optional[float] = None
         self.martingale:            MartingaleCalculator = MartingaleCalculator()
+        # Calculadoras aisladas para GALE por contexto (estrategia+par).
+        # Evita que una pérdida en STRAT-B/ASSET_X contamine STRAT-A/ASSET_Y.
+        self._martingale_by_context: dict[str, MartingaleCalculator] = {}
         self.session_stop_hit:      bool = False
         self.cycle_id:              int = 1
         self.cycle_ops:             int = 0
@@ -1223,6 +1251,7 @@ class ConsolidationBot:
         self.hub = HubScanner()
         self.last_scan_strat_a: List[CandidateEntry] = []
         self.last_scan_strat_b: List[CandidateEntry] = []
+        self.last_scan_strat_c: List[CandidateEntry] = []
         self._gale_thread: Optional[threading.Thread] = None
         self._gale_thread_loop: Optional[asyncio.AbstractEventLoop] = None
         self._gale_thread_ready = threading.Event()
@@ -1233,7 +1262,7 @@ class ConsolidationBot:
         # (la trade base expiró pero el gale todavía está corriendo).
         self._gale_order_active: bool = False
         # Motor de Gale — vigila operaciones activas y dispara compensación en T-1s
-        if _GALE_WATCHER_AVAILABLE:
+        if _GALE_WATCHER_AVAILABLE and GaleWatcher is not None:
             self._gale_watcher = GaleWatcher(
                 fetch_price_fn=self._gale_fetch_price_bridge,
                 place_order_fn=self._gale_place_order_bridge,
@@ -1544,10 +1573,37 @@ class ConsolidationBot:
                 except Exception as exc:
                     log.debug("HUB: Error converting STRAT-B candidate: %s", exc)
 
+            strat_c_for_hub = []
+            sorted_c = sorted(self.last_scan_strat_c, key=lambda c: c.score, reverse=True)
+            for candidate in sorted_c[:5]:
+                try:
+                    dist = self._candidate_trigger_distance_pct(candidate)
+                    cd = CandidateData(
+                        strategy="STRAT-C",
+                        asset=candidate.asset,
+                        direction=candidate.direction,
+                        score=candidate.score,
+                        payout=candidate.payout,
+                        zone_ceiling=candidate.zone.ceiling if candidate.zone else 0.0,
+                        zone_floor=candidate.zone.floor if candidate.zone else 0.0,
+                        zone_age_min=candidate.zone.age_minutes if candidate.zone else 0.0,
+                        pattern=getattr(candidate, "_reversal_pattern", "rejection_30s"),
+                        pattern_strength=getattr(candidate, "_reversal_strength", 0.0),
+                        entry_mode=getattr(candidate, "_entry_mode", "rejection_30s"),
+                        confidence=getattr(candidate, "_reversal_strength", None),
+                        signal_type=getattr(candidate, "_reversal_pattern", None),
+                        raw_reason="scan",
+                        dist_pct=dist,
+                    )
+                    strat_c_for_hub.append(cd)
+                except Exception as exc:
+                    log.debug("HUB: Error converting STRAT-C candidate: %s", exc)
+
             self.hub.record_scan_cycle(
                 total_assets=total_assets,
                 strat_a_candidates=strat_a_for_hub,
                 strat_b_candidates=strat_b_for_hub,
+                strat_c_candidates=strat_c_for_hub,
                 balance=self.current_balance,
                 cycle_id=self.cycle_id,
                 cycle_ops=self.cycle_ops,
@@ -1611,7 +1667,7 @@ class ConsolidationBot:
                 await self.client.start_realtime_price(
                     asset,
                     period=0,
-                    timeout=REALTIME_PRICE_TIMEOUT_SEC,
+                    timeout=max(1, int(ceil(REALTIME_PRICE_TIMEOUT_SEC))),
                 )
                 self._rt_stream_started.add(asset)
                 log.info("📡 Realtime stream activo para %s", asset)
@@ -2691,56 +2747,76 @@ class ConsolidationBot:
         candles_1m: List[Candle],
         direction: str,
         min_body_ratio: float = REJECTION_CANDLE_MIN_BODY,
-    ) -> Tuple[bool, str]:
+    ) -> Tuple[bool, str, str]:
         """
         Valida que la vela 1m más reciente confirme el rebote en piso/techo.
         
         Para CALL (piso): close > open (alcista) Y body_ratio >= min_body_ratio
         Para PUT (techo): close < open (bajista) Y body_ratio >= min_body_ratio
         
-        Retorna (válido, razón_fallo | "").
+        Retorna (válido, razón_fallo | "", calidad_rechazo).
+        calidad_rechazo: "none" | "partial" | "total".
         """
         if len(candles_1m) < 3:
-            return False, "insuficientes velas 1m"
+            return False, "insuficientes velas 1m", "none"
         
         last = candles_1m[-2]
         rango = last.range
         if rango <= 0:
-            return False, "vela sin rango"
+            return False, "vela sin rango", "none"
+
+        if REJECTION_ENTRY_WINDOW_ENABLED:
+            sec = datetime.now(tz=BROKER_TZ).second
+            if sec < REJECTION_ENTRY_WINDOW_START_SEC or sec > REJECTION_ENTRY_WINDOW_END_SEC:
+                return (
+                    False,
+                    (
+                        f"fuera de ventana temporal s={sec:02d} "
+                        f"(esperado {REJECTION_ENTRY_WINDOW_START_SEC:02d}-"
+                        f"{REJECTION_ENTRY_WINDOW_END_SEC:02d})"
+                    ),
+                    "none",
+                )
         
         body_ratio = abs(last.close - last.open) / rango
         
         if direction == "call":
             # CALL en piso: esperar vela alcista (close > open)
             if last.close <= last.open:
-                return False, f"vela bajista (close={last.close:.5f} < open={last.open:.5f})"
+                return False, f"vela bajista (close={last.close:.5f} < open={last.open:.5f})", "none"
             if body_ratio < min_body_ratio:
-                return False, f"cuerpo débil {body_ratio:.0%} < {min_body_ratio:.0%}"
+                return False, f"cuerpo débil {body_ratio:.0%} < {min_body_ratio:.0%}", "none"
             lower_wick = min(last.open, last.close) - last.low
             lower_wick_ratio = lower_wick / rango
             if lower_wick_ratio < REJECTION_CALL_MIN_LOWER_WICK:
                 return False, (
                     f"mecha inferior débil {lower_wick_ratio:.0%} "
                     f"< {REJECTION_CALL_MIN_LOWER_WICK:.0%}"
-                )
-            return True, ""
+                ), "none"
+            quality = "total" if body_ratio >= REJECTION_TOTAL_MIN_BODY_RATIO else "partial"
+            if quality == "partial" and not REJECTION_ALLOW_PARTIAL:
+                return False, "rechazo parcial bloqueado por configuración", "none"
+            return True, "", quality
         
         elif direction == "put":
             # PUT en techo: esperar vela bajista (close < open)
             if last.close >= last.open:
-                return False, f"vela alcista (close={last.close:.5f} >= open={last.open:.5f})"
+                return False, f"vela alcista (close={last.close:.5f} >= open={last.open:.5f})", "none"
             if body_ratio < min_body_ratio:
-                return False, f"cuerpo débil {body_ratio:.0%} < {min_body_ratio:.0%}"
+                return False, f"cuerpo débil {body_ratio:.0%} < {min_body_ratio:.0%}", "none"
             upper_wick = last.high - max(last.open, last.close)
             upper_wick_ratio = upper_wick / rango
             if upper_wick_ratio < REJECTION_PUT_MIN_UPPER_WICK:
                 return False, (
                     f"mecha superior débil {upper_wick_ratio:.0%} "
                     f"< {REJECTION_PUT_MIN_UPPER_WICK:.0%}"
-                )
-            return True, ""
+                ), "none"
+            quality = "total" if body_ratio >= REJECTION_TOTAL_MIN_BODY_RATIO else "partial"
+            if quality == "partial" and not REJECTION_ALLOW_PARTIAL:
+                return False, "rechazo parcial bloqueado por configuración", "none"
+            return True, "", quality
         
-        return False, "dirección inválida"
+        return False, "dirección inválida", "none"
 
     def _reset_cycle(self, reason: str) -> None:
         log.info(
@@ -2817,7 +2893,7 @@ class ConsolidationBot:
             return False
 
         drawdown = (self.session_start_balance - bal) / self.session_start_balance
-        if drawdown >= MAX_LOSS_SESSION:
+        if ENABLE_SESSION_STOP_LOSS and drawdown >= MAX_LOSS_SESSION:
             self.session_stop_hit = True
             log.error(
                 "🛑 STOP-LOSS DE SESIÓN activado: drawdown=%.1f%% (inicio=%.2f, actual=%.2f)",
@@ -3254,7 +3330,7 @@ class ConsolidationBot:
             )
 
             req_strength = self._required_rebound_strength(pr.proposed_direction)
-            candle_valid, candle_fail_reason = self._validate_rejection_candle(
+            candle_valid, candle_fail_reason, rejection_quality = self._validate_rejection_candle(
                 candles_1m,
                 pr.proposed_direction,
                 REJECTION_CANDLE_MIN_BODY,
@@ -3317,6 +3393,9 @@ class ConsolidationBot:
                 elif pattern_name == "none":
                     candidate.score = round(candidate.score - 10.0, 1)
                     candidate.score_breakdown["weak_confirmation"] = -10.0
+                if rejection_quality == "total":
+                    candidate.score = round(candidate.score + 2.0, 1)
+                    candidate.score_breakdown["rejection_total_bonus"] = 2.0
                 ready_candidates.append(candidate)
                 to_remove.append(sym)
 
@@ -3420,10 +3499,12 @@ class ConsolidationBot:
         strat_b_timeout = 0  # fetches 1m que devolvieron 0 velas (timeout)
         strat_b_hits: list[tuple[str, int, float, str, str]] = []
         strat_b_nearmiss: list[tuple[str, int, float, str]] = []
+        strat_c_hits: list[tuple[str, int, float, str]] = []
         
         # Limpiar registro de candidatos para este ciclo
         self.last_scan_strat_a = []
         self.last_scan_strat_b = []
+        self.last_scan_strat_c = []
         # Acumuladores para pending_reversals (populados durante el loop).
         candles_1m_collected: dict[str, list] = {}
         last_prices_collected: dict[str, float] = {}
@@ -3434,51 +3515,63 @@ class ConsolidationBot:
         ob_fetch_sem = asyncio.Semaphore(OB_FETCH_CONCURRENCY)
 
         async def _fetch_5m_limited(symbol: str) -> List[Candle]:
-            async with fetch_sem:
-                return await fetch_candles_with_retry(
-                    self.client,
-                    symbol,
-                    TF_5M,
-                    CANDLES_LOOKBACK,
-                    timeout_sec=CANDLE_FETCH_TIMEOUT_SEC,
-                )
+            try:
+                async with fetch_sem:
+                    return await fetch_candles_with_retry(
+                        self.client,
+                        symbol,
+                        TF_5M,
+                        CANDLES_LOOKBACK,
+                        timeout_sec=CANDLE_FETCH_TIMEOUT_SEC,
+                    )
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                raise asyncio.CancelledError()
 
         async def _fetch_1m_limited(symbol: str) -> List[Candle]:
-            async with fetch_sem:
-                result = await fetch_candles_with_retry(
-                    self.client,
-                    symbol,
-                    60,
-                    36,
-                    timeout_sec=CANDLE_FETCH_1M_TIMEOUT_SEC,
-                )
-                if len(result) < 20:
-                    log.debug(
-                        "STRAT-B DEBUG: %s devolvió %d velas 1m (mínimo=20, timeout=%.0fs)",
-                        symbol, len(result), CANDLE_FETCH_1M_TIMEOUT_SEC,
+            try:
+                async with fetch_sem:
+                    result = await fetch_candles_with_retry(
+                        self.client,
+                        symbol,
+                        60,
+                        36,
+                        timeout_sec=CANDLE_FETCH_1M_TIMEOUT_SEC,
                     )
-                return result
+                    if len(result) < 20:
+                        log.debug(
+                            "STRAT-B DEBUG: %s devolvió %d velas 1m (mínimo=20, timeout=%.0fs)",
+                            symbol, len(result), CANDLE_FETCH_1M_TIMEOUT_SEC,
+                        )
+                    return result
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                raise asyncio.CancelledError()
 
         async def _fetch_h1_limited(symbol: str) -> List[Candle]:
-            async with h1_fetch_sem:
-                return await fetch_candles_with_retry(
-                    self.client,
-                    symbol,
-                    H1_TF_SEC,
-                    H1_CANDLES_LOOKBACK,
-                    timeout_sec=H1_FETCH_TIMEOUT_SEC,
-                )
+            try:
+                async with h1_fetch_sem:
+                    return await fetch_candles_with_retry(
+                        self.client,
+                        symbol,
+                        H1_TF_SEC,
+                        H1_CANDLES_LOOKBACK,
+                        timeout_sec=H1_FETCH_TIMEOUT_SEC,
+                    )
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                raise asyncio.CancelledError()
 
         async def _fetch_ob_limited(symbol: str) -> List[Candle]:
-            async with ob_fetch_sem:
-                return await fetch_candles_with_retry(
-                    self.client,
-                    symbol,
-                    ORDER_BLOCK_TF_SEC,
-                    ORDER_BLOCK_CANDLES,
-                    timeout_sec=CANDLE_FETCH_TIMEOUT_SEC,
-                    retries=1,
-                )
+            try:
+                async with ob_fetch_sem:
+                    return await fetch_candles_with_retry(
+                        self.client,
+                        symbol,
+                        ORDER_BLOCK_TF_SEC,
+                        ORDER_BLOCK_CANDLES,
+                        timeout_sec=CANDLE_FETCH_TIMEOUT_SEC,
+                        retries=1,
+                    )
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                raise asyncio.CancelledError()
 
         # Solo pre-lanzamos los fetches 5m en paralelo (concurrencia limitada).
         # Los fetches 1m se hacen de forma SECUENCIAL en el loop para evitar
@@ -3569,6 +3662,92 @@ class ConsolidationBot:
                 else:
                     strat_b_insufficient += 1
 
+                # ── STRAT-C (Rechazo M1 — 60s) ──────────────────────────────────────────
+                # Se evalúa siempre que STRAT-C esté disponible y haya velas 1m suficientes.
+                # El trading solo se habilita si STRAT_C_CAN_TRADE=True.
+                if _STRAT_C_AVAILABLE and strat_c_detector is not None and len(candles_1m) >= 15:
+                    try:
+                        _c_candles_dict = [
+                            {"open": c.open, "high": c.high, "low": c.low, "close": c.close}
+                            for c in candles_1m
+                        ]
+                        _c_result = strat_c_detector.evaluar_vela(
+                            _c_candles_dict,
+                            zonas=None,
+                            check_time=False,
+                        )
+                        if _c_result is not None:
+                            _c_direction, _c_score, _c_detalle = _c_result
+                            _c_direction_lower = _c_direction.lower()
+                            _c_zone = ConsolidationZone(
+                                asset=sym,
+                                ceiling=float(candles_1m[-1].high),
+                                floor=float(candles_1m[-1].low),
+                                bars_inside=0,
+                                detected_at=time.time(),
+                                range_pct=0.0,
+                            )
+                            _c_candidate = CandidateEntry(
+                                asset=sym,
+                                payout=payout,
+                                zone=_c_zone,
+                                direction=_c_direction_lower,
+                                candles=candles_1m,
+                                score=round(float(_c_score) / 17.0 * 100.0, 1),
+                                score_breakdown={
+                                    "raw_score": float(_c_score),
+                                    "wick_ratio": float(_c_detalle.get("wick_ratio", 0.0)),
+                                    "rsi": float(_c_detalle.get("rsi", 0.0)),
+                                },
+                            )
+                            setattr(_c_candidate, "_entry_mode", "rejection_30s")
+                            setattr(_c_candidate, "_strat_c_score", float(_c_score))
+                            setattr(_c_candidate, "_strat_c_detalle", _c_detalle)
+                            self.last_scan_strat_c.append(_c_candidate)
+                            strat_c_hits.append((sym, payout, float(_c_score), _c_direction_lower))
+                            log.info(
+                                "🔵 STRAT-C señal: %s %s score=%.1f/17 rsi=%.1f atr=%.6f",
+                                sym, _c_direction.upper(), _c_score,
+                                float(_c_detalle.get("rsi", 0.0)),
+                                float(_c_detalle.get("atr", 0.0)),
+                            )
+                            # Entrada operativa si STRAT_C_CAN_TRADE y capacidad disponible
+                            if (
+                                STRAT_C_CAN_TRADE
+                                and len(self.trades) < MAX_CONCURRENT_TRADES
+                                and not self._gale_order_active
+                            ):
+                                _c_amount, _ = self._compute_initial_amount(payout)
+                                _c_strategy = self._strategy_snapshot()
+                                _c_strategy.update({"strategy_origin": "STRAT-C", "strat_c_score": float(_c_score)})
+                                _c_outcome = "DRY_RUN" if self.dry_run else "PENDING"
+                                _c_cid = get_journal().log_candidate(
+                                    _c_candidate,
+                                    decision="ACCEPTED",
+                                    amount=_c_amount,
+                                    stage="initial",
+                                    outcome=_c_outcome,
+                                    strategy=_c_strategy,
+                                )
+                                setattr(_c_candidate, "_journal_cid", _c_cid)
+                                await self._enter(
+                                    sym,
+                                    _c_direction_lower,
+                                    _c_amount,
+                                    _c_zone,
+                                    f"STRAT-C score={_c_score:.1f}/17 {_c_direction.upper()}",
+                                    "initial",
+                                    journal_cid=_c_cid,
+                                    signal_ts=candles_1m[-1].ts if candles_1m else None,
+                                    strategy_origin="STRAT-C",
+                                    duration_sec=STRAT_C_DURATION_SEC,
+                                    payout=payout,
+                                    score_original=round(float(_c_score) / 17.0 * 100.0, 1),
+                                )
+                                await sleep_with_inline_countdown(COOLDOWN_BETWEEN_ENTRIES, "⏳ Cooldown post-orden")
+                    except Exception as _c_exc:
+                        log.debug("STRAT-C eval error en %s: %s", sym, _c_exc)
+
                 strat_b_conf = float(strat_b_info.get("confidence", 0.0) or 0.0)
                 strat_b_signal_type = str(strat_b_info.get("signal_type") or "")
                 strat_b_direction = str(strat_b_info.get("direction") or "call")
@@ -3581,6 +3760,81 @@ class ConsolidationBot:
                 else:
                     if strat_b_conf >= STRAT_B_PREVIEW_MIN_CONF:
                         strat_b_nearmiss.append((sym, payout, strat_b_conf, strat_b_reason))
+
+                # ── Caja negra STRAT-B: registrar TODAS las señales detectadas ──
+                # Registramos incluso las rechazadas para poder auditar el algoritmo.
+                if strat_b_conf >= STRAT_B_PREVIEW_MIN_CONF:
+                    _b_pseudo_zone = ConsolidationZone(
+                        asset=sym,
+                        ceiling=float(candles_1m[-1].high) if candles_1m else 0.0,
+                        floor=float(candles_1m[-1].low) if candles_1m else 0.0,
+                        bars_inside=0,
+                        detected_at=time.time(),
+                        range_pct=0.0,
+                    )
+                    _b_candidate = CandidateEntry(
+                        asset=sym,
+                        payout=payout,
+                        zone=_b_pseudo_zone,
+                        direction=strat_b_direction or "call",
+                        candles=candles_1m,
+                        score=round(strat_b_conf * 100.0, 1),
+                        score_breakdown={
+                            "compression": 0.0,
+                            "bounce": round(strat_b_conf * 35.0, 2),
+                            "trend": round(strat_b_conf * 25.0, 2),
+                            "payout": round(min(20.0, (payout / 95.0) * 20.0), 2),
+                        },
+                    )
+                    setattr(_b_candidate, "_reversal_pattern", strat_b_signal_type or "none")
+                    setattr(_b_candidate, "_reversal_strength", strat_b_conf)
+                    setattr(_b_candidate, "_entry_mode", strat_b_signal_type or "none")
+                    self.last_scan_strat_b.append(_b_candidate)
+                    _b_strategy = self._strategy_snapshot()
+                    _b_strategy.update({
+                        "strategy_origin": "STRAT-B",
+                        "strat_b_signal_type": strat_b_signal_type,
+                        "strat_b_confidence": strat_b_conf,
+                        "strat_b_required_conf": strat_b_required_conf,
+                        "strat_b_reason": strat_b_reason,
+                        "strat_b_is_signal": strat_b_signal,
+                    })
+                    if not STRAT_B_CAN_TRADE:
+                        pass
+                    elif not strat_b_signal:
+                        # Near-miss: señal insuficiente para activar
+                        get_journal().log_candidate(
+                            _b_candidate,
+                            decision="REJECTED_SCORE",
+                            reject_reason=f"STRAT-B near-miss: conf={strat_b_conf*100:.1f}% < req={strat_b_required_conf*100:.1f}% | {strat_b_reason}",
+                            amount=0.0,
+                            stage="initial",
+                            outcome="NO_SIGNAL",
+                            strategy=_b_strategy,
+                        )
+                    elif strat_b_conf < strat_b_required_conf:
+                        # Señal detectada pero confianza insuficiente
+                        get_journal().log_candidate(
+                            _b_candidate,
+                            decision="REJECTED_SCORE",
+                            reject_reason=f"STRAT-B conf baja: {strat_b_conf*100:.1f}% < req={strat_b_required_conf*100:.1f}% | {strat_b_reason}",
+                            amount=0.0,
+                            stage="initial",
+                            outcome="LOW_CONF",
+                            strategy=_b_strategy,
+                        )
+                    elif (len(self.trades) >= MAX_CONCURRENT_TRADES or self._gale_order_active):
+                        # Señal válida pero trades llenos o gale activo
+                        _br = "gale activo" if self._gale_order_active else f"trades={len(self.trades)}/{MAX_CONCURRENT_TRADES}"
+                        get_journal().log_candidate(
+                            _b_candidate,
+                            decision="REJECTED_LIMIT",
+                            reject_reason=f"STRAT-B bloqueado: {_br} | conf={strat_b_conf*100:.1f}% | {strat_b_reason}",
+                            amount=0.0,
+                            stage="initial",
+                            outcome="BLOCKED",
+                            strategy=_b_strategy,
+                        )
 
                 # Modo opcional: STRAT-B puede abrir operación por sí sola.
                 if (
@@ -3628,9 +3882,6 @@ class ConsolidationBot:
                     setattr(b_candidate, "_reversal_pattern", strat_b_signal_type or "none")
                     setattr(b_candidate, "_reversal_strength", strat_b_conf)
                     
-                    # Guardar para registro en HUB
-                    self.last_scan_strat_b.append(b_candidate)
-
                     b_strategy = self._strategy_snapshot()
                     b_strategy.update(
                         {
@@ -3903,11 +4154,39 @@ class ConsolidationBot:
                     strength = signal_1m.strength
                     confirms = signal_1m.confirms_direction
 
+                # Preview STRAT-A para HUB: crear candidato con datos disponibles
+                # antes de los filtros de patrón/H1. El mismo objeto se actualiza
+                # in-place si el candidato pasa todos los filtros.
+                candidate = CandidateEntry(
+                    asset=sym,
+                    payout=payout,
+                    zone=zone,
+                    direction=direction,
+                    candles=candles,
+                )
+                setattr(candidate, "_entry_mode", entry_mode)
+                setattr(candidate, "_reversal_pattern", pattern_name)
+                setattr(candidate, "_reversal_strength", strength)
+                setattr(candidate, "_reversal_confirms", confirms)
+                setattr(candidate, "_signal_ts_1m", candles_1m[-1].ts if candles_1m else None)
+                setattr(candidate, "_amount", amount)
+                setattr(candidate, "_stage", stage)
+                setattr(candidate, "_ma_state", ma_state)
+                setattr(candidate, "_order_blocks", blocks)
+                setattr(candidate, "_ob_tf", ob_tf_label)
+                setattr(
+                    candidate,
+                    "_force_execute",
+                    bool(FORCE_EXECUTE_STRONG_BREAKOUT and stage == "breakout" and breakout_strength_ok),
+                )
+                score_candidate(candidate)
+                self.last_scan_strat_a.append(candidate)
+
                 if entry_mode.startswith("rebound"):
                     side = "techo" if entry_mode == "rebound_ceiling" else "piso"
                     
                     # Validar forma de la vela 1m que tocó piso/techo
-                    candle_valid, candle_fail_reason = self._validate_rejection_candle(
+                    candle_valid, candle_fail_reason, rejection_quality = self._validate_rejection_candle(
                         candles_1m, direction, REJECTION_CANDLE_MIN_BODY
                     )
                     
@@ -3934,6 +4213,19 @@ class ConsolidationBot:
                             self.pending_reversals[sym].zone = zone
                         self.stats["skipped"] += 1
                         continue
+                    if rejection_quality == "partial":
+                        log.info(
+                            "↪ %s: rechazo parcial aceptado en %s (umbral total=%.0f%%)",
+                            sym,
+                            side,
+                            REJECTION_TOTAL_MIN_BODY_RATIO * 100.0,
+                        )
+                    elif rejection_quality == "total":
+                        log.info(
+                            "✅ %s: rechazo total detectado en %s",
+                            sym,
+                            side,
+                        )
                     
                     # Vela confirma dirección — validar patrón de reversión como antes
                     req_strength = self._required_rebound_strength(direction)
@@ -4042,31 +4334,7 @@ class ConsolidationBot:
                 else:
                     h1_candles = await _fetch_h1_limited(sym)
 
-                candidate = CandidateEntry(
-                    asset=sym,
-                    payout=payout,
-                    zone=zone,
-                    direction=direction,
-                    candles=candles,
-                )
                 candidate.candles_h1 = h1_candles
-
-                setattr(candidate, "_reversal_pattern", pattern_name)
-                setattr(candidate, "_reversal_strength", strength)
-                setattr(candidate, "_reversal_confirms", confirms)
-                setattr(candidate, "_entry_mode", entry_mode)
-                setattr(candidate, "_signal_ts_1m", candles_1m[-1].ts if candles_1m else None)
-
-                setattr(candidate, "_amount", amount)
-                setattr(candidate, "_stage", stage)
-                setattr(candidate, "_ma_state", ma_state)
-                setattr(candidate, "_order_blocks", blocks)
-                setattr(candidate, "_ob_tf", ob_tf_label)
-                setattr(
-                    candidate,
-                    "_force_execute",
-                    bool(FORCE_EXECUTE_STRONG_BREAKOUT and stage == "breakout" and breakout_strength_ok),
-                )
 
                 score_candidate(candidate)
 
@@ -4146,7 +4414,6 @@ class ConsolidationBot:
                 )
 
                 candidates.append(candidate)
-                self.last_scan_strat_a.append(candidate)
                 await asyncio.sleep(0.30)  # breve pausa para separar respuestas WebSocket
         finally:
             pending_5m = [t for t in candles_tasks.values() if not t.done()]
@@ -4625,9 +4892,10 @@ class ConsolidationBot:
 
         if isinstance(result_payload, dict):
             for key in ("closePrice", "close_price", "close", "sellPrice"):
-                if key in result_payload and result_payload.get(key) is not None:
+                raw_close_price = result_payload.get(key)
+                if key in result_payload and raw_close_price is not None:
                     try:
-                        close_price = float(result_payload.get(key))
+                        close_price = float(raw_close_price)
                         break
                     except Exception:
                         pass
@@ -4671,7 +4939,7 @@ class ConsolidationBot:
         log.info("🏁 %s %s $%.2f | saldo: $%.2f", sym, outcome, profit, balance_now)
         self._update_cycle_after_result(outcome=outcome, profit=profit)
 
-        # Sincronizar calculadora con resultado real del broker.
+        # Sincronizar calculadora global (compatibilidad histórica).
         try:
             if outcome == "WIN":
                 self.martingale.sync_balance(self.current_balance if self.current_balance is not None else 0.0)
@@ -4685,6 +4953,22 @@ class ConsolidationBot:
                 self.martingale.register_loss(trade.amount, apply_balance_change=False)
         except Exception as exc:
             log.debug("No se pudo actualizar ciclo de martingale tras %s: %s", outcome, exc)
+
+        # Protocolo GALE por contexto estrategia+par (aislado entre estrategias y activos).
+        try:
+            context_key = self._gale_context_key(trade.strategy_origin, sym)
+            context_calc = self._get_context_martingale(context_key)
+            context_calc.sync_balance(self.current_balance if self.current_balance is not None else 0.0)
+            if outcome == "WIN":
+                context_calc.register_win(
+                    trade.amount,
+                    int(trade.payout or MIN_PAYOUT),
+                    apply_target_balance=False,
+                )
+            elif outcome == "LOSS":
+                context_calc.register_loss(trade.amount, apply_balance_change=False)
+        except Exception as exc:
+            log.debug("No se pudo actualizar martingale por contexto tras %s: %s", outcome, exc)
 
         if outcome == "WIN":
             if trade.strategy_origin == "STRAT-B":
@@ -4809,7 +5093,11 @@ class ConsolidationBot:
         if main_loop is current:
             return await coro
 
-        fut = asyncio.run_coroutine_threadsafe(coro, main_loop)
+        async def _await_in_main_loop() -> Any:
+            return await coro
+
+        main_loop_coro: Coroutine[Any, Any, Any] = _await_in_main_loop()
+        fut = asyncio.run_coroutine_threadsafe(main_loop_coro, main_loop)
         return await asyncio.wrap_future(fut)
 
     async def _run_on_main_loop_bounded(
@@ -4916,8 +5204,25 @@ class ConsolidationBot:
         except Exception:
             pass
 
-    def _launch_gale_watch(self, gale_info: Any, stage: str) -> None:
-        if self._gale_watcher is None:
+    def _gale_context_key(self, strategy_origin: str, asset: str) -> str:
+        return f"{str(strategy_origin or 'STRAT-A').upper()}|{str(asset or '').upper()}"
+
+    def _get_context_martingale(self, context_key: str) -> MartingaleCalculator:
+        calc = self._martingale_by_context.get(context_key)
+        if calc is not None:
+            return calc
+
+        base_balance = float(self.current_balance) if self.current_balance is not None else 0.0
+        calc = MartingaleCalculator(base_balance)
+        try:
+            calc.configure_growth_target(base_balance, pct=0.02)
+        except Exception:
+            pass
+        self._martingale_by_context[context_key] = calc
+        return calc
+
+    def _launch_gale_watch(self, watcher: Any, gale_info: Any, stage: str, context_key: str) -> None:
+        if watcher is None:
             return
         self._start_gale_thread()
         loop = self._gale_thread_loop
@@ -4926,7 +5231,7 @@ class ConsolidationBot:
             return
 
         async def _runner() -> None:
-            await self._gale_watcher.watch(gale_info)
+            await watcher.watch(gale_info)
 
         fut = asyncio.run_coroutine_threadsafe(_runner(), loop)
         self._gale_futures.add(fut)
@@ -4939,8 +5244,9 @@ class ConsolidationBot:
                 done_fut.result()
             except Exception as exc:
                 log.error(
-                    "GaleWatcher task falló (%s): %s",
+                    "GaleWatcher task falló (%s | %s): %s",
                     stage,
+                    context_key,
                     exc,
                     exc_info=(type(exc), exc, exc.__traceback__),
                 )
@@ -5177,7 +5483,33 @@ class ConsolidationBot:
             self.stats["strat_a_signals"] += 1
 
         # ── Lanzar GaleWatcher en background (solo para entradas iniciales) ──
-        if stage not in ("martin",) and self._gale_watcher is not None:
+        if stage not in ("martin",) and _GALE_WATCHER_AVAILABLE and GaleWatcher is not None and GaleTradeInfo is not None:
+            context_key = self._gale_context_key(strategy_origin, sym)
+            context_calc = self._get_context_martingale(context_key)
+            try:
+                if self.current_balance is not None:
+                    context_calc.sync_balance(float(self.current_balance))
+            except Exception:
+                pass
+
+            # Closure que inyecta context_key en cada tick de status para el HUB.
+            _ctx_key_for_watcher = context_key
+
+            async def _status_with_context(**kw: Any) -> None:
+                kw.setdefault("context_key", _ctx_key_for_watcher)
+                await self._gale_on_status_bridge(**kw)
+
+            watcher = GaleWatcher(
+                fetch_price_fn=self._gale_fetch_price_bridge,
+                place_order_fn=self._gale_place_order_bridge,
+                calculator=context_calc,
+                get_balance_fn=self._gale_get_balance_bridge,
+                get_time_fn=self._broker_now_ts,
+                dry_run=self.dry_run,
+                on_status_fn=_status_with_context,
+                on_clear_fn=self._gale_on_clear_bridge,
+            )
+
             gale_info = GaleTradeInfo(
                 asset=sym,
                 direction=direction,
@@ -5191,7 +5523,7 @@ class ConsolidationBot:
                 account_type=self.account_type,
                 expires_at_ts=float(trade.close_ts or 0.0),
             )
-            self._launch_gale_watch(gale_info, stage)
+            self._launch_gale_watch(watcher, gale_info, stage, context_key)
 
         if oid:
             log.info("  ✓ Orden aceptada  id=%s  open=%.5f  ref=%s", oid, open_price, order_ref)

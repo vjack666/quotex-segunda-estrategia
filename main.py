@@ -1,6 +1,8 @@
 import sys
 import io
 import os
+import json
+import subprocess
 import argparse
 import asyncio
 import logging
@@ -26,6 +28,138 @@ import time as _time
 
 _DATA_SUBDIRS = ("logs/bot", "logs/broker", "db")
 _RETENTION_DAYS = 31
+_HUB_RUNTIME_STATE_FILE = ROOT / "data" / "hub_runtime_state.json"
+_MONITOR_LAUNCH_LOG = ROOT / "data" / "logs" / "bot" / "monitor_launcher.log"
+
+
+def _write_hub_runtime_snapshot(bot=None) -> None:
+    """Escribe un snapshot ligero del HUB para monitores externos (A/B/C)."""
+    def _candidate_to_dict(c) -> dict:
+        return {
+            "strategy": str(getattr(c, "strategy", "") or ""),
+            "asset": str(getattr(c, "asset", "") or ""),
+            "direction": str(getattr(c, "direction", "") or ""),
+            "score": float(getattr(c, "score", 0.0) or 0.0),
+            "payout": int(getattr(c, "payout", 0) or 0),
+            "zone_floor": float(getattr(c, "zone_floor", 0.0) or 0.0),
+            "zone_ceiling": float(getattr(c, "zone_ceiling", 0.0) or 0.0),
+            "entry_mode": str(getattr(c, "entry_mode", "") or ""),
+            "pattern": str(getattr(c, "pattern", "") or ""),
+            "pattern_strength": float(getattr(c, "pattern_strength", 0.0) or 0.0),
+            "dist_pct": getattr(c, "dist_pct", None),
+            "confidence": getattr(c, "confidence", None),
+            "signal_type": getattr(c, "signal_type", None),
+        }
+
+    try:
+        from hub.hub_models import HubState
+
+        if bot is not None and hasattr(bot, "hub"):
+            state = bot.hub.get_state()
+            balance = float(getattr(state, "known_balance", 0.0) or 0.0)
+        else:
+            state = HubState()
+            balance = 0.0
+
+        payload = {
+            "generated_at": _time.time(),
+            "pid": os.getpid(),
+            "total_scans": int(getattr(state, "total_scans", 0) or 0),
+            "balance": balance,
+            "wins": int(getattr(state, "live_wins", 0) or 0),
+            "losses": int(getattr(state, "live_losses", 0) or 0),
+            "strat_a": [_candidate_to_dict(c) for c in list(getattr(state, "strat_a_watching", []) or [])],
+            "strat_b": [_candidate_to_dict(c) for c in list(getattr(state, "strat_b_watching", []) or [])],
+            "strat_c": [_candidate_to_dict(c) for c in list(getattr(state, "strat_c_watching", []) or [])],
+            "gale": {
+                "active": bool(getattr(getattr(state, "gale", None), "active", False)),
+                "asset": str(getattr(getattr(state, "gale", None), "asset", "") or ""),
+                "direction": str(getattr(getattr(state, "gale", None), "direction", "") or ""),
+                "secs_remaining": float(getattr(getattr(state, "gale", None), "secs_remaining", 0.0) or 0.0),
+            },
+        }
+
+        _HUB_RUNTIME_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _HUB_RUNTIME_STATE_FILE.write_text(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def _launch_strategy_monitors(enabled: bool) -> list[subprocess.Popen]:
+    """Abre 3 consolas (A/B/C) para checklists por estrategia."""
+    if (not enabled) or os.name != "nt":
+        return []
+
+    monitor_script = ROOT / "src" / "hub_strategy_monitor.py"
+    if not monitor_script.exists():
+        return []
+
+    procs: list[subprocess.Popen] = []
+    creation_flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+
+    def _log_launch(msg: str) -> None:
+        try:
+            _MONITOR_LAUNCH_LOG.parent.mkdir(parents=True, exist_ok=True)
+            with _MONITOR_LAUNCH_LOG.open("a", encoding="utf-8") as fh:
+                fh.write(f"{_time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+        except Exception:
+            pass
+
+    for strategy in ("A", "B", "C"):
+        cmd_args = [
+            sys.executable,
+            "-u",
+            str(monitor_script),
+            "--strategy",
+            strategy,
+            "--state-file",
+            str(_HUB_RUNTIME_STATE_FILE),
+        ]
+        try:
+            p = subprocess.Popen(cmd_args, cwd=str(ROOT), creationflags=creation_flags)
+            # Si el proceso cae instantáneamente, usar fallback con cmd/start.
+            _time.sleep(0.15)
+            if p.poll() is None:
+                procs.append(p)
+                _log_launch(f"OK new_console strategy={strategy} pid={p.pid}")
+                continue
+            _log_launch(
+                f"WARN new_console exited strategy={strategy} rc={p.poll()} -> fallback cmd/start"
+            )
+
+            # Fallback robusto: cmd /c start abre una ventana de consola nueva.
+            launch_cmd = (
+                f'start "" "{sys.executable}" -u "{monitor_script}" '
+                f'--strategy {strategy} --state-file "{_HUB_RUNTIME_STATE_FILE}"'
+            )
+            subprocess.Popen(["cmd", "/c", launch_cmd], cwd=str(ROOT))
+            _log_launch(f"OK cmd_start strategy={strategy}")
+        except Exception:
+            _log_launch(f"ERROR launch strategy={strategy}")
+            continue
+    return procs
+
+
+def _stop_strategy_monitors(procs: list[subprocess.Popen]) -> None:
+    """Cierra monitores externos si siguen vivos."""
+    for p in procs:
+        try:
+            if p.poll() is None:
+                p.terminate()
+        except Exception:
+            pass
+    for p in procs:
+        try:
+            if p.poll() is None:
+                p.wait(timeout=1.0)
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
 
 
 def _cleanup_old_data_files() -> None:
@@ -86,6 +220,24 @@ def _build_parser() -> argparse.ArgumentParser:
         default=1.0,
         help="Pausa entre ciclos de escaneo live (segundos)",
     )
+    p.add_argument(
+        "--adaptive-threshold-base",
+        type=int,
+        default=60,
+        help="Umbral base de score para STRAT-A",
+    )
+    p.add_argument(
+        "--adaptive-threshold-low",
+        type=int,
+        default=58,
+        help="Umbral bajo dinámico de score para STRAT-A",
+    )
+    p.add_argument(
+        "--adaptive-threshold-high",
+        type=int,
+        default=64,
+        help="Umbral alto dinámico de score para STRAT-A",
+    )
 
     # STRAT-B (Spring Sweep)
     p.add_argument(
@@ -118,6 +270,35 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Mecha inferior mínima [0.0-1.0] para validar rechazo CALL en vela 1m",
     )
     p.add_argument(
+        "--rejection-entry-window-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Habilitar ventana temporal de entrada de rechazo en M1 (segundo 30-41)",
+    )
+    p.add_argument(
+        "--rejection-entry-window-start-sec",
+        type=int,
+        default=30,
+        help="Segundo inicial de ventana temporal para ejecutar rechazo M1",
+    )
+    p.add_argument(
+        "--rejection-entry-window-end-sec",
+        type=int,
+        default=41,
+        help="Segundo final de ventana temporal para ejecutar rechazo M1",
+    )
+    p.add_argument(
+        "--rejection-total-min-body",
+        type=float,
+        default=0.55,
+        help="Body mínimo [0.0-1.0] para clasificar rechazo como total (si no, parcial)",
+    )
+    p.add_argument(
+        "--rejection-disallow-partial",
+        action="store_true",
+        help="Si se activa, solo permite rechazos totales",
+    )
+    p.add_argument(
         "--structure-entry-lock-ttl-min",
         type=float,
         default=180.0,
@@ -128,6 +309,38 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=("auto", "live", "static", "fallback"),
         default="auto",
         help="Modo de render del HUB (auto en Windows usa static para evitar duplicados)",
+    )
+    p.add_argument(
+        "--hub-multi-monitor",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Abrir monitores A/B/C en consolas separadas con checklist en tiempo real",
+    )
+
+    # STRAT-C (Rechazo M1 — 30 segundos)
+    p.add_argument(
+        "--strat-c-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Habilitar STRAT-C: rechazo M1 con expiración 60s (en desarrollo)",
+    )
+    p.add_argument(
+        "--strat-c-min-score",
+        type=float,
+        default=4.0,
+        help="Puntuación mínima de confluencia para STRAT-C [0-17]",
+    )
+    p.add_argument(
+        "--strat-c-atr-min",
+        type=float,
+        default=0.0,
+        help="ATR mínimo para STRAT-C (filtra mercados planos)",
+    )
+    p.add_argument(
+        "--strat-c-atr-max",
+        type=float,
+        default=999.0,
+        help="ATR máximo para STRAT-C (filtra spikes/noticias)",
     )
     return p
 
@@ -152,13 +365,47 @@ def _apply_runtime_config(args: argparse.Namespace) -> None:
     cb.SCAN_LEAD_SEC = float(args.scan_lead_sec)
     cb.LIVE_SCAN_SLEEP_SEC = max(0.2, float(args.scan_sleep_sec))
     cb.DURATION_SEC = 300
+    cb.ADAPTIVE_THRESHOLD_BASE = max(30, min(90, int(args.adaptive_threshold_base)))
+    cb.ADAPTIVE_THRESHOLD_LOW = max(30, min(90, int(args.adaptive_threshold_low)))
+    cb.ADAPTIVE_THRESHOLD_HIGH = max(30, min(90, int(args.adaptive_threshold_high)))
 
     cb.STRAT_B_CAN_TRADE = bool(args.strat_b_live)
     cb.STRAT_B_DURATION_SEC = 300
     cb.STRAT_B_MIN_CONFIDENCE = max(0.0, min(1.0, float(args.strat_b_min_confidence)))
     cb.SAME_ASSET_REENTRY_COOLDOWN_SEC = max(0.0, float(args.same_asset_cooldown_sec))
     cb.REJECTION_CALL_MIN_LOWER_WICK = max(0.0, min(1.0, float(args.rejection_call_min_lower_wick)))
+    cb.REJECTION_ENTRY_WINDOW_ENABLED = bool(args.rejection_entry_window_enabled)
+    cb.REJECTION_ENTRY_WINDOW_START_SEC = max(0, min(59, int(args.rejection_entry_window_start_sec)))
+    cb.REJECTION_ENTRY_WINDOW_END_SEC = max(0, min(59, int(args.rejection_entry_window_end_sec)))
+    cb.REJECTION_TOTAL_MIN_BODY_RATIO = max(0.0, min(1.0, float(args.rejection_total_min_body)))
+    cb.REJECTION_ALLOW_PARTIAL = not bool(args.rejection_disallow_partial)
     cb.STRUCTURE_ENTRY_LOCK_TTL_MIN = max(0.0, float(args.structure_entry_lock_ttl_min))
+
+    # STRAT-C (Rechazo M1 — 30s) — configura el módulo estrategia_30s/detector.py
+    try:
+        from estrategia_30s import detector as strat_c_detector
+        # Set calibrado desde grid-search sobre snapshots reales.
+        strat_c_detector.ATR_PERIOD = 7
+        strat_c_detector.RSI_PERIOD = 7
+        strat_c_detector.BB_PERIOD = 14
+        strat_c_detector.BB_STD_DEV = 2.0
+        strat_c_detector.STOCH_K_PERIOD = 5
+        strat_c_detector.STOCH_D_PERIOD = 3
+        strat_c_detector.EMA_FAST_PERIOD = 8
+        strat_c_detector.EMA_SLOW_PERIOD = 21
+        strat_c_detector.SR_LOOKBACK = 40
+        strat_c_detector.SR_PIVOT_WINDOW = 2
+        strat_c_detector.SR_MERGE_ATR_MULT = 0.3
+        strat_c_detector.ZONE_TOLERANCE_ATR_MULT = 1.2
+        strat_c_detector.MIN_WICK_TO_BODY_RATIO = 0.8
+
+        strat_c_detector.MIN_SCORE = max(0.0, float(args.strat_c_min_score))
+        strat_c_detector.ATR_MIN   = max(0.0, float(args.strat_c_atr_min))
+        strat_c_detector.ATR_MAX   = max(0.0, float(args.strat_c_atr_max))
+    except ImportError:
+        pass  # módulo aún en desarrollo
+
+    cb.STRAT_C_CAN_TRADE = bool(args.strat_c_enabled)
 
     # Modo HUB (solo lectura): fuerza escaneo por minuto y deshabilita trading.
     if bool(args.hub_readonly):
@@ -179,6 +426,7 @@ async def _render_hub_once(bot=None) -> None:
             state = HubState()
             balance = 0.0
         HubDashboard.display(state, balance=balance)
+        _write_hub_runtime_snapshot(bot)
     except Exception:
         pass
 
@@ -341,45 +589,55 @@ async def _run(args: argparse.Namespace) -> None:
     _configure_hub_console(cb)
     await _render_hub_once()
 
+    monitor_procs = _launch_strategy_monitors(bool(args.hub_multi_monitor))
+
     # En modo HUB no se ejecutan ordenes (dry_run=True), solo lectura/analisis.
     dry_run = hub_readonly
 
-    if hub_readonly:
-        # Loop propio: un escaneo (loop_forever=False) → renderizar hub → esperar → repetir.
-        # Esto garantiza que el panel se dibuje después de cada ciclo.
-        while True:
-            try:
-                bot = await _run_cycle_with_loading(
-                    cb,
-                    dry_run=True,
-                    real_account=bool(args.real),
-                )
-            except SystemExit as exc:
-                code = exc.code if isinstance(exc.code, int) else 1
-                print(f"[HUB] Conexion no disponible (code={code}). Reintentando en 60s...")
-                await asyncio.sleep(60)
+    try:
+        if hub_readonly:
+            # Loop propio: un escaneo (loop_forever=False) → renderizar hub → esperar → repetir.
+            # Esto garantiza que el panel se dibuje después de cada ciclo.
+            while True:
+                try:
+                    bot = await _run_cycle_with_loading(
+                        cb,
+                        dry_run=True,
+                        real_account=bool(args.real),
+                    )
+                except SystemExit as exc:
+                    code = exc.code if isinstance(exc.code, int) else 1
+                    print(f"[HUB] Conexion no disponible (code={code}). Reintentando en 60s...")
+                    await asyncio.sleep(60)
+                    if run_once:
+                        return
+                    continue
                 if run_once:
                     return
-                continue
-            if run_once:
-                return
-            try:
-                await asyncio.sleep(cb.SCAN_INTERVAL_SEC)
-            except asyncio.CancelledError:
-                return
-    else:
-        if run_once:
-            bot = await _run_cycle_with_loading(
-                cb,
-                dry_run=dry_run,
-                real_account=bool(args.real),
-            )
+                try:
+                    await asyncio.sleep(cb.SCAN_INTERVAL_SEC)
+                except asyncio.CancelledError:
+                    return
         else:
-            bot = await _run_forever_with_initial_loading(
-                cb,
-                dry_run=dry_run,
-                real_account=bool(args.real),
-            )
+            if run_once:
+                bot = await _run_cycle_with_loading(
+                    cb,
+                    dry_run=dry_run,
+                    real_account=bool(args.real),
+                )
+            else:
+                bot = await _run_forever_with_initial_loading(
+                    cb,
+                    dry_run=dry_run,
+                    real_account=bool(args.real),
+                )
+    finally:
+        _stop_strategy_monitors(monitor_procs)
+        try:
+            if _HUB_RUNTIME_STATE_FILE.exists():
+                _HUB_RUNTIME_STATE_FILE.unlink()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

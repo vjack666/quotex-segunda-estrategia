@@ -300,13 +300,13 @@ log.info(bot.martingale.format_status())
 
 ## 🚀 Próximos Pasos
 
-1. **Testeo en modo dry-run**
+1. **Testeo en modo monitoreo**
    ```bash
-   python main.py --dry-run
+   python main.py --hub-readonly
    ```
 
 2. **Validación con histórico**
-   - Reproducir operaciones desde trade_journal.db
+   - Reproducir operaciones desde data/db/trade_journal-YYYY-MM-DD.db
    - Comparar montos calculados vs reales
 
 3. **Adaptaciones por mercado**

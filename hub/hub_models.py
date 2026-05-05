@@ -17,6 +17,7 @@ VALID_ENTRY_MODES = {
     "upthrust",
     "wyckoff_early_spring",
     "wyckoff_early_upthrust",
+    "rejection_30s",
     "none",
 }
 
@@ -135,8 +136,10 @@ class HubScanSnapshot:
     total_assets_scanned: int
     strat_a_candidates: List[CandidateData] = field(default_factory=list)
     strat_b_candidates: List[CandidateData] = field(default_factory=list)
+    strat_c_candidates: List[CandidateData] = field(default_factory=list)
     strat_a_entered: Optional[str] = None
     strat_b_entered: Optional[str] = None
+    strat_c_entered: Optional[str] = None
     balance: Optional[float] = None
     cycle_id: int = 0
     cycle_ops: int = 0
@@ -166,6 +169,7 @@ class GaleState:
     consecutive_count:   int   = 0       # entrada actual en el ciclo (1=base, 2=1er gale, 3=2do gale)
     cycle_target_amount: float = 0.0    # objetivo de ganancia del ciclo ($)
     safety_status:       str   = "OK"   # estado de seguridad: OK | RIESGO | LIMITE | ERROR
+    context_key:         str   = ""      # clave aislada de gale: "STRAT-X|ASSET" (protocolo por par)
 
 
 @dataclass
@@ -175,6 +179,7 @@ class HubState:
     last_scan: Optional[HubScanSnapshot] = None
     strat_a_watching: List[CandidateData] = field(default_factory=list)
     strat_b_watching: List[CandidateData] = field(default_factory=list)
+    strat_c_watching: List[CandidateData] = field(default_factory=list)
     active_trade_asset: Optional[str] = None
     active_trade_direction: Optional[str] = None
     active_trade_time_remaining_sec: Optional[float] = None

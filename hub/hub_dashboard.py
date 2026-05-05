@@ -293,12 +293,14 @@ def _build_strat_a_table(candidates: List[CandidateData]) -> "Table":
     t.add_column("Score",  width=6,  justify="right")
     t.add_column("P%",     width=4,  justify="right")
     t.add_column("Dist",   width=7,  justify="right")
+    t.add_column("Sup",    width=10, justify="right")
+    t.add_column("Res",    width=10, justify="right")
     t.add_column("Modo",   width=11, no_wrap=True)
     t.add_column("Patron", min_width=12)
 
     if not candidates:
         t.add_row("[dim]—[/dim]", "[dim]Sin candidatos en este escaneo[/dim]",
-                  "", "", "", "", "", "")
+              "", "", "", "", "", "", "", "")
         return t
 
     for i, c in enumerate(candidates[:5], 1):
@@ -311,6 +313,8 @@ def _build_strat_a_table(candidates: List[CandidateData]) -> "Table":
             f"[{s_col}]{c.score:.1f}[/{s_col}]",
             f"[{p_col}]{c.payout}[/{p_col}]",
             _dist_markup(c.dist_pct),
+            f"[dim]{c.zone_floor:.5f}[/dim]",
+            f"[dim]{c.zone_ceiling:.5f}[/dim]",
             f"[dim]{_abbrev(c.entry_mode)}[/dim]",
             f"[dim]{c.pattern[:18]}[/dim]",
         )
@@ -326,12 +330,14 @@ def _build_strat_b_table(candidates: List[CandidateData]) -> "Table":
     t.add_column("Conf%",  width=6,  justify="right")
     t.add_column("P%",     width=4,  justify="right")
     t.add_column("Dist",   width=7,  justify="right")
+    t.add_column("Sup",    width=10, justify="right")
+    t.add_column("Res",    width=10, justify="right")
     t.add_column("Señal",  width=11, no_wrap=True)
     t.add_column("Patron", min_width=12)
 
     if not candidates:
         t.add_row("[dim]—[/dim]", "[dim]Sin candidatos en este escaneo[/dim]",
-                  "", "", "", "", "", "")
+              "", "", "", "", "", "", "", "")
         return t
 
     for i, c in enumerate(candidates[:5], 1):
@@ -346,6 +352,46 @@ def _build_strat_b_table(candidates: List[CandidateData]) -> "Table":
             f"[{c_col}]{conf:.1f}[/{c_col}]",
             f"[{p_col}]{c.payout}[/{p_col}]",
             _dist_markup(c.dist_pct),
+            f"[dim]{c.zone_floor:.5f}[/dim]",
+            f"[dim]{c.zone_ceiling:.5f}[/dim]",
+            f"[dim]{signal}[/dim]",
+            f"[dim]{c.pattern[:18]}[/dim]",
+        )
+    return t
+
+
+def _build_strat_c_table(candidates: List[CandidateData]) -> "Table":
+    table_cls = _require_table_class()
+    t = table_cls(show_header=True, header_style="bold blue", box=None, padding=(0, 1), expand=True)
+    t.add_column("#",      width=2,  justify="right")
+    t.add_column("Activo", width=14, no_wrap=True)
+    t.add_column("Dir",    width=6)
+    t.add_column("Score",  width=6,  justify="right")
+    t.add_column("P%",     width=4,  justify="right")
+    t.add_column("Dist",   width=7,  justify="right")
+    t.add_column("Sup",    width=10, justify="right")
+    t.add_column("Res",    width=10, justify="right")
+    t.add_column("Señal",  width=11, no_wrap=True)
+    t.add_column("Patron", min_width=12)
+
+    if not candidates:
+        t.add_row("[dim]—[/dim]", "[dim]Sin candidatos en este escaneo[/dim]",
+              "", "", "", "", "", "", "", "")
+        return t
+
+    for i, c in enumerate(candidates[:5], 1):
+        s_col = "green" if c.score >= 65 else "yellow" if c.score >= 50 else "red"
+        p_col = "green" if c.payout >= 80 else "yellow" if c.payout >= 70 else "red"
+        signal = _abbrev(c.signal_type or c.entry_mode or "none")
+        t.add_row(
+            str(i),
+            f"[bold]{c.asset}[/bold]",
+            _direction_markup(c.direction),
+            f"[{s_col}]{c.score:.1f}[/{s_col}]",
+            f"[{p_col}]{c.payout}[/{p_col}]",
+            _dist_markup(c.dist_pct),
+            f"[dim]{c.zone_floor:.5f}[/dim]",
+            f"[dim]{c.zone_ceiling:.5f}[/dim]",
             f"[dim]{signal}[/dim]",
             f"[dim]{c.pattern[:18]}[/dim]",
         )
@@ -491,6 +537,11 @@ def _build_gale_panel(state: HubState) -> "Panel":
     t.add_row("Objetivo:",     objetivo_mu)
     t.add_row("Consecutivas:", consec_mu)
 
+    # contexto de gale (protocolo por estrategia+par)
+    ctx = str(getattr(g, "context_key", "") or "")
+    if ctx:
+        t.add_row("Protocolo:", f"[dim]{ctx}[/dim]")
+
     border = "red" if g.is_losing else "green"
     if g.gale_fired:
         border = "yellow"
@@ -525,6 +576,53 @@ def _build_logs_panel(state: HubState) -> "Panel":
     )
 
 
+def _build_quick_levels_panel(state: HubState) -> "Panel":
+    """Lista compacta para trazar niveles manualmente en la grafica."""
+    panel_cls = _require_panel_class()
+    table_cls = _require_table_class()
+
+    all_candidates: List[CandidateData] = (
+        list(state.strat_a_watching[:5])
+        + list(state.strat_b_watching[:5])
+        + list(state.strat_c_watching[:5])
+    )
+
+    # Priorizar candidatos mas cercanos al trigger y luego por score/conf.
+    all_candidates.sort(
+        key=lambda c: (
+            9999.0 if c.dist_pct is None else c.dist_pct,
+            -c.rank_value,
+        )
+    )
+
+    t = table_cls.grid(expand=True, padding=(0, 1))
+    t.add_column(style="bold", min_width=7)
+    t.add_column(min_width=14)
+    t.add_column(min_width=5)
+    t.add_column(justify="right", min_width=10)
+    t.add_column(justify="right", min_width=10)
+
+    if not all_candidates:
+        t.add_row("[dim]-[/dim]", "[dim]Sin niveles[/dim]", "", "", "")
+    else:
+        for c in all_candidates[:8]:
+            strat = c.strategy.replace("STRAT-", "S")
+            t.add_row(
+                f"[cyan]{strat}[/cyan]",
+                f"[bold]{c.asset}[/bold]",
+                _direction_markup(c.direction),
+                f"[dim]{c.zone_floor:.5f}[/dim]",
+                f"[dim]{c.zone_ceiling:.5f}[/dim]",
+            )
+
+    return panel_cls(
+        t,
+        title="[bold white]NIVELES RAPIDOS[/bold white] [dim](Soporte / Resistencia)[/dim]",
+        border_style="white",
+        padding=(0, 1),
+    )
+
+
 def _build_layout(state: HubState, balance: float) -> "Layout":
     layout_cls = _require_layout_class()
     panel_cls = _require_panel_class()
@@ -535,12 +633,13 @@ def _build_layout(state: HubState, balance: float) -> "Layout":
     layout.split_column(
         layout_cls(name="header", size=5),
         layout_cls(name="body",   ratio=1),
+        layout_cls(name="levels", size=6),
         layout_cls(name="gale",   size=8),
         layout_cls(name="logs",   size=10),
         layout_cls(name="footer", size=1),
     )
 
-    layout["body"].split_row(layout_cls(name="strat_a"), layout_cls(name="strat_b"))
+    layout["body"].split_row(layout_cls(name="strat_a"), layout_cls(name="strat_b"), layout_cls(name="strat_c"))
 
     layout["header"].update(
         panel_cls(
@@ -553,7 +652,7 @@ def _build_layout(state: HubState, balance: float) -> "Layout":
     a_count = len(state.strat_a_watching)
     a_inner = table_cls.grid(expand=True)
     a_inner.add_column()
-    a_inner.add_row(text_cls.from_markup("[dim]Score · Dir · Dist-trigger · Modo · Patron[/dim]"))
+    a_inner.add_row(text_cls.from_markup("[dim]Score · Dir · Dist-trigger · Soporte/Resistencia · Modo · Patron[/dim]"))
     a_inner.add_row(_build_strat_a_table(state.strat_a_watching))
     layout["strat_a"].update(
         panel_cls(
@@ -567,7 +666,7 @@ def _build_layout(state: HubState, balance: float) -> "Layout":
     b_count = len(state.strat_b_watching)
     b_inner = table_cls.grid(expand=True)
     b_inner.add_column()
-    b_inner.add_row(text_cls.from_markup("[dim]Conf · Dir · Dist-trigger · Señal · Patron[/dim]"))
+    b_inner.add_row(text_cls.from_markup("[dim]Conf · Dir · Dist-trigger · Soporte/Resistencia · Señal · Patron[/dim]"))
     b_inner.add_row(_build_strat_b_table(state.strat_b_watching))
     layout["strat_b"].update(
         panel_cls(
@@ -578,7 +677,22 @@ def _build_layout(state: HubState, balance: float) -> "Layout":
         )
     )
 
+    c_count = len(state.strat_c_watching)
+    c_inner = table_cls.grid(expand=True)
+    c_inner.add_column()
+    c_inner.add_row(text_cls.from_markup("[dim]Score · Dir · Dist-trigger · Soporte/Resistencia · Señal · Patron[/dim]"))
+    c_inner.add_row(_build_strat_c_table(state.strat_c_watching))
+    layout["strat_c"].update(
+        panel_cls(
+            c_inner,
+            title=f"[bold blue]STRAT-C | RECHAZO 30s[/bold blue]  [dim]({c_count})[/dim]",
+            border_style="blue",
+            padding=(0, 1),
+        )
+    )
+
     layout["gale"].update(_build_gale_panel(state))
+    layout["levels"].update(_build_quick_levels_panel(state))
     layout["logs"].update(_build_logs_panel(state))
 
     layout["footer"].update(
@@ -707,45 +821,77 @@ class HubDashboard:
         cls._last_line_count = len(text.splitlines())
 
     @classmethod
-    def _render_fallback(cls, state: HubState, balance: float) -> str:
+    def _render_fallback(cls, state: HubState, balance: float) -> str:  # noqa: C901
         now = datetime.now(tz=timezone.utc).strftime("%H:%M:%S")
-        lines = [
-            f"{_BOLD}{_CYAN}{'=' * 80}{_RESET}",
-            f"{_BOLD}{_MAGENTA}QUOTEX BOT HUB - LIVE{_RESET}",
-            f"UTC {now} | Scans {state.total_scans} | Balance ${balance:.2f} | "
-            f"{_GREEN}{state.live_wins}W{_RESET}/{_RED}{state.live_losses}L{_RESET}",
-            "",
+        sep  = f"{_BOLD}{_CYAN}{'─' * 80}{_RESET}"
+        sep2 = f"{_DIM}{'·' * 80}{_RESET}"
+        title = f"  QUOTEX BOT HUB │ UTC {now} │ Scans:{state.total_scans} │ ${balance:.2f} │ {_GREEN}{state.live_wins}W{_RESET}/{_RED}{state.live_losses}L{_RESET}"
+        lines: list[str] = [
+            f"{_BOLD}{_CYAN}{'━' * 80}{_RESET}",
+            f"{_BOLD}{_MAGENTA}{title}{_RESET}",
+            f"{_BOLD}{_CYAN}{'━' * 80}{_RESET}",
         ]
-        for label, candidates in [("STRAT-A", state.strat_a_watching),
-                                   ("STRAT-B", state.strat_b_watching)]:
-            lines.append(f"{_BOLD}--- {label} ---{_RESET}")
+
+        # ── Secciones de estrategias ──────────────────────────────────────
+        strat_defs = [
+            ("A", "STRAT-A  Consolidación / Rebote",  state.strat_a_watching),
+            ("B", "STRAT-B  Spring / Sweep",           state.strat_b_watching),
+            ("C", "STRAT-C  Rechazo M1 (30s)",         state.strat_c_watching),
+        ]
+        for _key, label, candidates in strat_defs:
+            lines.append(f"{_BOLD}  [{label}]{_RESET}")
             if not candidates:
-                lines.append("  Sin candidatos en este escaneo")
+                lines.append(f"  {_DIM}  Sin candidatos en este escaneo{_RESET}")
             else:
                 for i, c in enumerate(candidates[:5], 1):
-                    dist = f"{c.dist_pct * 100:.2f}%" if c.dist_pct is not None else "--"
+                    dist = f"{c.dist_pct * 100:.2f}%" if c.dist_pct is not None else "  -- "
+                    dir_color = _GREEN if c.direction.lower() == "call" else _RED
+                    score_color = _GREEN if c.score >= 60 else (_YELLOW if c.score >= 45 else _RED)
                     lines.append(
-                        f"  {i}. {c.asset:<12} {c.direction:<4} "
-                        f"S:{c.score:.1f} P:{c.payout}% Dist:{dist}"
+                        f"  {i}. {c.asset:<13} {dir_color}{c.direction.upper():<4}{_RESET}"
+                        f"  {score_color}S:{c.score:<5.1f}{_RESET} P:{c.payout}%"
+                        f"  Dist:{dist:<7}"
+                        f"  {c.zone_floor:.5f} ── {c.zone_ceiling:.5f}"
                     )
-            lines.append("")
-        # ── GALE panel (fallback) ───────────────────────────────────────────
+            lines.append(sep2)
+
+        # ── Niveles rápidos (sección combinada) ───────────────────────────
+        lines.append(f"{_BOLD}  [NIVELES S/R]{_RESET}")
+        quick = (
+            list(state.strat_a_watching[:5])
+            + list(state.strat_b_watching[:5])
+            + list(state.strat_c_watching[:5])
+        )
+        quick.sort(key=lambda c: (9999.0 if c.dist_pct is None else c.dist_pct, -c.rank_value))
+        if not quick:
+            lines.append(f"  {_DIM}  Sin niveles en este escaneo{_RESET}")
+        else:
+            for i, c in enumerate(quick[:10], 1):
+                strat_tag = c.strategy.replace("STRAT-", "S")
+                dir_color = _GREEN if c.direction.lower() == "call" else _RED
+                dist = f"Dist:{c.dist_pct * 100:.2f}%" if c.dist_pct is not None else ""
+                lines.append(
+                    f"  {i:>2}. {_DIM}{strat_tag:<2}{_RESET} {c.asset:<13}"
+                    f"  {dir_color}{c.direction.upper():<4}{_RESET}"
+                    f"  {c.zone_floor:.5f} ── {c.zone_ceiling:.5f}"
+                    f"  {_DIM}{dist}{_RESET}"
+                )
+        lines.append(sep)
+
+        # ── GALE WATCHER ──────────────────────────────────────────────────
         g = state.gale
-        lines.append(f"{_BOLD}{_YELLOW}--- GALE WATCHER ---{_RESET}")
+        lines.append(f"{_BOLD}{_YELLOW}  [GALE WATCHER]{_RESET}")
         if not g.active:
-            lines.append(f"  {_DIM}Sin operación activa{_RESET}")
+            lines.append(f"  {_DIM}  Sin operación activa{_RESET}")
         else:
             dir_color = _GREEN if g.direction.upper() == "CALL" else _RED
             status = f"{_RED}⚠ PERDIENDO{_RESET}" if g.is_losing else f"{_GREEN}✓ GANANDO{_RESET}"
-            drift = 0.0
-            if g.updated_at > 0:
-                drift = max(0.0, time.time() - g.updated_at)
+            drift = max(0.0, time.time() - g.updated_at) if g.updated_at > 0 else 0.0
             secs = max(0.0, g.secs_remaining - drift)
             mm, ss = divmod(int(secs), 60)
             fired = (
                 f"{_GREEN}✔ ENVIADO{_RESET}" if g.gale_fired and g.gale_success
-                else (f"{_RED}✗ ERROR{_RESET}" if g.gale_fired
-                      else f"{_DIM}En espera{_RESET}")
+                else (f"{_RED}✗ ERROR{_RESET}" if g.gale_fired else f"{_DIM}En espera{_RESET}")
             )
             safety = str(getattr(g, "safety_status", "OK") or "OK").upper()
             if safety == "OK":
@@ -758,32 +904,39 @@ class HubDashboard:
                 safety_txt = f"{_BLUE}CICLO{_RESET}"
             else:
                 safety_txt = f"{_RED}ERROR{_RESET}"
-            lines.append(
-                f"  {g.asset.upper()} {dir_color}{g.direction.upper()}{_RESET}"
-                f"  EP:{g.entry_price:.5f}  PX:{g.current_price:.5f}"
-                f"  {g.delta_pct:+.4f}%  {status}"
-            )
-            lines.append(
-                f"  ⏱ {mm:02d}:{ss:02d}  Base:${g.amount_invested:.2f}"
-                f"  Gale:{_YELLOW}${g.gale_amount:.2f}{_RESET}  Disparo:{fired}"
-            )
-            lines.append(f"  Seguridad:{safety_txt}")
-            # objetivo ciclo y consecutivas
             obj = f"+${g.cycle_target_amount:.2f}" if g.cycle_target_amount > 0 else "calculando..."
             max_c = MartingaleCalculator.MAX_CONSECUTIVE_ENTRIES
             used = min(g.consecutive_count, max_c)
             c_color = _RED if used >= max_c else (_YELLOW if used >= max_c - 1 else "")
+            ctx = str(getattr(g, "context_key", "") or "")
+            lines.append(
+                f"  {g.asset.upper():<14} {dir_color}{g.direction.upper():<4}{_RESET}"
+                f"  EP:{g.entry_price:.5f}  PX:{g.current_price:.5f}"
+                f"  {g.delta_pct:+.4f}%  {status}"
+            )
+            lines.append(
+                f"  ⏱ {mm:02d}:{ss:02d}"
+                f"  Base:${g.amount_invested:.2f}  Gale:{_YELLOW}${g.gale_amount:.2f}{_RESET}"
+                f"  Disparo:{fired}  Seguridad:{safety_txt}"
+            )
             lines.append(
                 f"  Objetivo:{_GREEN}{obj}{_RESET}"
                 f"  Consecutivas:{c_color}{used}/{max_c}{_RESET}"
+                + (f"  {_DIM}{ctx}{_RESET}" if ctx else "")
             )
-        lines.append("")
-        lines.append(f"{_BOLD}--- MINI TERMINAL LOGS (tail) ---{_RESET}")
+        lines.append(sep)
+
+        # ── Mini log ─────────────────────────────────────────────────────
+        lines.append(f"{_BOLD}  [LOGS]{_RESET}")
         if _waiting_first_order(state):
-            lines.append("  (en espera de primera operacion)")
+            lines.append(f"  {_DIM}  En espera de primera operacion...{_RESET}")
         else:
-            for ln in _live_log_lines():
-                lines.append(f"  {ln}")
-        lines.append("")
-        lines.append(f"{_DIM}CTRL+C para salir{_RESET}")
+            log_lines = _live_log_lines()
+            if not log_lines:
+                lines.append(f"  {_DIM}  (sin eventos recientes){_RESET}")
+            else:
+                for ln in log_lines:
+                    lines.append(f"  {ln}")
+        lines.append(f"{_BOLD}{_CYAN}{'━' * 80}{_RESET}")
+        lines.append(f"  {_DIM}CTRL+C para salir{_RESET}")
         return "\n".join(lines)

@@ -172,9 +172,17 @@ class MartingaleCalculator:
 
         Se usa para escenarios como GALE en curso, donde hay una pérdida probable
         aún no confirmada por el broker.
+        Preserva el cycle_target ACTUAL para que el gale recupere la pérdida real,
+        en vez de calcular un target nuevo desde el balance proyectado (que devolvería
+        el mismo monto que la operación base).
         """
         projected_balance = max(0.0, float(balance_override))
-        cycle_target = self._calculate_objective_from_balance(projected_balance)
+        # Usar el target del ciclo vigente si existe, para que el gale cubra la pérdida
+        # real y no solo apunte a un incremento mínimo desde el saldo reducido.
+        if self.cycle_target is not None and self.cycle_target > projected_balance:
+            cycle_target = self.cycle_target
+        else:
+            cycle_target = self._calculate_objective_from_balance(projected_balance)
 
         if projected_balance >= cycle_target:
             return 0, "CYCLE_COMPLETE"

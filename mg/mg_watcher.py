@@ -64,6 +64,21 @@ PRICE_FETCH_RETRIES_CRITICAL = 3
 GALE_MAX_TRIGGER_ATTEMPTS = 5
 GALE_RETRY_INTERVAL_SEC = 0.5
 
+# Tiempo mínimo restante (segundos) para siquiera intentar el gale.
+# Con menos tiempo que esto no tiene sentido enviar la orden.
+MIN_TIME_TO_ATTEMPT_GALE_SEC = 8.0
+
+# Referencia al timeout del bridge de place_order en consolidation_bot.
+# Se usa para calcular el timeout dinámico y para decidir si hay tiempo
+# suficiente para otro intento antes de la expiración.
+BRIDGE_ORDER_TIMEOUT_REF_SEC = 45.0
+
+# Cuántos segundos ANTES del final_target disparar el gale anticipado.
+# Garantiza que el bridge (hasta 45s) complete antes de la expiración.
+# early_trigger = final_target - BRIDGE_ORDER_TIMEOUT_REF_SEC - este buffer.
+# En operaciones de 5m: early_trigger ≈ T - 3s - 45s - 5s = T - 53s.
+GALE_EARLY_TRIGGER_BUFFER_SEC = 5.0
+
 # Guardia de sanidad de precio durante vigilancia del trade.
 # Si el precio se desvía demasiado del entry en una operación de 5m,
 # se asume contaminación de feed y se ignora ese tick.
@@ -85,9 +100,10 @@ NowFn = Callable[[], float]
 
 
 # Firma: async/sync on_status(**campos) -> None  (notifica al hub en cada tick)
-OnStatusFn = Optional[Callable[..., None]]
+CallbackResult = None | Awaitable[None]
+OnStatusFn = Optional[Callable[..., CallbackResult]]
 # Firma: async/sync on_clear() -> None (limpia estado del hub al terminar)
-OnClearFn  = Optional[Callable[[], None]]
+OnClearFn  = Optional[Callable[[], CallbackResult]]
 
 
 # ── Data ───────────────────────────────────────────────────────────────────
@@ -430,28 +446,44 @@ class GaleWatcher:
         # ── calcular targets de disparo ───────────────────────────────────
         # Target primario: próximo open de 5m calculado desde la hora del ticket
         # (opened_at), no desde "ahora", para evitar drift visual/operativo.
-        # Target final: T-1s como red de seguridad para no perder el gale.
+        # Target final: T-3s como red de seguridad para no perder el gale.
+        # Early trigger: se adelanta BRIDGE_ORDER_TIMEOUT_REF_SEC + buffer segundos
+        # antes del final_target para que el bridge (hasta 45s) complete antes
+        # de la expiración incluso si el loop está ocupado.
         primary_target_ts = self._next_5m_boundary_ts(system_opened_at)
         final_target_ts = max(system_opened_at, expires_at - GALE_TRIGGER_SEC)
+        early_trigger_ts = max(
+            system_opened_at,
+            final_target_ts - BRIDGE_ORDER_TIMEOUT_REF_SEC - GALE_EARLY_TRIGGER_BUFFER_SEC,
+        )
         use_primary_target = primary_target_ts < expires_at
+        # Sólo activar el early trigger si hay al menos MIN_TIME_TO_ATTEMPT_GALE_SEC
+        # de operación restante desde ahora — evita disparo prematuro en ops cortas.
+        use_early_trigger = (early_trigger_ts > self._now_ts() + 1.0) and (
+            (expires_at - early_trigger_ts) >= MIN_TIME_TO_ATTEMPT_GALE_SEC
+        )
 
         if not use_primary_target:
             log.info(
                 "🔍 GaleWatcher iniciado | %s %s $%.2f | entry=%.6f | cierre en %.0fs "
-                "| target=T-1s (fallback: próximo 5m después de expiración)",
+                "| target=T-3s (fallback) | early_trigger en %.0fs",
                 asset, direction.upper(), trade.amount, trade.entry_price,
                 self._secs_remaining(trade, expires_at=expires_at),
+                max(0.0, early_trigger_ts - self._now_ts()),
             )
         else:
             secs_to_target = primary_target_ts - self._now_ts()
             log.info(
                 "🔍 GaleWatcher iniciado | %s %s $%.2f | entry=%.6f | cierre en %.0fs "
-                "| target=próximo 5m en %.0fs",
+                "| target=próximo 5m en %.0fs | early_trigger en %.0fs",
                 asset, direction.upper(), trade.amount, trade.entry_price,
-                self._secs_remaining(trade, expires_at=expires_at), secs_to_target,
+                self._secs_remaining(trade, expires_at=expires_at),
+                secs_to_target,
+                max(0.0, early_trigger_ts - self._now_ts()),
             )
 
         primary_attempted = False
+        early_attempted = False
         trigger_attempts = 0
         next_retry_ts = 0.0
 
@@ -490,33 +522,86 @@ class GaleWatcher:
             reason = ""
             if use_primary_target and (not primary_attempted) and now >= primary_target_ts:
                 primary_attempted = True
+                early_attempted = True  # el primario cubre la ventana temprana también
                 should_try = True
                 reason = "target_5m"
+            elif use_early_trigger and (not early_attempted) and now >= early_trigger_ts:
+                # Ventana anticipada: dispara BRIDGE_ORDER_TIMEOUT_REF_SEC+buffer antes
+                # del final_target para que el bridge complete antes de la expiración.
+                early_attempted = True
+                should_try = True
+                reason = "early_trigger"
+                log.info(
+                    "⏱ GaleWatcher %s: ventana early_trigger activada (%.0fs antes de expiración)",
+                    asset, expires_at - now,
+                )
             elif now >= final_target_ts and now >= next_retry_ts and trigger_attempts < GALE_MAX_TRIGGER_ATTEMPTS:
                 should_try = True
                 reason = "target_final"
 
             if should_try and not self.gale_fired:
-                outcome = await self._fire_gale(trade, display_price)
+                outcome = await self._fire_gale(trade, display_price, expires_at)
                 if outcome == "sent":
-                    # Después del disparo, esperar hasta expiración y salir
-                    await asyncio.sleep(max(0.0, self._secs_remaining(trade, expires_at=expires_at) + 1.0))
+                    # Gale disparado — seguir monitoreando hasta que expire el GALE
+                    # (no solo la operación base) para mantener el HUB actualizado.
+                    gale_expires_at = self._now_ts() + float(GALE_DURATION_SEC) + 2.0
+                    log.info(
+                        "GaleWatcher %s: gale enviado — monitoreando gale %.0fs más",
+                        asset,
+                        gale_expires_at - self._now_ts(),
+                    )
+                    while True:
+                        gale_secs_left = max(0.0, gale_expires_at - self._now_ts())
+                        if gale_secs_left <= 0:
+                            break
+                        raw_price = await self._current_price(asset)
+                        display_price = self._sanitize_trade_price(trade, raw_price, last_good_price)
+                        if display_price is not None:
+                            last_good_price = display_price
+                        self._notify_status(
+                            trade,
+                            display_price,
+                            gale_fired=True,
+                            gale_success=True,
+                            secs_remaining_override=gale_secs_left,
+                        )
+                        await asyncio.sleep(POLL_INTERVAL_SEC)
+                    self._notify_clear()
+                    return
+
+                # "no_time": no hay margen para reintentar — terminar limpiamente.
+                if outcome == "no_time":
+                    log.warning(
+                        "GaleWatcher %s: gale cancelado por tiempo insuficiente — loop terminado",
+                        asset,
+                    )
                     self._notify_clear()
                     return
 
                 # Sólo reintentar si fue problema técnico (precio o envío).
-                # Nota: también aplica cuando el intento fue target_5m y falló —
-                # en ese caso habilitamos la ventana final como fallback inmediato.
+                # Antes de programar reintento, verificar que queda tiempo suficiente
+                # para un intento completo (efectivo_timeout + buffer_mínimo).
                 if outcome in ("no_price", "failed_send"):
+                    time_left_now = expires_at - self._now_ts()
+                    min_time_for_retry = MIN_TIME_TO_ATTEMPT_GALE_SEC + 1.0
+                    if time_left_now < min_time_for_retry:
+                        log.warning(
+                            "GaleWatcher %s: intento %d fallido (%s) y no hay tiempo"
+                            " para reintento (%.1fs restantes) — loop terminado",
+                            asset, trigger_attempts + 1, outcome, time_left_now,
+                        )
+                        self._notify_clear()
+                        return
                     trigger_attempts += 1
                     next_retry_ts = self._now_ts() + GALE_RETRY_INTERVAL_SEC
-                    # Si falló en target_5m, bajar el umbral final para reintentar pronto
-                    if reason == "target_5m":
+                    # Si falló en target_5m o early_trigger, bajar el umbral final para reintentar pronto
+                    if reason in ("target_5m", "early_trigger"):
+                        final_target_ts = min(final_target_ts, self._now_ts() + GALE_RETRY_INTERVAL_SEC)
                         final_target_ts = min(final_target_ts, self._now_ts() + GALE_RETRY_INTERVAL_SEC)
                         log.warning(
-                            "GaleWatcher %s: disparo target_5m falló (%s) — "
+                            "GaleWatcher %s: disparo %s falló (%s) — "
                             "activando ventana de reintento en %.1fs (intento %d/%d)",
-                            asset, outcome, GALE_RETRY_INTERVAL_SEC,
+                            asset, reason, outcome, GALE_RETRY_INTERVAL_SEC,
                             trigger_attempts, GALE_MAX_TRIGGER_ATTEMPTS,
                         )
                     else:
@@ -531,8 +616,10 @@ class GaleWatcher:
 
             # ── determinar intervalo de polling ───────────────────────────
             next_target = final_target_ts
+            if use_early_trigger and not early_attempted:
+                next_target = min(next_target, early_trigger_ts)
             if use_primary_target and not primary_attempted:
-                next_target = min(primary_target_ts, final_target_ts)
+                next_target = min(primary_target_ts, next_target)
             secs_to_target = max(0.0, next_target - self._now_ts())
             if secs_to_target <= FAST_POLL_THRESHOLD_SEC:
                 base_sleep = FAST_POLL_INTERVAL_SEC
@@ -548,7 +635,12 @@ class GaleWatcher:
 
     # ── disparo de gale ──────────────────────────────────────────────────
 
-    async def _fire_gale(self, trade: TradeInfo, last_price: Optional[float]) -> str:
+    async def _fire_gale(
+        self,
+        trade: TradeInfo,
+        last_price: Optional[float],
+        expires_at: float,
+    ) -> str:
         """Evalúa si corresponde disparar el gale y lo envía al broker.
 
         Retorna:
@@ -557,9 +649,19 @@ class GaleWatcher:
             "invalid_amount": calculadora devolvió monto inválido.
             "no_price": no fue posible obtener precio.
             "failed_send": se intentó enviar pero el broker lo rechazó o falló.
+            "no_time": no queda tiempo suficiente para completar la orden.
         """
         asset     = trade.asset
         direction = trade.direction
+
+        # ── verificación temprana de tiempo restante ──────────────────────
+        time_budget = expires_at - self._now_ts()
+        if time_budget < MIN_TIME_TO_ATTEMPT_GALE_SEC:
+            log.warning(
+                "⚠ GaleWatcher %s: tiempo insuficiente para gale (%.1fs < %.1fs mínimo) — cancelado",
+                asset, time_budget, MIN_TIME_TO_ATTEMPT_GALE_SEC,
+            )
+            return "no_time"
 
         # ── reintentar precio si no teníamos ──────────────────────────────
         price = last_price
@@ -619,7 +721,7 @@ class GaleWatcher:
             amount, balance or 0.0,
         )
 
-        # ── colocar la orden ─────────────────────────────────────────────
+        # ── colocar la orden con timeout dinámico ─────────────────────────
         if self.dry_run:
             self.gale_fired = True
             log.info(
@@ -628,14 +730,31 @@ class GaleWatcher:
             )
             return "sent"
 
+        # Timeout efectivo: no esperar más de lo que queda de operación menos un buffer.
+        # Si queda menos de BRIDGE_ORDER_TIMEOUT_REF_SEC, fallamos rápido y reintentamos
+        # mientras aún hay tiempo, en lugar de bloquear 45s y expirar sin gale.
+        time_budget_now = expires_at - self._now_ts()
+        effective_timeout = max(3.0, min(BRIDGE_ORDER_TIMEOUT_REF_SEC, time_budget_now - 2.0))
+
         try:
-            success, order_id, open_price, order_ref, error = await self._place_order(
-                asset=asset,
-                direction=direction,
-                amount=amount,
-                duration=GALE_DURATION_SEC,
-                account_type=trade.account_type,
+            success, order_id, open_price, order_ref, error = await asyncio.wait_for(
+                self._place_order(
+                    asset=asset,
+                    direction=direction,
+                    amount=amount,
+                    duration=GALE_DURATION_SEC,
+                    account_type=trade.account_type,
+                ),
+                timeout=effective_timeout,
             )
+        except asyncio.TimeoutError:
+            time_left = expires_at - self._now_ts()
+            log.error(
+                "❌ GALE BRIDGE TIMEOUT | %s | timeout=%.0fs agotado (%.1fs restantes en op)"
+                " — loop principal bloqueado (reconexión o buy() en curso)",
+                asset, effective_timeout, max(0.0, time_left),
+            )
+            return "no_time"
         except Exception as exc:
             log.error("GaleWatcher: excepción colocando gale: %s", exc)
             # gale_fired permanece False → permite reintento si hay tiempo
@@ -654,14 +773,17 @@ class GaleWatcher:
             return "sent"
         else:
             _is_bridge_timeout = "bridge_timeout" in str(error)
+            time_left = expires_at - self._now_ts()
             if _is_bridge_timeout:
                 log.error(
-                    "❌ GALE BRIDGE TIMEOUT | %s | el loop principal tardó > %.0fs en responder "
-                    "— probablemente reconexión o buy() en curso. error=%s",
+                    "❌ GALE BRIDGE TIMEOUT | %s | timeout interno=%.0fs agotado"
+                    " (%.1fs restantes en op) — probablemente reconexión o buy() en curso. error=%s",
                     asset,
-                    45.0,  # GALE_BRIDGE_ORDER_TIMEOUT_SEC
+                    BRIDGE_ORDER_TIMEOUT_REF_SEC,
+                    max(0.0, time_left),
                     error,
                 )
+                return "no_time"
             else:
                 log.error(
                     "❌ GALE RECHAZADO por broker | %s | error=%s",

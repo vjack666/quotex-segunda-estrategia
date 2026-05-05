@@ -32,6 +32,8 @@ class HubScanner:
             return CandidateData.from_strat_a(dict(item))
         if strategy == "STRAT-B":
             return CandidateData.from_strat_b(dict(item))
+        if strategy == "STRAT-C":
+            return CandidateData.from_strat_b(dict(item))
         raise ValueError(f"estrategia desconocida: {strategy}")
 
     def normalize_candidates(
@@ -48,6 +50,7 @@ class HubScanner:
         total_assets: int,
         strat_a_candidates: Sequence[CandidateData | Mapping[str, Any]],
         strat_b_candidates: Sequence[CandidateData | Mapping[str, Any]],
+        strat_c_candidates: Sequence[CandidateData | Mapping[str, Any]] = (),
         balance: Optional[float] = None,
         cycle_id: int = 0,
         cycle_ops: int = 0,
@@ -64,11 +67,14 @@ class HubScanner:
         # Normaliza y conserva top candidatos por estrategia para el HUB.
         normalized_a = self.normalize_candidates("STRAT-A", strat_a_candidates)
         normalized_b = self.normalize_candidates("STRAT-B", strat_b_candidates)
+        normalized_c = self.normalize_candidates("STRAT-C", strat_c_candidates)
         strat_a_top5 = normalized_a[:5]
         strat_b_top5 = normalized_b[:5]
+        strat_c_top5 = normalized_c[:5]
 
         self.state.strat_a_watching = strat_a_top5
         self.state.strat_b_watching = strat_b_top5
+        self.state.strat_c_watching = strat_c_top5
         self.state.total_scans += 1
         self.state.last_update = now
         if balance is not None:
@@ -81,6 +87,7 @@ class HubScanner:
             total_assets_scanned=total_assets,
             strat_a_candidates=strat_a_top5,
             strat_b_candidates=strat_b_top5,
+            strat_c_candidates=strat_c_top5,
             balance=balance,
             cycle_id=cycle_id,
             cycle_ops=cycle_ops,
@@ -90,12 +97,14 @@ class HubScanner:
         self.state.last_scan = snapshot
 
         log.debug(
-            "SCAN #%d | STRAT-A=%d (top5=%d) | STRAT-B=%d (top5=%d)",
+            "SCAN #%d | STRAT-A=%d (top5=%d) | STRAT-B=%d (top5=%d) | STRAT-C=%d (top5=%d)",
             self.scan_count,
             len(normalized_a),
             len(strat_a_top5),
             len(normalized_b),
             len(strat_b_top5),
+            len(normalized_c),
+            len(strat_c_top5),
         )
 
     def record_entry(
@@ -122,6 +131,10 @@ class HubScanner:
         elif strategy.upper() == "STRAT-B":
             self.state.strat_b_watching = [
                 c for c in self.state.strat_b_watching if c.asset != asset.upper()
+            ]
+        elif strategy.upper() == "STRAT-C":
+            self.state.strat_c_watching = [
+                c for c in self.state.strat_c_watching if c.asset != asset.upper()
             ]
 
         log.info(
@@ -216,6 +229,7 @@ class HubScanner:
         total_assets: int,
         strat_a_payload: Sequence[Mapping[str, Any]],
         strat_b_payload: Sequence[Mapping[str, Any]],
+        strat_c_payload: Sequence[Mapping[str, Any]] = (),
         balance: Optional[float] = None,
         cycle_id: int = 0,
         cycle_ops: int = 0,
@@ -227,6 +241,7 @@ class HubScanner:
             total_assets=total_assets,
             strat_a_candidates=strat_a_payload,
             strat_b_candidates=strat_b_payload,
+            strat_c_candidates=strat_c_payload,
             balance=balance,
             cycle_id=cycle_id,
             cycle_ops=cycle_ops,

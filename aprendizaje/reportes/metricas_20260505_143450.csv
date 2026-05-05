@@ -1,0 +1,3 @@
+estrategia,total_registros,accepted,rejected_score,rejected_limit,rejected_structure,wins,losses,unresolved_or_pending,pnl_cerradas,score_promedio_accepted
+STRAT-A,111,4,103,0,4,2,1,1,1.8314,66.88
+STRAT-B,0,0,0,0,0,0,0,0,0,0.0

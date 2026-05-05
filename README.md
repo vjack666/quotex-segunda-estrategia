@@ -1,18 +1,29 @@
 # QUOTEX Trading System
 
-Sistema unificado para bots de trading con pyquotex.
+Sistema de entrenamiento y ejecución para estrategias OTC en Quotex.
 
-## Flujo esencial
+## Estado actual
 
-- src/main.py: orquestador principal
-- src/consolidation_bot.py: bot de consolidación con selección matemática del mejor candidato
-- src/entry_scorer.py: motor de scoring (0-100) para filtrar entradas
-- src/filter_and_sell_otc.py: bot de filtro y venta por payout
-- src/smc_auto_trader.py: trader SMC
+- STRAT-A (Consolidación) activa
+- STRAT-B (Spring/Upthrust) integrada y registrando en caja negra
+- Duración de orden: 300s (5m)
+- Caja negra en SQLite por día: data/db/trade_journal-YYYY-MM-DD.db
+- Stop-loss de sesión desactivado para entrenamiento (flag interno)
+
+## Estructura relevante
+
+- main.py: entrada principal (CLI + loop)
+- src/consolidation_bot.py: motor central
+- src/entry_scorer.py: scoring y selección de candidatos
+- src/strategy_spring_sweep.py: detección STRAT-B
+- src/trade_journal.py: persistencia de caja negra
+- documentacion/: documentación técnica
+- aprendizaje/: flujo de entrenamiento y mejora
+- lab/: scripts de análisis offline
 
 ## Setup rápido (Windows PowerShell)
 
-1. cd c:\Users\v_jac\Desktop\QUOTEX
+1. cd c:\Users\v_jac\Desktop\QUOTEX - segunda estrategia
 2. python -m venv .venv
 3. .\.venv\Scripts\Activate.ps1
 4. pip install --upgrade pip
@@ -23,32 +34,29 @@ Sistema unificado para bots de trading con pyquotex.
 - QUOTEX_EMAIL
 - QUOTEX_PASSWORD
 
-## Ejecutar bots
+## Ejecución
 
-Orquestador:
+- Un ciclo: python main.py --once
+- Loop continuo: python main.py
+- Cuenta real: python main.py --real
+- HUB solo monitoreo (sin órdenes): python main.py --hub-readonly
 
-- python src/main.py --help
+## Parámetros útiles (CLI)
 
-Consolidation (1 ciclo):
+- --min-payout 80
+- --cycle-ops 5
+- --cycle-wins 2
+- --cycle-profit-pct 0.10
+- --strat-b-live
+- --strat-b-min-confidence 0.70
+- --same-asset-cooldown-sec 65
+- --structure-entry-lock-ttl-min 180
 
-- python src/main.py consolidation --live
+## Flujo de aprendizaje recomendado
 
-Consolidation 24/7:
-
-- python src/main.py consolidation --live --loop
-
-SMC:
-
-- python src/main.py smc --live --asset EURUSD_otc --amount 1 --duration 60
-
-Filter sell:
-
-- python src/main.py filter-sell --live --min-payout 85 --amount 1
-
-## Monitoreo en vivo
-
-- Get-Content consolidation_bot.log -Wait -Tail 40
-
-## Nota de limpieza
-
-Los scripts de prueba y diagnóstico fueron movidos a src/lab para mantener src limpio sin eliminar herramientas útiles.
+1. Ejecutar sesión de entrenamiento
+2. Exportar métricas: .venv\Scripts\python.exe aprendizaje\scripts\exportar_metricas_aprendizaje.py
+3. Revisar caja negra: .venv\Scripts\python.exe lab\full_session_review.py
+4. Revisar A/B: .venv\Scripts\python.exe lab\black_box_stratb.py
+5. Exportar velas: .venv\Scripts\python.exe lab\dump_candidate_candles.py
+6. Archivar sesión: powershell -ExecutionPolicy Bypass -File aprendizaje\scripts\cerrar_sesion_aprendizaje.ps1
