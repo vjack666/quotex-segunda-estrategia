@@ -85,6 +85,25 @@ _RED     = "\033[91m"
 _BLUE    = "\033[94m"
 _MAGENTA = "\033[95m"
 
+
+def _enable_ansi_windows() -> bool:
+    """Intenta habilitar ANSI en consola Windows. Retorna True si queda activo."""
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+            kernel32.SetConsoleMode(handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+            return True
+    except Exception:
+        pass
+    return False
+
 _LOG_TAIL_LINES = 8
 _LOG_TAIL_MAX_BYTES = 64 * 1024
 _LOG_RECENT_WINDOW_MIN = 20
@@ -799,21 +818,30 @@ class HubDashboard:
     _last_text: str = ""
     _last_line_count: int = 0
     _screen_initialized: bool = False
+    _fallback_cursor_mode: Optional[bool] = None
 
     @classmethod
     def _display_fallback(cls, state: HubState, balance: float) -> None:
         text = cls._render_fallback(state, balance)
         if text == cls._last_text:
             return
+
+        if cls._fallback_cursor_mode is None:
+            cls._fallback_cursor_mode = bool(_enable_ansi_windows())
+
         if not cls._screen_initialized:
             import os as _os
             _os.system("cls" if _os.name == "nt" else "clear")
             cls._screen_initialized = True
 
-        # \033[H  → cursor al origen (fila 1, col 1)
-        # \033[J  → borrar desde cursor hasta el final de pantalla
-        # Esto elimina cualquier residuo del frame anterior sin parpadeo total.
-        sys.stdout.write("\033[H\033[J")
+        # En terminales con ANSI: refresco in-place sin crear cuadros nuevos.
+        # En terminales sin ANSI: limpiar pantalla completa en cada frame.
+        if cls._fallback_cursor_mode:
+            sys.stdout.write("\033[H\033[J")
+        else:
+            import os as _os
+            _os.system("cls" if _os.name == "nt" else "clear")
+
         sys.stdout.write(text)
         sys.stdout.write("\n")
         sys.stdout.flush()

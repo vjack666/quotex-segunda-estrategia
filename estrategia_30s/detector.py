@@ -8,6 +8,7 @@ Uso standalone:
     if resultado:
         direction, score, detalle = resultado
 """
+import time as _time
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Tuple, Dict, Any
 
@@ -21,7 +22,9 @@ MIN_WICK_TO_BODY_RATIO: float = 1.5
 MIN_SCORE: float              = 6.0
 ATR_MIN: float                = 0.00004   # mercado muy plano → no entrar
 ATR_MAX: float                = 0.00040   # spike/noticia → no entrar
-BROKER_TZ                     = timezone(timedelta(hours=-3))  # UTC-3
+# BROKER_TZ ya no se usa — el segundo se extrae directamente del timestamp UNIX.
+# int(ts) % 60 da el segundo dentro del minuto sin depender de zona horaria.
+BROKER_TZ                     = timezone(timedelta(hours=-3))  # conservado por compatibilidad
 
 # Parametros de indicadores (calibrables)
 ATR_PERIOD: int = 7
@@ -59,6 +62,7 @@ def evaluar_vela(
     zonas: Optional[List[float]] = None,
     *,
     check_time: bool = True,
+    broker_ts: Optional[float] = None,
 ) -> Optional[SignalResult]:
     """
     Evalúa si la vela actual genera señal de entrada.
@@ -68,7 +72,9 @@ def evaluar_vela(
                     Mínimo recomendado: 25 velas para indicadores.
         zonas:      Niveles S/R pre-identificados. Si es None se calculan internamente.
         check_time: Si True verifica que el segundo actual esté en [30-41].
-                    Pasar False en backtesting.
+                    Pasar False en backtesting o cuando la verificación la hace el caller.
+        broker_ts:  Timestamp UNIX calibrado del broker. Elimina dependencia de timezone.
+                    Si es None y check_time=True, usa time.time() (hora local).
 
     Returns:
         (direccion, score, detalle) si hay señal, None si no.
@@ -80,8 +86,11 @@ def evaluar_vela(
         return None
 
     # ── 1. Ventana de tiempo ──────────────────────────────────────────────────
+    # Se usa int(ts) % 60 para extraer el segundo sin depender de timezone.
+    # broker_ts (calibrado) tiene prioridad sobre time.time() (hora local).
     if check_time:
-        second = datetime.now(tz=BROKER_TZ).second
+        _ts = broker_ts if broker_ts is not None else _time.time()
+        second = int(_ts) % 60
         if not (ENTRY_WINDOW_START_SEC <= second <= ENTRY_WINDOW_END_SEC):
             return None
 

@@ -36,13 +36,13 @@ import pandas as pd
 class SpringSweepConfig:
     """Parametros matematicos del detector Spring (alcista)."""
 
-    support_lookback: int = 18
-    min_rows: int = 20
-    break_buffer_pct: float = 0.00005
-    reclaim_tolerance_pct: float = 0.00030
-    min_lower_wick_ratio: float = 0.45
-    confirm_break_buffer_pct: float = 0.00005
-    min_confirm_body_ratio: float = 0.40
+    support_lookback: int = 20
+    min_rows: int = 22
+    break_buffer_pct: float = 0.00003
+    reclaim_tolerance_pct: float = 0.00035
+    min_lower_wick_ratio: float = 0.50
+    confirm_break_buffer_pct: float = 0.00003
+    min_confirm_body_ratio: float = 0.45
 
 
 # Alias para legibilidad en el código que instancia la config directamente.
@@ -53,11 +53,11 @@ SpringConfig = SpringSweepConfig
 class UpthrustConfig:
     """Parametros matematicos del detector Upthrust (bajista, espejo de Spring)."""
 
-    resistance_lookback: int = 18
-    min_rows: int = 20
-    break_buffer_pct: float = 0.00005
-    reclaim_tolerance_pct: float = 0.00030
-    min_upper_wick_ratio: float = 0.45
+    resistance_lookback: int = 20
+    min_rows: int = 22
+    break_buffer_pct: float = 0.00003
+    reclaim_tolerance_pct: float = 0.00035
+    min_upper_wick_ratio: float = 0.52
     confirm_break_buffer_pct: float = 0.00005
     min_confirm_body_ratio: float = 0.40
 
@@ -146,10 +146,10 @@ def _confidence_from_metrics(
 
     score = (
         depth_score * 0.20
-        + reclaim_score * 0.25
-        + wick_score * 0.20
+        + reclaim_score * 0.35
+        + wick_score * 0.15
         + break_score * 0.20
-        + body_score * 0.15
+        + body_score * 0.10
     )
     return round(_clamp(score, 0.0, 1.0), 4)
 

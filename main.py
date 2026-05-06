@@ -49,6 +49,8 @@ def _write_hub_runtime_snapshot(bot=None) -> None:
             "dist_pct": getattr(c, "dist_pct", None),
             "confidence": getattr(c, "confidence", None),
             "signal_type": getattr(c, "signal_type", None),
+            "raw_reason": str(getattr(c, "raw_reason", "") or ""),
+            "raw_note": str(getattr(c, "raw_note", "") or ""),
         }
 
     try:
@@ -117,6 +119,8 @@ def _launch_strategy_monitors(enabled: bool) -> list[subprocess.Popen]:
             strategy,
             "--state-file",
             str(_HUB_RUNTIME_STATE_FILE),
+            "--stale-sec",
+            "30.0",
         ]
         try:
             p = subprocess.Popen(cmd_args, cwd=str(ROOT), creationflags=creation_flags)
@@ -133,7 +137,8 @@ def _launch_strategy_monitors(enabled: bool) -> list[subprocess.Popen]:
             # Fallback robusto: cmd /c start abre una ventana de consola nueva.
             launch_cmd = (
                 f'start "" "{sys.executable}" -u "{monitor_script}" '
-                f'--strategy {strategy} --state-file "{_HUB_RUNTIME_STATE_FILE}"'
+                f'--strategy {strategy} --state-file "{_HUB_RUNTIME_STATE_FILE}" '
+                f'--stale-sec 30.0'
             )
             subprocess.Popen(["cmd", "/c", launch_cmd], cwd=str(ROOT))
             _log_launch(f"OK cmd_start strategy={strategy}")
@@ -321,7 +326,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--strat-c-enabled",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="Habilitar STRAT-C: rechazo M1 con expiración 60s (en desarrollo)",
     )
     p.add_argument(

@@ -456,11 +456,31 @@ class GaleWatcher:
             system_opened_at,
             final_target_ts - BRIDGE_ORDER_TIMEOUT_REF_SEC - GALE_EARLY_TRIGGER_BUFFER_SEC,
         )
-        use_primary_target = primary_target_ts < expires_at
+        total_trade_span_sec = max(0.0, expires_at - system_opened_at)
+        expected_trade_span_sec = max(0.0, float(trade.duration_sec))
+        expiry_span_drift_sec = abs(total_trade_span_sec - expected_trade_span_sec)
+        # Solo usar target_5m si la expiración real del ticket coincide aproximadamente
+        # con la duración esperada. Si el broker alinea a slots (p.ej. 16:08 -> 16:15),
+        # el próximo boundary de 5m queda demasiado pronto y provoca gale prematuro.
+        use_primary_target = (
+            primary_target_ts < expires_at
+            and expiry_span_drift_sec <= 15.0
+        )
+        early_trigger_min_trade_span_sec = (
+            BRIDGE_ORDER_TIMEOUT_REF_SEC
+            + GALE_EARLY_TRIGGER_BUFFER_SEC
+            + GALE_TRIGGER_SEC
+            + 1.0
+        )
         # Sólo activar el early trigger si hay al menos MIN_TIME_TO_ATTEMPT_GALE_SEC
-        # de operación restante desde ahora — evita disparo prematuro en ops cortas.
-        use_early_trigger = (early_trigger_ts > self._now_ts() + 1.0) and (
+        # de operación restante desde ahora y la operación es lo bastante larga
+        # como para justificar anticipar hasta 45s de bridge.
+        use_early_trigger = (
+            total_trade_span_sec >= early_trigger_min_trade_span_sec
+            and (early_trigger_ts > self._now_ts() + 1.0)
+            and (
             (expires_at - early_trigger_ts) >= MIN_TIME_TO_ATTEMPT_GALE_SEC
+            )
         )
 
         if not use_primary_target:
@@ -471,6 +491,13 @@ class GaleWatcher:
                 self._secs_remaining(trade, expires_at=expires_at),
                 max(0.0, early_trigger_ts - self._now_ts()),
             )
+            if expiry_span_drift_sec > 15.0:
+                log.info(
+                    "GaleWatcher %s: primary_target desactivado; expiry real difiere %.0fs de duration=%ss",
+                    asset,
+                    expiry_span_drift_sec,
+                    int(trade.duration_sec),
+                )
         else:
             secs_to_target = primary_target_ts - self._now_ts()
             log.info(
@@ -749,8 +776,8 @@ class GaleWatcher:
             )
         except asyncio.TimeoutError:
             time_left = expires_at - self._now_ts()
-            log.error(
-                "❌ GALE BRIDGE TIMEOUT | %s | timeout=%.0fs agotado (%.1fs restantes en op)"
+            log.warning(
+                "⏳ GALE BRIDGE TIMEOUT | %s | timeout=%.0fs agotado (%.1fs restantes en op)"
                 " — loop principal bloqueado (reconexión o buy() en curso)",
                 asset, effective_timeout, max(0.0, time_left),
             )
@@ -775,8 +802,8 @@ class GaleWatcher:
             _is_bridge_timeout = "bridge_timeout" in str(error)
             time_left = expires_at - self._now_ts()
             if _is_bridge_timeout:
-                log.error(
-                    "❌ GALE BRIDGE TIMEOUT | %s | timeout interno=%.0fs agotado"
+                log.warning(
+                    "⏳ GALE BRIDGE TIMEOUT | %s | timeout interno=%.0fs agotado"
                     " (%.1fs restantes en op) — probablemente reconexión o buy() en curso. error=%s",
                     asset,
                     BRIDGE_ORDER_TIMEOUT_REF_SEC,

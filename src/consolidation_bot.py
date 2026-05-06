@@ -51,7 +51,7 @@ from datetime import timedelta
 from math import ceil
 from pathlib import Path
 from statistics import mean
-from typing import Any, Awaitable, Coroutine, Deque, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Coroutine, Deque, List, Optional, Tuple
 
 # ── Cargar .env ───────────────────────────────────────────────────────────────
 for _candidate in (Path(__file__).parent / ".env", Path(__file__).parent.parent / ".env"):
@@ -76,15 +76,18 @@ from candle_patterns import (
 )
 from strategy_spring_sweep import detect_spring_or_upthrust
 from trade_journal import get_journal
+from black_box_recorder import get_black_box
 from martingale_calculator import MartingaleCalculator
 from hub.hub_scanner import HubScanner
 from hub.hub_models import CandidateData
 
 try:
     from estrategia_30s import detector as strat_c_detector
+    from estrategia_30s.zonas import detectar_zonas_sr as _strat_c_detect_zones
     _STRAT_C_AVAILABLE = True
 except Exception:
     strat_c_detector = None  # type: ignore
+    _strat_c_detect_zones = None  # type: ignore
     _STRAT_C_AVAILABLE = False
 
 # Motor de Gale — ruta relativa al ROOT del proyecto
@@ -382,6 +385,8 @@ class TradeState:
     payout: int = MIN_PAYOUT
     resolved: bool = False
     score_original: float = 0.0
+    black_box_candidate_id: int = 0
+    black_box_order_key: str = ""
 
 
 @dataclass
@@ -809,7 +814,8 @@ def _extract_ticket_opened_at_with_source(info: Any, fallback_ts: float) -> tupl
     if not isinstance(info, dict):
         return float(fallback_ts), "fallback:local_clock"
 
-    now = time.time()
+    # Usar referencia calibrada al broker cuando esté disponible.
+    now = float(fallback_ts) if float(fallback_ts or 0.0) > 0.0 else time.time()
     keys = (
         "openTime", "open_time", "opened_at", "openTimestamp",
         "open_ts", "createdAt", "created_at", "timestamp", "time",
@@ -858,7 +864,8 @@ def _extract_ticket_close_ts_with_source(
     if not isinstance(info, dict):
         return float(opened_at_ts) + float(duration_sec), "calculated:open+duration"
 
-    now = time.time()
+    # Si tenemos opened_at de broker, usarlo como ancla de validación temporal.
+    now = float(opened_at_ts) if float(opened_at_ts or 0.0) > 0.0 else time.time()
     close_keys = (
         "closeTime", "close_time", "endTime", "end_time",
         "closeAt", "close_at", "expireAt", "expire_at",
@@ -904,11 +911,12 @@ async def place_order(
     client: Quotex, asset: str, direction: str,
     amount: float, duration: int, dry_run: bool,
     account_type: str = "PRACTICE",
+    now_ts_fn: Optional[Callable[[], float]] = None,
 ) -> Tuple[bool, str, float, int, str, float, str, float]:
     if dry_run:
         log.info("  [DRY-RUN] %s %s $%.2f %ds",
                  direction.upper(), asset, amount, duration)
-        ts_now = time.time()
+        ts_now = float(now_ts_fn()) if now_ts_fn is not None else time.time()
         close_ts_dry = ts_now + float(duration)
         return True, f"DRY-{int(ts_now)}", 0.0, 0, "", ts_now, "dry_run", close_ts_dry
 
@@ -1051,12 +1059,16 @@ async def place_order(
 
     elapsed = time.time() - t0
 
+    try:
+        _ticket_now = float(now_ts_fn()) if now_ts_fn is not None else time.time()
+    except Exception:
+        _ticket_now = time.time()
+
     if status and isinstance(info, dict):
         log.debug("  Respuesta broker (%.2fs): %s", elapsed, info)
-        _local_now = time.time()
-        opened_at_ts, opened_at_source = _extract_ticket_opened_at_with_source(info, _local_now)
+        opened_at_ts, opened_at_source = _extract_ticket_opened_at_with_source(info, _ticket_now)
         close_ts, close_ts_source = _extract_ticket_close_ts_with_source(info, opened_at_ts, duration)
-        _offset = opened_at_ts - _local_now
+        _offset = opened_at_ts - _ticket_now
         log.info(
             "  ⏱ Ticket: open=%s  close=%s  offset_vs_local=%+.3fs  (src_open=%s  src_close=%s)",
             datetime.fromtimestamp(opened_at_ts, tz=timezone.utc).strftime("%H:%M:%S.%f")[:-3],
@@ -1124,10 +1136,13 @@ async def place_order(
         elapsed_retry = time.time() - t0_retry
         if status_retry and isinstance(info_retry, dict):
             log.info("  ✅ Reintento exitoso en broker (%.2fs)", elapsed_retry)
-            _local_now = time.time()
-            opened_at_ts, opened_at_source = _extract_ticket_opened_at_with_source(info_retry, _local_now)
+            try:
+                _ticket_now_retry = float(now_ts_fn()) if now_ts_fn is not None else time.time()
+            except Exception:
+                _ticket_now_retry = time.time()
+            opened_at_ts, opened_at_source = _extract_ticket_opened_at_with_source(info_retry, _ticket_now_retry)
             close_ts, close_ts_source = _extract_ticket_close_ts_with_source(info_retry, opened_at_ts, duration)
-            _offset = opened_at_ts - _local_now
+            _offset = opened_at_ts - _ticket_now_retry
             log.info(
                 "  ⏱ Ticket: open=%s  close=%s  offset_vs_local=%+.3fs  (src_open=%s  src_close=%s)",
                 datetime.fromtimestamp(opened_at_ts, tz=timezone.utc).strftime("%H:%M:%S.%f")[:-3],
@@ -1249,9 +1264,18 @@ class ConsolidationBot:
         # Blacklist temporal de activos por racha de pérdidas.
         # Hub para registrar candidatos en tiempo real
         self.hub = HubScanner()
+        self.black_box = get_black_box()
         self.last_scan_strat_a: List[CandidateEntry] = []
         self.last_scan_strat_b: List[CandidateEntry] = []
         self.last_scan_strat_c: List[CandidateEntry] = []
+        # Cooldown propio de STRAT-C: evita doble entrada en el mismo activo
+        self._strat_c_last_entry: dict[str, float] = {}
+        # Cache de zonas S/R por activo (TTL 5min) — evita recalcular en cada scan
+        self._strat_c_zones_cache: dict[str, tuple[float, list]] = {}
+        # Cache de velas 1m + payout por activo — usado por el ticker dedicado s30-41
+        self._strat_c_candles_cache: dict[str, tuple[float, list[dict], int]] = {}
+        # Controla que el ticker no dispare dos veces en la misma vela M1
+        self._strat_c_window_vela_fired: float = 0.0
         self._gale_thread: Optional[threading.Thread] = None
         self._gale_thread_loop: Optional[asyncio.AbstractEventLoop] = None
         self._gale_thread_ready = threading.Event()
@@ -1566,7 +1590,8 @@ class ConsolidationBot:
                         entry_mode=getattr(candidate, "_entry_mode", "rebound_floor"),
                         confidence=getattr(candidate, "_reversal_strength", None),
                         signal_type=getattr(candidate, "_reversal_pattern", None),
-                        raw_reason="scan",
+                        raw_reason=str(getattr(candidate, "_pipeline_stage", "scan") or "scan"),
+                        raw_note=str(getattr(candidate, "_pipeline_note", "") or ""),
                         dist_pct=dist,
                     )
                     strat_b_for_hub.append(cd)
@@ -3438,6 +3463,213 @@ class ConsolidationBot:
 
         return ready_candidates
 
+    async def _strat_c_window_ticker(self) -> None:
+        """
+        Ticker dedicado para STRAT-C — ventana s30-41 de cada vela M1.
+
+        Corre cada 0.5s. Cuando el segundo del broker entra en [30, 41]:
+        - Itera sobre activos con datos de velas cacheados (max 90s de antigüedad).
+        - Evalúa evaluar_vela() con broker_ts ya conocido.
+        - Si hay señal y el gate pasa: ejecuta la orden directamente.
+
+        Propósito: garantizar que NUNCA se pierda la ventana de 11s aunque el
+        scan principal esté ocupado con otros activos / lógica de martingala.
+        """
+        log.info("🕐 STRAT-C window ticker iniciado (revisa s30-41 cada 0.5s)")
+        while True:
+            try:
+                await asyncio.sleep(0.5)
+
+                if not STRAT_C_CAN_TRADE:
+                    continue
+                if not _STRAT_C_AVAILABLE or strat_c_detector is None:
+                    continue
+
+                _broker_ts = self._broker_now_ts()
+                _broker_second = int(_broker_ts) % 60
+
+                # Fuera de la ventana → reset del flag de "ya disparé esta vela"
+                if not (REJECTION_ENTRY_WINDOW_START_SEC <= _broker_second <= REJECTION_ENTRY_WINDOW_END_SEC):
+                    self._strat_c_window_vela_fired = 0.0
+                    continue
+
+                # Clave de vela actual = minuto al que pertenece el timestamp del broker
+                _current_vela_key = _broker_ts - (_broker_ts % 60)
+                if self._strat_c_window_vela_fired >= _current_vela_key:
+                    # Ya evaluamos esta vela en la ventana — no disparar dos veces
+                    continue
+
+                # Iterar activos con velas frescas
+                _now = time.time()
+                _best_score: float = -1.0
+                _best_sym: Optional[str] = None
+                _best_result = None
+                _best_payout: int = 0
+                _best_zones: list = []
+
+                for _sym, _cache_entry in list(self._strat_c_candles_cache.items()):
+                    _cache_ts, _c_candles, _c_payout = _cache_entry
+                    # Sólo usar datos frescos (menos de 90s de antigüedad)
+                    if _now - _cache_ts > 90.0:
+                        continue
+                    if _c_payout < MIN_PAYOUT:
+                        continue
+                    if len(_c_candles) < 15:
+                        continue
+                    # Skip activos con cooldown activo
+                    if _now - self._strat_c_last_entry.get(_sym, 0.0) < STRAT_C_DURATION_SEC + 10:
+                        continue
+
+                    try:
+                        # Usar zonas cacheadas si están frescas
+                        _zones_ts, _zones_list = self._strat_c_zones_cache.get(_sym, (0.0, []))
+                        _zonas = _zones_list if (_now - _zones_ts < 300.0 and _zones_list) else None
+
+                        _result = strat_c_detector.evaluar_vela(
+                            _c_candles,
+                            zonas=_zonas,
+                            check_time=True,
+                            broker_ts=_broker_ts,
+                        )
+                        if _result is not None:
+                            _dir, _score, _detalle = _result
+                            if _score > _best_score:
+                                _best_score = _score
+                                _best_sym = _sym
+                                _best_result = _result
+                                _best_payout = _c_payout
+                                _best_zones = _zonas or []
+                    except Exception as _exc:
+                        log.debug("STRAT-C ticker eval error %s: %s", _sym, _exc)
+
+                # Marcar la vela como evaluada aunque no haya señal
+                self._strat_c_window_vela_fired = _current_vela_key
+
+                if _best_result is None or _best_sym is None:
+                    continue
+
+                _c_direction, _c_score, _c_detalle = _best_result
+                _c_direction_lower = _c_direction.lower()
+
+                # Gate de capacidad
+                _strat_c_active = sum(
+                    1 for _t in self.trades.values()
+                    if getattr(_t, 'strategy_origin', '') == 'STRAT-C'
+                )
+                if _strat_c_active >= 1 or len(self.trades) >= MAX_CONCURRENT_TRADES:
+                    log.debug("STRAT-C ticker: señal %s omitida — capacidad llena", _best_sym)
+                    continue
+
+                log.info(
+                    "🔵⚡ STRAT-C TICKER: %s %s score=%.1f/17 s=%d (ventana)",
+                    _best_sym, _c_direction.upper(), _c_score, _broker_second,
+                )
+
+                _c_zone = ConsolidationZone(
+                    asset=_best_sym,
+                    ceiling=float(self._strat_c_candles_cache[_best_sym][1][-1]['high']),
+                    floor=float(self._strat_c_candles_cache[_best_sym][1][-1]['low']),
+                    bars_inside=0,
+                    detected_at=_now,
+                    range_pct=0.0,
+                )
+                _c_amount, _ = self._compute_initial_amount(_best_payout)
+                _c_strategy = self._strategy_snapshot()
+                _c_strategy.update({"strategy_origin": "STRAT-C", "strat_c_score": float(_c_score), "source": "window_ticker"})
+                _c_cached_candles = [
+                    Candle(
+                        ts=0,
+                        open=float(_candle["open"]),
+                        high=float(_candle["high"]),
+                        low=float(_candle["low"]),
+                        close=float(_candle["close"]),
+                    )
+                    for _candle in self._strat_c_candles_cache[_best_sym][1]
+                ]
+
+                _c_candidate = CandidateEntry(
+                    asset=_best_sym,
+                    payout=_best_payout,
+                    zone=_c_zone,
+                    direction=_c_direction_lower,
+                    candles=_c_cached_candles,
+                    score=round(float(_c_score) / 17.0 * 100.0, 1),
+                    score_breakdown={
+                        "raw_score": float(_c_score),
+                        "wick_ratio": float(_c_detalle.get("wick_ratio", 0.0)),
+                        "rsi": float(_c_detalle.get("rsi", 0.0)),
+                    },
+                )
+                setattr(_c_candidate, "_entry_mode", "rejection_30s_ticker")
+                setattr(_c_candidate, "_strat_c_score", float(_c_score))
+                setattr(_c_candidate, "_strat_c_detalle", _c_detalle)
+
+                _c_black_box_id = 0
+                try:
+                    _c_scan_id = self.black_box.record_scan_start(
+                        "C",
+                        int(self.stats.get("scans", 0)),
+                        {
+                            "market_state": "strat_c_window",
+                            "volatility_atr": float(_c_detalle.get("atr", 0.0) or 0.0),
+                        },
+                    )
+                    _c_black_box_id = self.black_box.record_candidate(
+                        _c_scan_id,
+                        "C",
+                        {
+                            "asset": _best_sym,
+                            "direction": _c_direction_lower,
+                            "score": round(float(_c_score) / 17.0 * 100.0, 1),
+                            "confidence": round(float(_c_score) / 17.0, 4),
+                            "payout": _best_payout,
+                            "decision": "ACCEPTED",
+                            "decision_reason": "window_ticker accepted",
+                            "strategy_details": {
+                                "source": "window_ticker",
+                                "raw_score": float(_c_score),
+                                "broker_second": int(_broker_second),
+                                "detalle": _c_detalle,
+                            },
+                            "candles_1m": self._strat_c_candles_cache[_best_sym][1][-5:],
+                        },
+                    )
+                    self.black_box.update_scan_results(_c_scan_id, found=1, accepted=1, rejected=0)
+                except Exception as exc:
+                    log.debug("Black box STRAT-C ticker error %s: %s", _best_sym, exc)
+
+                _c_cid = get_journal().log_candidate(
+                    _c_candidate,
+                    decision="ACCEPTED",
+                    amount=_c_amount,
+                    stage="initial",
+                    outcome="PENDING",
+                    strategy=_c_strategy,
+                )
+                setattr(_c_candidate, "_journal_cid", _c_cid)
+                self._strat_c_last_entry[_best_sym] = _now
+                await self._enter(
+                    _best_sym,
+                    _c_direction_lower,
+                    _c_amount,
+                    _c_zone,
+                    f"STRAT-C⚡ ticker score={_c_score:.1f}/17 {_c_direction.upper()}",
+                    "initial",
+                    journal_cid=_c_cid,
+                    signal_ts=None,
+                    strategy_origin="STRAT-C",
+                    duration_sec=STRAT_C_DURATION_SEC,
+                    payout=_best_payout,
+                    score_original=round(float(_c_score) / 17.0 * 100.0, 1),
+                    black_box_candidate_id=_c_black_box_id,
+                )
+
+            except asyncio.CancelledError:
+                log.info("STRAT-C window ticker cancelado.")
+                return
+            except Exception as _ticker_exc:
+                log.debug("STRAT-C ticker loop error: %s", _ticker_exc)
+
     async def scan_all(self) -> None:
         """
         Escanea todos los activos, puntúa cada candidato con el sensor
@@ -3500,6 +3732,9 @@ class ConsolidationBot:
         strat_b_hits: list[tuple[str, int, float, str, str]] = []
         strat_b_nearmiss: list[tuple[str, int, float, str]] = []
         strat_c_hits: list[tuple[str, int, float, str]] = []
+        strat_c_black_box_scan_id = 0
+        strat_c_black_box_found = 0
+        strat_c_black_box_accepted = 0
         
         # Limpiar registro de candidatos para este ciclo
         self.last_scan_strat_a = []
@@ -3667,15 +3902,37 @@ class ConsolidationBot:
                 # El trading solo se habilita si STRAT_C_CAN_TRADE=True.
                 if _STRAT_C_AVAILABLE and strat_c_detector is not None and len(candles_1m) >= 15:
                     try:
+                        # Verificar ventana de tiempo usando el reloj calibrado del broker.
+                        # La estrategia requiere segundo 30-41 del broker (no hora local).
+                        from datetime import datetime as _dt_c, timezone as _tz_c
+                        _broker_second = _dt_c.fromtimestamp(
+                            self._broker_now_ts(), tz=_tz_c.utc
+                        ).second
+                        _in_entry_window = (
+                            REJECTION_ENTRY_WINDOW_START_SEC
+                            <= _broker_second
+                            <= REJECTION_ENTRY_WINDOW_END_SEC
+                        )
                         _c_candles_dict = [
                             {"open": c.open, "high": c.high, "low": c.low, "close": c.close}
                             for c in candles_1m
                         ]
+                        # Actualizar cache de velas (+ payout) para el ticker dedicado s30-41
+                        self._strat_c_candles_cache[sym] = (time.time(), _c_candles_dict, payout)
+                        # Zonas S/R: cache por activo con TTL de 5 minutos
+                        _zones_cached_ts, _zonas_precomp = self._strat_c_zones_cache.get(sym, (0.0, []))
+                        if time.time() - _zones_cached_ts > 300.0 and _strat_c_detect_zones is not None:
+                            _zonas_precomp = _strat_c_detect_zones(_c_candles_dict)
+                            self._strat_c_zones_cache[sym] = (time.time(), _zonas_precomp)
+                        # check_time=True + broker_ts: verificación definitiva sin UTC-3 hardcodeado.
+                        # _in_entry_window es pre-filtro rápido; evaluar_vela confirma con broker_ts.
+                        _c_broker_ts = self._broker_now_ts()
                         _c_result = strat_c_detector.evaluar_vela(
                             _c_candles_dict,
-                            zonas=None,
-                            check_time=False,
-                        )
+                            zonas=_zonas_precomp if _zonas_precomp else None,
+                            check_time=True,
+                            broker_ts=_c_broker_ts,
+                        ) if _in_entry_window else None
                         if _c_result is not None:
                             _c_direction, _c_score, _c_detalle = _c_result
                             _c_direction_lower = _c_direction.lower()
@@ -3711,11 +3968,76 @@ class ConsolidationBot:
                                 float(_c_detalle.get("rsi", 0.0)),
                                 float(_c_detalle.get("atr", 0.0)),
                             )
-                            # Entrada operativa si STRAT_C_CAN_TRADE y capacidad disponible
-                            if (
+                            # Entrada operativa si STRAT_C_CAN_TRADE y capacidad disponible.
+                            # STRAT-C tiene su propio cooldown y no se bloquea por gale externo.
+                            _strat_c_active = sum(
+                                1 for _t in self.trades.values()
+                                if getattr(_t, 'strategy_origin', '') == 'STRAT-C'
+                            )
+                            _strat_c_cooldown_ok = (
+                                time.time() - self._strat_c_last_entry.get(sym, 0.0)
+                                >= STRAT_C_DURATION_SEC + 10
+                            )
+                            _strat_c_should_enter = (
                                 STRAT_C_CAN_TRADE
+                                and _strat_c_active < 1
+                                and _strat_c_cooldown_ok
                                 and len(self.trades) < MAX_CONCURRENT_TRADES
-                                and not self._gale_order_active
+                            )
+                            if not STRAT_C_CAN_TRADE:
+                                _strat_c_bb_decision = "REJECTED_DISABLED"
+                                _strat_c_bb_reason = "STRAT-C trading deshabilitado"
+                            elif _strat_c_active >= 1 or len(self.trades) >= MAX_CONCURRENT_TRADES:
+                                _strat_c_bb_decision = "REJECTED_CAPACITY"
+                                _strat_c_bb_reason = f"capacidad llena trades={len(self.trades)}/{MAX_CONCURRENT_TRADES}"
+                            elif not _strat_c_cooldown_ok:
+                                _strat_c_bb_decision = "REJECTED_COOLDOWN"
+                                _strat_c_bb_reason = "cooldown STRAT-C activo"
+                            else:
+                                _strat_c_bb_decision = "ACCEPTED"
+                                _strat_c_bb_reason = "scan_all accepted"
+
+                            _strat_c_black_box_id = 0
+                            try:
+                                if strat_c_black_box_scan_id == 0:
+                                    strat_c_black_box_scan_id = self.black_box.record_scan_start(
+                                        "C",
+                                        int(self.stats.get("scans", 0)),
+                                        {
+                                            "market_state": "strat_c_scan",
+                                            "volatility_atr": float(_c_detalle.get("atr", 0.0) or 0.0),
+                                        },
+                                    )
+                                _strat_c_black_box_id = self.black_box.record_candidate(
+                                    strat_c_black_box_scan_id,
+                                    "C",
+                                    {
+                                        "asset": sym,
+                                        "direction": _c_direction_lower,
+                                        "score": round(float(_c_score) / 17.0 * 100.0, 1),
+                                        "confidence": round(float(_c_score) / 17.0, 4),
+                                        "payout": payout,
+                                        "decision": _strat_c_bb_decision,
+                                        "decision_reason": _strat_c_bb_reason,
+                                        "reject_reason": "" if _strat_c_should_enter else _strat_c_bb_reason,
+                                        "strategy_details": {
+                                            "source": "scan_all",
+                                            "raw_score": float(_c_score),
+                                            "broker_second": int(_broker_second),
+                                            "entry_window": bool(_in_entry_window),
+                                            "detalle": _c_detalle,
+                                        },
+                                        "candles_1m": _c_candles_dict[-5:],
+                                    },
+                                )
+                                strat_c_black_box_found += 1
+                                if _strat_c_should_enter:
+                                    strat_c_black_box_accepted += 1
+                            except Exception as exc:
+                                log.debug("Black box STRAT-C scan error %s: %s", sym, exc)
+
+                            if (
+                                _strat_c_should_enter
                             ):
                                 _c_amount, _ = self._compute_initial_amount(payout)
                                 _c_strategy = self._strategy_snapshot()
@@ -3730,6 +4052,7 @@ class ConsolidationBot:
                                     strategy=_c_strategy,
                                 )
                                 setattr(_c_candidate, "_journal_cid", _c_cid)
+                                self._strat_c_last_entry[sym] = time.time()
                                 await self._enter(
                                     sym,
                                     _c_direction_lower,
@@ -3743,6 +4066,7 @@ class ConsolidationBot:
                                     duration_sec=STRAT_C_DURATION_SEC,
                                     payout=payout,
                                     score_original=round(float(_c_score) / 17.0 * 100.0, 1),
+                                    black_box_candidate_id=_strat_c_black_box_id,
                                 )
                                 await sleep_with_inline_countdown(COOLDOWN_BETWEEN_ENTRIES, "⏳ Cooldown post-orden")
                     except Exception as _c_exc:
@@ -3789,6 +4113,8 @@ class ConsolidationBot:
                     setattr(_b_candidate, "_reversal_pattern", strat_b_signal_type or "none")
                     setattr(_b_candidate, "_reversal_strength", strat_b_conf)
                     setattr(_b_candidate, "_entry_mode", strat_b_signal_type or "none")
+                    setattr(_b_candidate, "_pipeline_stage", "preview")
+                    setattr(_b_candidate, "_pipeline_note", strat_b_reason)
                     self.last_scan_strat_b.append(_b_candidate)
                     _b_strategy = self._strategy_snapshot()
                     _b_strategy.update({
@@ -3800,9 +4126,12 @@ class ConsolidationBot:
                         "strat_b_is_signal": strat_b_signal,
                     })
                     if not STRAT_B_CAN_TRADE:
-                        pass
+                        setattr(_b_candidate, "_pipeline_stage", "blocked_readonly")
+                        setattr(_b_candidate, "_pipeline_note", "STRAT-B trading deshabilitado")
                     elif not strat_b_signal:
                         # Near-miss: señal insuficiente para activar
+                        setattr(_b_candidate, "_pipeline_stage", "rejected_no_signal")
+                        setattr(_b_candidate, "_pipeline_note", strat_b_reason)
                         get_journal().log_candidate(
                             _b_candidate,
                             decision="REJECTED_SCORE",
@@ -3814,6 +4143,8 @@ class ConsolidationBot:
                         )
                     elif strat_b_conf < strat_b_required_conf:
                         # Señal detectada pero confianza insuficiente
+                        setattr(_b_candidate, "_pipeline_stage", "rejected_conf")
+                        setattr(_b_candidate, "_pipeline_note", strat_b_reason)
                         get_journal().log_candidate(
                             _b_candidate,
                             decision="REJECTED_SCORE",
@@ -3826,6 +4157,8 @@ class ConsolidationBot:
                     elif (len(self.trades) >= MAX_CONCURRENT_TRADES or self._gale_order_active):
                         # Señal válida pero trades llenos o gale activo
                         _br = "gale activo" if self._gale_order_active else f"trades={len(self.trades)}/{MAX_CONCURRENT_TRADES}"
+                        setattr(_b_candidate, "_pipeline_stage", "rejected_limit")
+                        setattr(_b_candidate, "_pipeline_note", _br)
                         get_journal().log_candidate(
                             _b_candidate,
                             decision="REJECTED_LIMIT",
@@ -3894,6 +4227,8 @@ class ConsolidationBot:
                     )
 
                     b_outcome = "DRY_RUN" if self.dry_run else "PENDING"
+                    setattr(_b_candidate, "_pipeline_stage", "accepted")
+                    setattr(_b_candidate, "_pipeline_note", f"conf={strat_b_conf*100:.1f}% req={strat_b_required_conf*100:.1f}%")
                     b_cid = get_journal().log_candidate(
                         b_candidate,
                         decision="ACCEPTED",
@@ -3903,7 +4238,7 @@ class ConsolidationBot:
                         strategy=b_strategy,
                     )
 
-                    await self._enter(
+                    b_entered = await self._enter(
                         sym,
                         strat_b_direction,
                         b_amount,
@@ -3917,6 +4252,12 @@ class ConsolidationBot:
                         payout=payout,
                         score_original=round(strat_b_conf * 100.0, 1),
                     )
+                    if b_entered:
+                        setattr(_b_candidate, "_pipeline_stage", "entered")
+                        setattr(_b_candidate, "_pipeline_note", "orden enviada")
+                    else:
+                        setattr(_b_candidate, "_pipeline_stage", "enter_failed")
+                        setattr(_b_candidate, "_pipeline_note", "fallo al enviar orden")
                     await sleep_with_inline_countdown(COOLDOWN_BETWEEN_ENTRIES, "⏳ Cooldown post-orden")
 
                 # STRAT-A requiere historial 5m mínimo para consolidación y MA.
@@ -4174,6 +4515,7 @@ class ConsolidationBot:
                 setattr(candidate, "_ma_state", ma_state)
                 setattr(candidate, "_order_blocks", blocks)
                 setattr(candidate, "_ob_tf", ob_tf_label)
+                setattr(candidate, "_pipeline_stage", "preview")
                 setattr(
                     candidate,
                     "_force_execute",
@@ -4413,6 +4755,7 @@ class ConsolidationBot:
                     ma_info,
                 )
 
+                setattr(candidate, "_pipeline_stage", "scored")
                 candidates.append(candidate)
                 await asyncio.sleep(0.30)  # breve pausa para separar respuestas WebSocket
         finally:
@@ -4569,6 +4912,10 @@ class ConsolidationBot:
 
         # 4) Seleccionar mejores
         selected, rejected = select_best(candidates, threshold=session_threshold)
+        for c in selected:
+            setattr(c, "_pipeline_stage", "selected")
+        for c in rejected:
+            setattr(c, "_pipeline_stage", "rejected_score")
 
         forced_breakouts = [c for c in candidates if bool(getattr(c, "_force_execute", False))]
         if forced_breakouts:
@@ -4628,6 +4975,7 @@ class ConsolidationBot:
             for c in moved_away:
                 distance = self._candidate_trigger_distance_pct(c)
                 dist_txt = f"{distance * 100:.3f}%" if distance is not None else "n/a"
+                setattr(c, "_pipeline_stage", "rejected_window")
                 log.info(
                     "⏭ %s %s fuera de ventana de disparo (%s) — se pospone.",
                     c.direction.upper(),
@@ -4644,6 +4992,8 @@ class ConsolidationBot:
                 )
 
         selected = near_selected
+        for c in selected:
+            setattr(c, "_pipeline_stage", "selected_near_trigger")
 
         # Registrar rechazados por score
         for c in rejected:
@@ -4689,6 +5039,7 @@ class ConsolidationBot:
             )
             # Guardar el mejor candidato como "vigilado" para entrar cuando cierre el trade activo.
             best_watched = max(selected, key=lambda x: x.score)
+            setattr(best_watched, "_pipeline_stage", "watched_limit")
             self.watched_candidates[best_watched.asset] = (best_watched, time.time())
             rev_w = getattr(best_watched, "_reversal_pattern", "none")
             log.info(
@@ -4699,6 +5050,7 @@ class ConsolidationBot:
             )
             # Registrar rechazados por límite
             for c in selected:
+                setattr(c, "_pipeline_stage", "rejected_limit")
                 journal.log_candidate(
                     c,
                     decision="REJECTED_LIMIT",
@@ -4709,12 +5061,23 @@ class ConsolidationBot:
                 )
             self.stats["skipped"] += len(selected)
             self._record_scan_acceptances(0)
+            if strat_c_black_box_scan_id:
+                try:
+                    self.black_box.update_scan_results(
+                        strat_c_black_box_scan_id,
+                        found=strat_c_black_box_found,
+                        accepted=strat_c_black_box_accepted,
+                        rejected=max(0, strat_c_black_box_found - strat_c_black_box_accepted),
+                    )
+                except Exception as exc:
+                    log.debug("Black box STRAT-C final update error: %s", exc)
             self._record_hub_scan_cycle(total_assets_available)
             return
 
         for winner in selected:
             if len(self.trades) >= MAX_CONCURRENT_TRADES or self._gale_order_active:
                 _br = "gale activo" if self._gale_order_active else f"trades abiertos={len(self.trades)}/{MAX_CONCURRENT_TRADES}"
+                setattr(winner, "_pipeline_stage", "rejected_limit")
                 journal.log_candidate(
                     winner,
                     decision="REJECTED_LIMIT",
@@ -4739,6 +5102,7 @@ class ConsolidationBot:
                 )
             # Pre-registrar como ACCEPTED (outcome se actualiza después)
             outcome = "DRY_RUN" if self.dry_run else "PENDING"
+            setattr(winner, "_pipeline_stage", "accepted")
             cid = journal.log_candidate(
                 winner,
                 decision="ACCEPTED",
@@ -4763,10 +5127,24 @@ class ConsolidationBot:
                 score_original=winner.score,
             )
             if entered:
+                setattr(winner, "_pipeline_stage", "entered")
+            else:
+                setattr(winner, "_pipeline_stage", "enter_failed")
+            if entered:
                 await sleep_with_inline_countdown(COOLDOWN_BETWEEN_ENTRIES, "⏳ Cooldown post-orden")
 
         self.stats["skipped"] += len(rejected)
         self._record_scan_acceptances(accepted_this_scan)
+        if strat_c_black_box_scan_id:
+            try:
+                self.black_box.update_scan_results(
+                    strat_c_black_box_scan_id,
+                    found=strat_c_black_box_found,
+                    accepted=strat_c_black_box_accepted,
+                    rejected=max(0, strat_c_black_box_found - strat_c_black_box_accepted),
+                )
+            except Exception as exc:
+                log.debug("Black box STRAT-C final update error: %s", exc)
         self._record_hub_scan_cycle(total_assets_available)
 
     async def ensure_connection(self) -> bool:
@@ -4911,6 +5289,11 @@ class ConsolidationBot:
             journal.update_outcome_by_id(row_id=trade.journal_id, outcome=outcome, profit=profit)
         else:
             journal.update_outcome(order_id=trade.order_id, outcome=outcome, profit=profit)
+        if trade.black_box_order_key:
+            try:
+                self.black_box.record_order_result(trade.black_box_order_key, outcome, profit)
+            except Exception as exc:
+                log.debug("Black box STRAT-C resolve error %s: %s", sym, exc)
 
         pre_objectives, pre_ok, pre_note = self._build_pre_objectives_audit(trade)
         ticket_opened_at = datetime.fromtimestamp(trade.opened_at, tz=BROKER_TZ).isoformat(timespec="milliseconds")
@@ -5272,6 +5655,7 @@ class ConsolidationBot:
             duration,
             self.dry_run,
             account_type=account_type,
+            now_ts_fn=self._broker_now_ts,
         )
         if ok:
             # Marcar que hay una orden de gale activa en el broker.
@@ -5295,6 +5679,7 @@ class ConsolidationBot:
         self, sym: str, direction: str, amount: float,
         zone: ConsolidationZone, reason: str, stage: str,
         journal_cid: int = 0,
+        black_box_candidate_id: int = 0,
         signal_ts: Optional[int] = None,
         strategy_origin: str = "STRAT-A",
         duration_sec: int = DURATION_SEC,
@@ -5324,6 +5709,16 @@ class ConsolidationBot:
                         (same_asset_reason, journal_cid),
                     )
                     _j._conn.commit()
+            if black_box_candidate_id:
+                try:
+                    self.black_box.update_candidate(
+                        black_box_candidate_id,
+                        decision="REJECTED_LIMIT",
+                        reject_reason=same_asset_reason,
+                        order_result="LIMIT_SKIPPED",
+                    )
+                except Exception as exc:
+                    log.debug("Black box STRAT-C limit update error %s: %s", sym, exc)
             return False
 
         can_enter_structure, structure_reason = self._can_enter_structure_now(sym, zone)
@@ -5342,6 +5737,16 @@ class ConsolidationBot:
                         (structure_reason, journal_cid),
                     )
                     _j._conn.commit()
+            if black_box_candidate_id:
+                try:
+                    self.black_box.update_candidate(
+                        black_box_candidate_id,
+                        decision="REJECTED_STRUCTURE",
+                        reject_reason=structure_reason,
+                        order_result="STRUCTURE_SKIPPED",
+                    )
+                except Exception as exc:
+                    log.debug("Black box STRAT-C structure update error %s: %s", sym, exc)
             return False
 
         timing: Optional[EntryTimingInfo] = None
@@ -5376,8 +5781,21 @@ class ConsolidationBot:
                             (reject_reason, journal_cid),
                         )
                         _j._conn.commit()
+                if black_box_candidate_id:
+                    try:
+                        self.black_box.update_candidate(
+                            black_box_candidate_id,
+                            decision="REJECTED_TIMING",
+                            reject_reason=f"timing 1m inválido: lag +{timing.lag_sec:.2f}s",
+                            order_result="TIMING_SKIPPED",
+                        )
+                    except Exception as exc:
+                        log.debug("Black box STRAT-C timing update error %s: %s", sym, exc)
                 return False
-            duration_sec = timing.duration_sec
+            # Respetar duraciones explícitas del caller (p.ej. STRAT-C=60s).
+            # Solo reemplazar cuando el caller viene con el default global.
+            if int(duration_sec) == int(DURATION_SEC):
+                duration_sec = timing.duration_sec
 
         payout_now = await self._get_asset_payout(sym, payout)
         if payout_now < MIN_PAYOUT:
@@ -5397,6 +5815,16 @@ class ConsolidationBot:
                         (reject_reason, journal_cid),
                     )
                     _j._conn.commit()
+            if black_box_candidate_id:
+                try:
+                    self.black_box.update_candidate(
+                        black_box_candidate_id,
+                        decision="REJECTED_PAYOUT",
+                        reject_reason=reject_reason,
+                        order_result="PAYOUT_SKIPPED",
+                    )
+                except Exception as exc:
+                    log.debug("Black box STRAT-C payout update error %s: %s", sym, exc)
             return False
 
         payout = int(payout_now)
@@ -5413,6 +5841,7 @@ class ConsolidationBot:
             duration_sec,
             self.dry_run,
             account_type=self.account_type,
+            now_ts_fn=self._broker_now_ts,
         )
         if not ok:
             log.error("  ✗ Fallo al colocar orden en %s | reason=%s", sym, reject_reason)
@@ -5427,10 +5856,21 @@ class ConsolidationBot:
                         (reject_reason[:500] if reject_reason else "broker_rejected", journal_cid)
                     )
                     _j._conn.commit()
+            if black_box_candidate_id:
+                try:
+                    self.black_box.update_candidate(
+                        black_box_candidate_id,
+                        decision="REJECTED_BROKER",
+                        reject_reason=reject_reason[:500] if reject_reason else "broker_rejected",
+                        order_result="BROKER_REJECTED",
+                    )
+                except Exception as exc:
+                    log.debug("Black box STRAT-C broker reject update error %s: %s", sym, exc)
             return False
 
         self._register_successful_entry_asset(sym, zone)
 
+        black_box_order_key = oid if oid else f"REF-{order_ref}" if order_ref else "BROKER_NO_ID"
         self.trades[sym] = TradeState(
             asset=sym, direction=direction, amount=amount,
             entry_price=open_price, ceiling=zone.ceiling, floor=zone.floor,
@@ -5443,6 +5883,8 @@ class ConsolidationBot:
             opened_at=float(ticket_opened_at_ts or time.time()),
             opened_at_source=str(ticket_opened_at_source or "fallback:local_clock"),
             close_ts=float(ticket_close_ts or 0.0),
+            black_box_candidate_id=int(black_box_candidate_id or 0),
+            black_box_order_key=black_box_order_key,
         )
         trade = self.trades[sym]
         try:
@@ -5475,6 +5917,15 @@ class ConsolidationBot:
                     duration_sec=int(duration_sec),
                     pre_objectives_note=f"ticket_opened_at_source={trade.opened_at_source}",
                 )
+        if black_box_candidate_id:
+            try:
+                self.black_box.update_candidate(
+                    black_box_candidate_id,
+                    order_id=black_box_order_key,
+                    order_result="PENDING",
+                )
+            except Exception as exc:
+                log.debug("Black box STRAT-C pending update error %s: %s", sym, exc)
 
         self.stats["entries"] += 1
         if strategy_origin == "STRAT-B":
@@ -5735,6 +6186,12 @@ async def main(
     # Reconciliar pendientes históricos al arrancar para limpiar métricas.
     await bot.reconcile_pending_candidates()
 
+    # Ticker dedicado STRAT-C: evalúa la ventana s30-41 de forma independiente al scan principal.
+    # Se inicia siempre — el ticker verifica STRAT_C_CAN_TRADE internamente y es un no-op si False.
+    _strat_c_ticker_task = asyncio.create_task(
+        bot._strat_c_window_ticker(), name="strat_c_window_ticker"
+    )
+
     try:
         # Alinear también el PRIMER escaneo al reloj de vela para evitar señales
         # fuera de ventana al iniciar el bot en un segundo arbitrario.
@@ -5810,6 +6267,11 @@ async def main(
     except KeyboardInterrupt:
         log.info("Detenido por el usuario (Ctrl+C).")
     finally:
+        _strat_c_ticker_task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(_strat_c_ticker_task), timeout=1.0)
+        except Exception:
+            pass
         try:
             await asyncio.wait_for(bot.shutdown_background_tasks(), timeout=3.0)
         except Exception:

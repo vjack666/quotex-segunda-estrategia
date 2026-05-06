@@ -52,6 +52,7 @@ class CandidateData:
     confidence: Optional[float] = None
     signal_type: Optional[str] = None
     raw_reason: Optional[str] = None
+    raw_note: Optional[str] = None
     dist_pct: Optional[float] = None  # distancia % del precio al trigger (None si sin precio)
 
     def __post_init__(self) -> None:
