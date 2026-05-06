@@ -12,7 +12,7 @@ import time as _time
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Tuple, Dict, Any
 
-from .indicadores_calc import rsi, ema, bollinger_bands, stochastic_d, atr
+from .indicadores_calc import ema, bollinger_bands, stochastic_d, atr
 from .zonas import detectar_zonas_sr
 
 # ── Parámetros por defecto (sobrescribibles desde main.py) ──────────────────
@@ -20,29 +20,38 @@ ENTRY_WINDOW_START_SEC: int   = 30
 ENTRY_WINDOW_END_SEC: int     = 41
 MIN_WICK_TO_BODY_RATIO: float = 1.5
 MIN_SCORE: float              = 6.0
-ATR_MIN: float                = 0.00004   # mercado muy plano → no entrar
-ATR_MAX: float                = 0.00040   # spike/noticia → no entrar
+# Filtro ATR normalizado (wick medido en unidades de ATR del propio activo)
+# Reemplaza ATR_MIN/ATR_MAX absolutos — funciona en Forex, crypto y acciones.
+WICK_ATR_MIN: float           = 0.15   # wick < 15% de un ATR → ruido, no estructura
+WICK_ATR_MAX: float           = 3.50   # wick > 3.5 ATR → spike/noticia, no tradeable
+# Legado (ya no se usan para filtrar, solo conservados por compatibilidad si alguien los lee)
+ATR_MIN: float                = 0.00004
+ATR_MAX: float                = 0.00040
 # BROKER_TZ ya no se usa — el segundo se extrae directamente del timestamp UNIX.
 # int(ts) % 60 da el segundo dentro del minuto sin depender de zona horaria.
 BROKER_TZ                     = timezone(timedelta(hours=-3))  # conservado por compatibilidad
 
 # Parametros de indicadores (calibrables)
 ATR_PERIOD: int = 7
-RSI_PERIOD: int = 7
-RSI_EXTREME_LOW: float = 25.0
-RSI_LOW: float = 30.0
-RSI_EXTREME_HIGH: float = 75.0
-RSI_HIGH: float = 70.0
 
 BB_PERIOD: int = 20
 BB_STD_DEV: float = 2.0
 
+# Estocástico Rápido (5,3) — timing de entrada en la ventana 30s
 STOCH_K_PERIOD: int = 5
 STOCH_D_PERIOD: int = 3
 STOCH_EXTREME_LOW: float = 20.0
 STOCH_LOW: float = 30.0
 STOCH_EXTREME_HIGH: float = 80.0
 STOCH_HIGH: float = 70.0
+
+# Estocástico Lento (14,3) — reemplaza RSI, confirma momentum/tendencia
+STOCH_SLOW_K_PERIOD: int = 14
+STOCH_SLOW_D_PERIOD: int = 3
+STOCH_SLOW_EXTREME_LOW: float = 20.0
+STOCH_SLOW_LOW: float = 30.0
+STOCH_SLOW_EXTREME_HIGH: float = 80.0
+STOCH_SLOW_HIGH: float = 70.0
 
 EMA_FAST_PERIOD: int = 8
 EMA_SLOW_PERIOD: int = 21
@@ -105,21 +114,25 @@ def evaluar_vela(
     upper_wick = current['high'] - max(current['open'], current['close'])
     lower_wick = min(current['open'], current['close']) - current['low']
 
-    # Determinar dirección dominante del rechazo
-    if lower_wick >= upper_wick and lower_wick / body >= MIN_WICK_TO_BODY_RATIO:
-        direction = 'CALL'
-        wick = lower_wick
-    elif upper_wick > lower_wick and upper_wick / body >= MIN_WICK_TO_BODY_RATIO:
-        direction = 'PUT'
-        wick = upper_wick
-    else:
+    lower_ratio = lower_wick / body
+    upper_ratio = upper_wick / body
+    call_wick_ok = lower_ratio >= MIN_WICK_TO_BODY_RATIO
+    put_wick_ok = upper_ratio >= MIN_WICK_TO_BODY_RATIO
+    if not call_wick_ok and not put_wick_ok:
         return None  # sin wick de rechazo significativo
 
-    wick_ratio = wick / body
-
-    # ── 3. Filtro ATR ─────────────────────────────────────────────────────────
+    # ── 3. Filtro ATR normalizado ──────────────────────────────────────────────
+    # Mide la mecha activa en unidades de ATR del propio activo (scale-free).
+    # Un wick de 0.15–3.5 ATR es estructura real; fuera de ese rango es ruido o spike.
     current_atr = atr(highs, lows, closes, period=ATR_PERIOD)
-    if current_atr < ATR_MIN or current_atr > ATR_MAX:
+    if current_atr <= 0:
+        return None
+    active_wick = max(
+        lower_wick if call_wick_ok else 0.0,
+        upper_wick if put_wick_ok else 0.0,
+    )
+    wick_atr_ratio = active_wick / current_atr
+    if wick_atr_ratio < WICK_ATR_MIN or wick_atr_ratio > WICK_ATR_MAX:
         return None
 
     # ── 4. Zona S/R cercana ───────────────────────────────────────────────────
@@ -132,75 +145,154 @@ def evaluar_vela(
         )
 
     tolerance = current_atr * ZONE_TOLERANCE_ATR_MULT
-    zona_precio = current['low'] if direction == 'CALL' else current['high']
-    zona_activa = any(abs(zona_precio - z) <= tolerance for z in zonas)
-    if not zona_activa:
+
+    call_zone_active = call_wick_ok and any(abs(current['low'] - z) <= tolerance for z in zonas)
+    put_zone_active = put_wick_ok and any(abs(current['high'] - z) <= tolerance for z in zonas)
+    if not call_zone_active and not put_zone_active:
         return None
+
+    # Indicadores base antes de resolver una vela ambigua de doble rechazo.
+    bb_upper, _bb_mid, bb_lower = bollinger_bands(closes, period=BB_PERIOD, std_dev=BB_STD_DEV)
+    # Estocástico Rápido (5,3): timing de entrada
+    k_val, d_val = stochastic_d(highs, lows, closes, k_period=STOCH_K_PERIOD, d_period=STOCH_D_PERIOD)
+    stoch_valid = k_val is not None and d_val is not None and (k_val > 0.0 or d_val > 0.0)
+    # Estocástico Lento (14,3): confirmación de momentum (reemplaza RSI)
+    sk_val, sd_val = stochastic_d(highs, lows, closes, k_period=STOCH_SLOW_K_PERIOD, d_period=STOCH_SLOW_D_PERIOD)
+    stoch_slow_valid = sk_val is not None and sd_val is not None and (sk_val > 0.0 or sd_val > 0.0)
+    ema8 = ema(closes, EMA_FAST_PERIOD)
+    ema21 = ema(closes, EMA_SLOW_PERIOD)
+
+    call_bias = 0.0
+    put_bias = 0.0
+
+    # Stoch Lento — confirmación de momentum (mismo rol que RSI)
+    if stoch_slow_valid:
+        if sk_val < STOCH_SLOW_EXTREME_LOW and sd_val < STOCH_SLOW_EXTREME_LOW:
+            call_bias += 2.0
+        elif sk_val < STOCH_SLOW_LOW:
+            call_bias += 1.0
+        if sk_val > STOCH_SLOW_EXTREME_HIGH and sd_val > STOCH_SLOW_EXTREME_HIGH:
+            put_bias += 2.0
+        elif sk_val > STOCH_SLOW_HIGH:
+            put_bias += 1.0
+
+    if bb_lower is not None and current['low'] <= bb_lower:
+        call_bias += 2.0
+    if bb_upper is not None and current['high'] >= bb_upper:
+        put_bias += 2.0
+
+    # Stoch Rápido — timing de entrada
+    if stoch_valid:
+        if k_val < STOCH_EXTREME_LOW and d_val < STOCH_EXTREME_LOW:
+            call_bias += 2.0
+        elif k_val < STOCH_LOW:
+            call_bias += 1.0
+        if k_val > STOCH_EXTREME_HIGH and d_val > STOCH_EXTREME_HIGH:
+            put_bias += 2.0
+        elif k_val > STOCH_HIGH:
+            put_bias += 1.0
+
+    if ema8 > ema21:
+        call_bias += 1.0
+    elif ema8 < ema21:
+        put_bias += 1.0
+
+    dual_wick = call_wick_ok and put_wick_ok
+    if dual_wick:
+        if call_zone_active and put_zone_active and call_bias != put_bias:
+            direction = 'CALL' if call_bias > put_bias else 'PUT'
+        elif call_zone_active and not put_zone_active:
+            direction = 'CALL'
+        elif put_zone_active and not call_zone_active:
+            direction = 'PUT'
+        elif abs(lower_ratio - upper_ratio) >= 1.0:
+            direction = 'CALL' if lower_ratio > upper_ratio else 'PUT'
+        else:
+            return None
+    elif call_zone_active:
+        direction = 'CALL'
+    elif put_zone_active:
+        direction = 'PUT'
+    else:
+        return None
+
+    wick = lower_wick if direction == 'CALL' else upper_wick
+    wick_ratio = lower_ratio if direction == 'CALL' else upper_ratio
+    zona_precio = current['low'] if direction == 'CALL' else current['high']
 
     # ── 5. Calcular score de confluencia ──────────────────────────────────────
     score: float = 0.0
     detalle: Dict[str, Any] = {
         'direction': direction,
         'wick_ratio': round(wick_ratio, 2),
+        'wick_atr_ratio': round(wick_atr_ratio, 2),
         'atr': round(current_atr, 6),
+        'dual_wick': dual_wick,
+        'call_bias': round(call_bias, 2),
+        'put_bias': round(put_bias, 2),
     }
 
-    # Wick quality
-    if wick_ratio > 3.0:
+    # Wick quality — combinación de wick/body Y wick/ATR (normalizado por volatilidad)
+    # wick/body > 3.0: mecha muy prominente relativa al cuerpo
+    # wick/ATR  > 0.8: la mecha es "grande" dentro de la volatilidad normal del activo
+    strong_body_ratio = wick_ratio > 3.0
+    strong_atr_ratio  = wick_atr_ratio > 0.8
+    if strong_body_ratio and strong_atr_ratio:
         score += 2.0
         detalle['wick_quality'] = 'total'
-    else:
+    elif strong_body_ratio or strong_atr_ratio:
         score += 1.0
         detalle['wick_quality'] = 'parcial'
+    else:
+        score += 0.0
+        detalle['wick_quality'] = 'debil'
 
     # Zona base (+2 mínimo — ya la verificamos antes)
     score += 2.0
     detalle['zona'] = round(zona_precio, 5)
 
-    # RSI(7)
-    rsi_val = rsi(closes, period=RSI_PERIOD)
-    detalle['rsi'] = round(rsi_val, 1)
-    if direction == 'CALL':
-        if rsi_val < RSI_EXTREME_LOW:
-            score += 2.0
-        elif rsi_val < RSI_LOW:
-            score += 1.0
-    else:
-        if rsi_val > RSI_EXTREME_HIGH:
-            score += 2.0
-        elif rsi_val > RSI_HIGH:
-            score += 1.0
+    # Estocástico Lento (14,3) — confirmación de momentum (reemplaza RSI)
+    detalle['stoch_slow_k'] = round(sk_val, 1) if stoch_slow_valid else None
+    detalle['stoch_slow_d'] = round(sd_val, 1) if stoch_slow_valid else None
+    if stoch_slow_valid:
+        if direction == 'CALL':
+            if sk_val < STOCH_SLOW_EXTREME_LOW and sd_val < STOCH_SLOW_EXTREME_LOW:
+                score += 2.0
+            elif sk_val < STOCH_SLOW_LOW:
+                score += 1.0
+        else:
+            if sk_val > STOCH_SLOW_EXTREME_HIGH and sd_val > STOCH_SLOW_EXTREME_HIGH:
+                score += 2.0
+            elif sk_val > STOCH_SLOW_HIGH:
+                score += 1.0
 
     # Bollinger Bands(20)
-    bb_upper, _bb_mid, bb_lower = bollinger_bands(closes, period=BB_PERIOD, std_dev=BB_STD_DEV)
     detalle['bb_lower'] = round(bb_lower, 5) if bb_lower else None
     detalle['bb_upper'] = round(bb_upper, 5) if bb_upper else None
     if bb_lower is not None:
-        if direction == 'CALL' and current['close'] <= bb_lower:
+        if direction == 'CALL' and current['low'] <= bb_lower:
             score += 2.0
             detalle['bb_signal'] = 'en_banda_inferior'
-        elif direction == 'PUT' and current['close'] >= bb_upper:
+        elif direction == 'PUT' and current['high'] >= bb_upper:
             score += 2.0
             detalle['bb_signal'] = 'en_banda_superior'
 
-    # Stochastic(5, 3)
-    k_val, d_val = stochastic_d(highs, lows, closes, k_period=STOCH_K_PERIOD, d_period=STOCH_D_PERIOD)
-    detalle['stoch_k'] = round(k_val, 1)
-    detalle['stoch_d'] = round(d_val, 1)
-    if direction == 'CALL':
-        if k_val < STOCH_EXTREME_LOW and d_val < STOCH_EXTREME_LOW:
-            score += 2.0
-        elif k_val < STOCH_LOW:
-            score += 1.0
-    else:
-        if k_val > STOCH_EXTREME_HIGH and d_val > STOCH_EXTREME_HIGH:
-            score += 2.0
-        elif k_val > STOCH_HIGH:
-            score += 1.0
+    # Stochastic(5, 3) — solo puntúa si el valor es válido
+    detalle['stoch_k'] = round(k_val, 1) if stoch_valid else None
+    detalle['stoch_d'] = round(d_val, 1) if stoch_valid else None
+    if stoch_valid:
+        if direction == 'CALL':
+            if k_val < STOCH_EXTREME_LOW and d_val < STOCH_EXTREME_LOW:
+                score += 2.0
+            elif k_val < STOCH_LOW:
+                score += 1.0
+        else:
+            if k_val > STOCH_EXTREME_HIGH and d_val > STOCH_EXTREME_HIGH:
+                score += 2.0
+            elif k_val > STOCH_HIGH:
+                score += 1.0
 
     # EMA(8) vs EMA(21) — micro-tendencia
-    ema8  = ema(closes, EMA_FAST_PERIOD)
-    ema21 = ema(closes, EMA_SLOW_PERIOD)
     detalle['ema8']  = round(ema8, 5)
     detalle['ema21'] = round(ema21, 5)
     if direction == 'CALL' and ema8 > ema21:

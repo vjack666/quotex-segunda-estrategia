@@ -228,19 +228,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--adaptive-threshold-base",
         type=int,
-        default=60,
+        default=50,
         help="Umbral base de score para STRAT-A",
     )
     p.add_argument(
         "--adaptive-threshold-low",
         type=int,
-        default=58,
+        default=48,
         help="Umbral bajo dinámico de score para STRAT-A",
     )
     p.add_argument(
         "--adaptive-threshold-high",
         type=int,
-        default=64,
+        default=54,
         help="Umbral alto dinámico de score para STRAT-A",
     )
 
@@ -332,20 +332,20 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--strat-c-min-score",
         type=float,
-        default=4.0,
-        help="Puntuación mínima de confluencia para STRAT-C [0-17]",
+        default=7.0,
+        help="Puntuacion minima de confluencia para STRAT-C [0-17] (thesis=7)",
     )
     p.add_argument(
-        "--strat-c-atr-min",
+        "--strat-c-wick-atr-min",
         type=float,
-        default=0.0,
-        help="ATR mínimo para STRAT-C (filtra mercados planos)",
+        default=0.15,
+        help="Wick minimo en unidades de ATR (filtra mechas de ruido)",
     )
     p.add_argument(
-        "--strat-c-atr-max",
+        "--strat-c-wick-atr-max",
         type=float,
-        default=999.0,
-        help="ATR máximo para STRAT-C (filtra spikes/noticias)",
+        default=3.50,
+        help="Wick maximo en unidades de ATR (filtra spikes/noticias)",
     )
     return p
 
@@ -391,11 +391,12 @@ def _apply_runtime_config(args: argparse.Namespace) -> None:
         from estrategia_30s import detector as strat_c_detector
         # Set calibrado desde grid-search sobre snapshots reales.
         strat_c_detector.ATR_PERIOD = 7
-        strat_c_detector.RSI_PERIOD = 7
         strat_c_detector.BB_PERIOD = 14
         strat_c_detector.BB_STD_DEV = 2.0
         strat_c_detector.STOCH_K_PERIOD = 5
         strat_c_detector.STOCH_D_PERIOD = 3
+        strat_c_detector.STOCH_SLOW_K_PERIOD = 14
+        strat_c_detector.STOCH_SLOW_D_PERIOD = 3
         strat_c_detector.EMA_FAST_PERIOD = 8
         strat_c_detector.EMA_SLOW_PERIOD = 21
         strat_c_detector.SR_LOOKBACK = 40
@@ -404,9 +405,9 @@ def _apply_runtime_config(args: argparse.Namespace) -> None:
         strat_c_detector.ZONE_TOLERANCE_ATR_MULT = 1.2
         strat_c_detector.MIN_WICK_TO_BODY_RATIO = 0.8
 
-        strat_c_detector.MIN_SCORE = max(0.0, float(args.strat_c_min_score))
-        strat_c_detector.ATR_MIN   = max(0.0, float(args.strat_c_atr_min))
-        strat_c_detector.ATR_MAX   = max(0.0, float(args.strat_c_atr_max))
+        strat_c_detector.MIN_SCORE     = max(0.0, float(args.strat_c_min_score))
+        strat_c_detector.WICK_ATR_MIN  = max(0.0, float(args.strat_c_wick_atr_min))
+        strat_c_detector.WICK_ATR_MAX  = max(0.0, float(args.strat_c_wick_atr_max))
     except ImportError:
         pass  # módulo aún en desarrollo
 
@@ -483,7 +484,7 @@ async def _run_cycle_with_loading(cb, *, dry_run: bool, real_account: bool):
     return await task
 
 
-async def _hub_ticker(bot_ref: list, interval: float = 1.0) -> None:
+async def _hub_ticker(bot_ref: list, interval: float = 0.5) -> None:
     """Refresca el HUB en segundo plano cada `interval` segundos sin esperar ciclos.
     Si llega un resultado de trade (WIN/LOSS) antes del intervalo, re-renderiza al instante.
     """
@@ -496,6 +497,7 @@ async def _hub_ticker(bot_ref: list, interval: float = 1.0) -> None:
             if bot is not None and hasattr(bot, 'hub') and hasattr(bot.hub, 'trade_result_event'):
                 trade_event = bot.hub.trade_result_event
 
+            trade_triggered = False
             if trade_event is not None:
                 # Esperar lo que llegue primero: resultado de trade o el intervalo normal.
                 sleep_task = asyncio.create_task(asyncio.sleep(interval))
@@ -504,8 +506,11 @@ async def _hub_ticker(bot_ref: list, interval: float = 1.0) -> None:
                     {sleep_task, event_wait},
                     return_when=asyncio.FIRST_COMPLETED,
                 )
+                trade_triggered = event_wait in done and event_wait.done() and not event_wait.cancelled()
                 for t in pending:
                     t.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
                 # Limpiar el evento para el siguiente ciclo.
                 trade_event.clear()
             else:
@@ -513,9 +518,14 @@ async def _hub_ticker(bot_ref: list, interval: float = 1.0) -> None:
 
             bot = bot_ref[0] if bot_ref else None
             if bot is not None:
+                # Render inmediato al cerrar trade para evitar sensación de "congelado".
+                if trade_triggered:
+                    await _render_hub_once(bot)
                 if hasattr(bot, "refresh_balance_for_hub"):
                     try:
-                        await bot.refresh_balance_for_hub()
+                        # Timeout corto: el HUB nunca debe quedar esperando red.
+                        timeout_sec = 0.35 if trade_triggered else 0.8
+                        await asyncio.wait_for(bot.refresh_balance_for_hub(), timeout=timeout_sec)
                     except Exception:
                         pass
                 await _render_hub_once(bot)
@@ -557,7 +567,7 @@ async def _run_forever_with_initial_loading(cb, *, dry_run: bool, real_account: 
         await asyncio.sleep(1)
 
     # Ticker de fondo: refresca el HUB cada 1s independiente de los ciclos.
-    ticker = asyncio.create_task(_hub_ticker(bot_ref, interval=1.0))
+    ticker = asyncio.create_task(_hub_ticker(bot_ref, interval=0.5))
     try:
         return await task
     finally:

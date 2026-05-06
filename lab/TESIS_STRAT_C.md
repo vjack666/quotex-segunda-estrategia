@@ -592,4 +592,65 @@ STRAT-C estará al 100% cuando:
 
 ---
 
+## 10. ESTUDIO PROFUNDO — LATENCIA Y CONGELAMIENTO DEL HUB
+
+**Síntoma reportado en operación real:**
+- El HUB se siente lento y, tras un WIN/LOSS, parece quedarse congelado durante segundos.
+- La lectura visual no acompaña el estado del bot en tiempo real.
+
+### 10.1 Hallazgos técnicos
+
+1. **Render dependía de I/O de red antes de dibujar**
+- En `main.py`, `_hub_ticker()` ejecutaba `refresh_balance_for_hub()` antes de renderizar.
+- Si el broker tardaba en `get_balance()`, el panel esperaba, generando sensación de freeze.
+
+2. **Evento de trade no tenía prioridad visual explícita**
+- Aunque existe `trade_result_event`, el render podía llegar tarde por orden de ejecución.
+
+3. **Cadencia de refresco conservadora (1.0s)**
+- Con jitter de red, 1s se percibe como saltos de 2s o más.
+
+4. **Cancelación de tareas pendientes incompleta**
+- En el ticker, tareas pendientes se cancelaban sin drenarlas explícitamente.
+- Esto no siempre rompe ejecución, pero puede degradar estabilidad a largo plazo.
+
+### 10.2 Cambios aplicados para agilizar HUB
+
+**Archivo:** `main.py`
+
+1. **Render inmediato tras cierre de trade**
+- Si dispara `trade_result_event`, el HUB renderiza al instante antes de cualquier refresh de balance.
+
+2. **Refresh de balance no bloqueante para UX**
+- `refresh_balance_for_hub()` ahora se llama con `asyncio.wait_for(...)` desde ticker:
+    - `0.35s` cuando hubo evento de trade
+    - `0.8s` en tick normal
+- Si hay timeout/falla, se omite y el panel sigue vivo.
+
+3. **Drenado de tareas canceladas**
+- Se agregó `await asyncio.gather(*pending, return_exceptions=True)` tras cancelar tasks pendientes.
+
+4. **Mayor frecuencia de refresco**
+- El ticker pasó de `1.0s` a `0.5s`.
+
+### 10.3 Impacto esperado
+
+- Menor latencia visual en panel tras WIN/LOSS.
+- Menor probabilidad de freeze aparente por espera de red.
+- Mayor suavidad de actualización del HUB.
+
+### 10.4 Riesgos residuales
+
+- Si la API del broker bloquea en rutas fuera de `refresh_balance_for_hub`, aún puede haber jitter.
+- El ruido de cierre abrupto (Ctrl+C) puede seguir dejando trazas de tareas pendientes en librerías externas.
+
+### 10.5 Siguiente fase recomendada
+
+1. Instrumentar métricas de rendimiento del HUB:
+     - `t_trade_close -> t_render`
+     - `t_balance_refresh`
+     - `frames dropped`
+2. Mostrar `latencia` y `ws_status` en header del HUB.
+3. Separar visualmente errores de cierre vs errores en vivo para no confundir diagnóstico.
+
 *Tesis generada por análisis exhaustivo del código fuente. Todos los números de línea son exactos al 2026-05-06.*
