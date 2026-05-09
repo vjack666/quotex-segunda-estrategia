@@ -94,6 +94,7 @@ CREATE TABLE IF NOT EXISTS scan_candidates (
     order_id        TEXT,
     order_result    TEXT,                   -- WIN | LOSS | PENDING | EXPIRED
     profit          REAL,
+    masaniello_snapshot TEXT,               -- JSON con estado Masaniello al cerrar
     
     created_at      TEXT DEFAULT CURRENT_TIMESTAMP,
     updated_at      TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -157,6 +158,13 @@ class BlackBoxRecorder:
         try:
             con = sqlite3.connect(self.db_path)
             con.executescript(_DDL_SCANS)
+            # Migración ligera para DBs existentes del día.
+            cols = [
+                str(row[1]).lower()
+                for row in con.execute("PRAGMA table_info(scan_candidates)").fetchall()
+            ]
+            if "masaniello_snapshot" not in cols:
+                con.execute("ALTER TABLE scan_candidates ADD COLUMN masaniello_snapshot TEXT")
             con.commit()
             con.close()
         except Exception as e:
@@ -254,6 +262,7 @@ class BlackBoxRecorder:
         order_id: Optional[str] = None,
         order_result: Optional[str] = None,
         profit: Optional[float] = None,
+        masaniello_snapshot: Optional[Dict[str, Any] | str] = None,
     ) -> None:
         """Actualiza un candidato existente con estado posterior al escaneo."""
         if candidate_id <= 0:
@@ -279,6 +288,12 @@ class BlackBoxRecorder:
         if profit is not None:
             fields.append("profit = ?")
             values.append(profit)
+        if masaniello_snapshot is not None:
+            fields.append("masaniello_snapshot = ?")
+            if isinstance(masaniello_snapshot, str):
+                values.append(masaniello_snapshot)
+            else:
+                values.append(json.dumps(masaniello_snapshot, ensure_ascii=False))
         if not fields:
             return
 

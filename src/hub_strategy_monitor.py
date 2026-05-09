@@ -26,8 +26,8 @@ _WHITE = "\033[37m"
 # ── Caché local de pares STRAT-A (persiste entre ciclos dentro del proceso) ──
 _strat_a_cache: dict[str, dict] = {}
 _MAX_ABSENT_CYCLES = 4   # ciclos sin aparecer antes de invalidar
-_MIN_SCORE_KEEP = 38.0   # score mínimo para mantener el par
-_SCORE_THRESHOLD = 60.0  # score para considerar el bloque aprobado
+_MIN_SCORE_KEEP = 20.0   # score mínimo para mantener el par (ajustado a condiciones actuales)
+_SCORE_THRESHOLD = 50.0  # score para considerar el bloque aprobado (sync con threshold base STRAT-A)
 
 # Archivo de cola para invalidaciones (lo consume el bot central)
 _INVALIDATION_QUEUE = _ROOT / "data" / "hub_invalidations_queue.jsonl"
@@ -376,7 +376,7 @@ def _checklist_generic(strategy: str, candidates: list[dict]) -> list[tuple[str,
     has_dist  = top.get("dist_pct", None) is not None
     confidence = float(top.get("confidence", 0.0) or 0.0)
 
-    req_score   = {"B": 48.0, "C": 40.0}.get(strategy, 50.0)
+    req_score   = {"B": 48.0, "C": 41.0}.get(strategy, 50.0)  # C: 7/17*100=41.2 sync MIN_SCORE
     req_payout  = 80
     req_conf    = 0.70 if strategy == "B" else 0.0
 
@@ -505,8 +505,8 @@ def _pipeline_steps_c(c: dict) -> list[tuple[str, bool]]:
     conf      = float(c.get("confidence", 0.0) or 0.0)
 
     # Umbrales STRAT-C
-    MIN_SCORE_RAW  = 6.0   # MIN_SCORE del detector (0-17)
-    MIN_SCORE_NORM = MIN_SCORE_RAW / 17.0 * 100.0   # ~35.3 normalizado
+    MIN_SCORE_RAW  = 7.0   # MIN_SCORE del detector (0-17) — sync con main.py --strat-c-min-score=7
+    MIN_SCORE_NORM = MIN_SCORE_RAW / 17.0 * 100.0   # ~41.2 normalizado
     MIN_PAYOUT_C   = 80
 
     has_data  = bool(c.get("asset", ""))

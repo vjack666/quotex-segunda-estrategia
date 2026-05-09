@@ -30,11 +30,8 @@ class HubScanner:
             return item
         if strategy == "STRAT-A":
             return CandidateData.from_strat_a(dict(item))
-        if strategy == "STRAT-B":
-            return CandidateData.from_strat_b(dict(item))
-        if strategy == "STRAT-C":
-            return CandidateData.from_strat_b(dict(item))
-        raise ValueError(f"estrategia desconocida: {strategy}")
+        # Cualquier estrategia no-A usa el normalizador B por compatibilidad.
+        return CandidateData.from_strat_b(dict(item))
 
     def normalize_candidates(
         self,
@@ -65,16 +62,15 @@ class HubScanner:
         now = datetime.now(tz=timezone.utc)
 
         # Normaliza y conserva top candidatos por estrategia para el HUB.
+        # STRAT-C queda fuera de consideración por decisión operativa actual.
         normalized_a = self.normalize_candidates("STRAT-A", strat_a_candidates)
         normalized_b = self.normalize_candidates("STRAT-B", strat_b_candidates)
-        normalized_c = self.normalize_candidates("STRAT-C", strat_c_candidates)
         strat_a_top5 = normalized_a[:5]
         strat_b_top5 = normalized_b[:5]
-        strat_c_top5 = normalized_c[:5]
 
         self.state.strat_a_watching = strat_a_top5
         self.state.strat_b_watching = strat_b_top5
-        self.state.strat_c_watching = strat_c_top5
+        self.state.strat_c_watching = []
         self.state.total_scans += 1
         self.state.last_update = now
         if balance is not None:
@@ -87,7 +83,7 @@ class HubScanner:
             total_assets_scanned=total_assets,
             strat_a_candidates=strat_a_top5,
             strat_b_candidates=strat_b_top5,
-            strat_c_candidates=strat_c_top5,
+            strat_c_candidates=[],
             balance=balance,
             cycle_id=cycle_id,
             cycle_ops=cycle_ops,
@@ -97,14 +93,12 @@ class HubScanner:
         self.state.last_scan = snapshot
 
         log.debug(
-            "SCAN #%d | STRAT-A=%d (top5=%d) | STRAT-B=%d (top5=%d) | STRAT-C=%d (top5=%d)",
+            "SCAN #%d | STRAT-A=%d (top5=%d) | STRAT-B=%d (top5=%d)",
             self.scan_count,
             len(normalized_a),
             len(strat_a_top5),
             len(normalized_b),
             len(strat_b_top5),
-            len(normalized_c),
-            len(strat_c_top5),
         )
 
     def record_entry(
@@ -131,10 +125,6 @@ class HubScanner:
         elif strategy.upper() == "STRAT-B":
             self.state.strat_b_watching = [
                 c for c in self.state.strat_b_watching if c.asset != asset.upper()
-            ]
-        elif strategy.upper() == "STRAT-C":
-            self.state.strat_c_watching = [
-                c for c in self.state.strat_c_watching if c.asset != asset.upper()
             ]
 
         log.info(
@@ -218,6 +208,41 @@ class HubScanner:
     def clear_gale_state(self) -> None:
         """Resetea el GaleState a inactivo (tras expirar la operación)."""
         self.state.gale = GaleState()
+
+    def update_masaniello_state(self, **kwargs) -> None:
+        """
+        Actualiza campos del MasanielloState en tiempo real.
+        Acepta cualquier campo definido en MasanielloState como keyword argument.
+        Ejemplo:
+            hub.update_masaniello_state(active=True, asset="GBPAUD_otc", cycle_num=2)
+        """
+        m = self.state.masaniello
+        prev_price = m.current_price
+        for key, value in kwargs.items():
+            if hasattr(m, key):
+                if key == "current_price":
+                    try:
+                        v = float(value)
+                    except Exception:
+                        continue
+                    if v <= 0.0 and prev_price > 0.0:
+                        continue
+                setattr(m, key, value)
+        m.updated_at = time.time()
+
+    def clear_masaniello_state(self) -> None:
+        """Marca Masaniello como inactivo sin perder el estado del ciclo."""
+        m = self.state.masaniello
+        m.active = False
+        m.asset = ""
+        m.direction = ""
+        m.entry_price = 0.0
+        m.current_price = 0.0
+        m.secs_remaining = 0.0
+        m.payout = 0
+        m.delta_pct = 0.0
+        m.updated_at = time.time()
+
 
     def get_state(self) -> HubState:
         """Devuelve el estado actual del HUB."""

@@ -2,7 +2,6 @@ import sys
 import io
 import os
 import json
-import subprocess
 import argparse
 import asyncio
 import logging
@@ -29,7 +28,6 @@ import time as _time
 _DATA_SUBDIRS = ("logs/bot", "logs/broker", "db")
 _RETENTION_DAYS = 31
 _HUB_RUNTIME_STATE_FILE = ROOT / "data" / "hub_runtime_state.json"
-_MONITOR_LAUNCH_LOG = ROOT / "data" / "logs" / "bot" / "monitor_launcher.log"
 
 
 def _write_hub_runtime_snapshot(bot=None) -> None:
@@ -71,13 +69,15 @@ def _write_hub_runtime_snapshot(bot=None) -> None:
             "wins": int(getattr(state, "live_wins", 0) or 0),
             "losses": int(getattr(state, "live_losses", 0) or 0),
             "strat_a": [_candidate_to_dict(c) for c in list(getattr(state, "strat_a_watching", []) or [])],
-            "strat_b": [_candidate_to_dict(c) for c in list(getattr(state, "strat_b_watching", []) or [])],
-            "strat_c": [_candidate_to_dict(c) for c in list(getattr(state, "strat_c_watching", []) or [])],
-            "gale": {
-                "active": bool(getattr(getattr(state, "gale", None), "active", False)),
-                "asset": str(getattr(getattr(state, "gale", None), "asset", "") or ""),
-                "direction": str(getattr(getattr(state, "gale", None), "direction", "") or ""),
-                "secs_remaining": float(getattr(getattr(state, "gale", None), "secs_remaining", 0.0) or 0.0),
+            "masaniello": {
+                "active": bool(getattr(getattr(state, "masaniello", None), "active", False)),
+                "asset": str(getattr(getattr(state, "masaniello", None), "asset", "") or ""),
+                "direction": str(getattr(getattr(state, "masaniello", None), "direction", "") or ""),
+                "cycle_num": int(getattr(getattr(state, "masaniello", None), "cycle_num", 1) or 1),
+                "trades_in_cycle": int(getattr(getattr(state, "masaniello", None), "trades_in_cycle", 0) or 0),
+                "wins_in_cycle": int(getattr(getattr(state, "masaniello", None), "wins_in_cycle", 0) or 0),
+                "next_amount": float(getattr(getattr(state, "masaniello", None), "next_amount", 0.0) or 0.0),
+                "total_pnl": float(getattr(getattr(state, "masaniello", None), "total_pnl", 0.0) or 0.0),
             },
         }
 
@@ -88,83 +88,6 @@ def _write_hub_runtime_snapshot(bot=None) -> None:
         )
     except Exception:
         pass
-
-
-def _launch_strategy_monitors(enabled: bool) -> list[subprocess.Popen]:
-    """Abre 3 consolas (A/B/C) para checklists por estrategia."""
-    if (not enabled) or os.name != "nt":
-        return []
-
-    monitor_script = ROOT / "src" / "hub_strategy_monitor.py"
-    if not monitor_script.exists():
-        return []
-
-    procs: list[subprocess.Popen] = []
-    creation_flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
-
-    def _log_launch(msg: str) -> None:
-        try:
-            _MONITOR_LAUNCH_LOG.parent.mkdir(parents=True, exist_ok=True)
-            with _MONITOR_LAUNCH_LOG.open("a", encoding="utf-8") as fh:
-                fh.write(f"{_time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
-        except Exception:
-            pass
-
-    for strategy in ("A", "B", "C"):
-        cmd_args = [
-            sys.executable,
-            "-u",
-            str(monitor_script),
-            "--strategy",
-            strategy,
-            "--state-file",
-            str(_HUB_RUNTIME_STATE_FILE),
-            "--stale-sec",
-            "30.0",
-        ]
-        try:
-            p = subprocess.Popen(cmd_args, cwd=str(ROOT), creationflags=creation_flags)
-            # Si el proceso cae instantáneamente, usar fallback con cmd/start.
-            _time.sleep(0.15)
-            if p.poll() is None:
-                procs.append(p)
-                _log_launch(f"OK new_console strategy={strategy} pid={p.pid}")
-                continue
-            _log_launch(
-                f"WARN new_console exited strategy={strategy} rc={p.poll()} -> fallback cmd/start"
-            )
-
-            # Fallback robusto: cmd /c start abre una ventana de consola nueva.
-            launch_cmd = (
-                f'start "" "{sys.executable}" -u "{monitor_script}" '
-                f'--strategy {strategy} --state-file "{_HUB_RUNTIME_STATE_FILE}" '
-                f'--stale-sec 30.0'
-            )
-            subprocess.Popen(["cmd", "/c", launch_cmd], cwd=str(ROOT))
-            _log_launch(f"OK cmd_start strategy={strategy}")
-        except Exception:
-            _log_launch(f"ERROR launch strategy={strategy}")
-            continue
-    return procs
-
-
-def _stop_strategy_monitors(procs: list[subprocess.Popen]) -> None:
-    """Cierra monitores externos si siguen vivos."""
-    for p in procs:
-        try:
-            if p.poll() is None:
-                p.terminate()
-        except Exception:
-            pass
-    for p in procs:
-        try:
-            if p.poll() is None:
-                p.wait(timeout=1.0)
-        except Exception:
-            try:
-                p.kill()
-            except Exception:
-                pass
 
 
 def _cleanup_old_data_files() -> None:
@@ -204,6 +127,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Monto mínimo de orden para la calculadora de riesgo (broker: > $1.00)",
     )
     p.add_argument(
+        "--amount-initial-auto",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Calcular monto inicial con fórmula Masaniello (estilo Excel) al detectar saldo",
+    )
+    p.add_argument(
+        "--amount-initial-balance-pct",
+        type=float,
+        default=1.0,
+        help="Fallback porcentual del saldo si la fórmula Masaniello no puede evaluarse",
+    )
+    p.add_argument(
         "--amount-martin",
         type=float,
         default=2.0,
@@ -215,9 +150,44 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cycle-ops", type=int, default=5, help="Máximo de operaciones por ciclo")
     p.add_argument("--cycle-wins", type=int, default=2, help="Objetivo de aciertos por ciclo")
     p.add_argument("--cycle-profit-pct", type=float, default=0.10, help="Take-profit por ciclo (fracción)")
+    p.add_argument(
+        "--masaniello-excel-mirror",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Escribir W/L en Excel para comparativa en tiempo real",
+    )
+    p.add_argument(
+        "--masaniello-excel-path",
+        type=str,
+        default=r"C:\Users\v_jac\Documents\Downloads\Masaniello.xlsx",
+        help="Ruta del archivo Excel donde se registran W/L",
+    )
+    p.add_argument(
+        "--masaniello-excel-sheet",
+        type=str,
+        default="Calcolatore",
+        help="Hoja del Excel donde se escriben los resultados",
+    )
+    p.add_argument(
+        "--masaniello-excel-column",
+        type=str,
+        default="B",
+        help="Columna (A..Z, AA...) para escribir W/L",
+    )
+    p.add_argument(
+        "--masaniello-excel-start-row",
+        type=int,
+        default=3,
+        help="Fila inicial para comenzar a registrar W/L",
+    )
 
     # Filtros operativos
-    p.add_argument("--min-payout", type=int, default=80, help="Payout mínimo permitido")
+    p.add_argument(
+        "--min-payout",
+        type=int,
+        default=85,
+        help="Payout mínimo base de riesgo (el escaneo usa payout estrictamente mayor)",
+    )
     p.add_argument("--scan-lead-sec", type=float, default=35.0, help="Anticipación del scan antes del open")
     p.add_argument(
         "--scan-sleep-sec",
@@ -244,24 +214,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Umbral alto dinámico de score para STRAT-A",
     )
 
-    # STRAT-B (Spring Sweep)
-    p.add_argument(
-        "--strat-b-live",
-        action="store_true",
-        help="Permitir que STRAT-B abra operaciones (default: solo aviso en terminal)",
-    )
-    p.add_argument(
-        "--strat-b-duration",
-        type=int,
-        default=300,
-        help="Duración en segundos para entradas STRAT-B (fijado en 300)",
-    )
-    p.add_argument(
-        "--strat-b-min-confidence",
-        type=float,
-        default=0.70,
-        help="Confianza mínima [0.0-1.0] para habilitar entrada STRAT-B",
-    )
     p.add_argument(
         "--same-asset-cooldown-sec",
         type=float,
@@ -315,56 +267,34 @@ def _build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="Modo de render del HUB (auto en Windows usa static para evitar duplicados)",
     )
-    p.add_argument(
-        "--hub-multi-monitor",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Abrir monitores A/B/C en consolas separadas con checklist en tiempo real",
-    )
-
-    # STRAT-C (Rechazo M1 — 30 segundos)
-    p.add_argument(
-        "--strat-c-enabled",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Habilitar STRAT-C: rechazo M1 con expiración 60s (en desarrollo)",
-    )
-    p.add_argument(
-        "--strat-c-min-score",
-        type=float,
-        default=7.0,
-        help="Puntuacion minima de confluencia para STRAT-C [0-17] (thesis=7)",
-    )
-    p.add_argument(
-        "--strat-c-wick-atr-min",
-        type=float,
-        default=0.15,
-        help="Wick minimo en unidades de ATR (filtra mechas de ruido)",
-    )
-    p.add_argument(
-        "--strat-c-wick-atr-max",
-        type=float,
-        default=3.50,
-        help="Wick maximo en unidades de ATR (filtra spikes/noticias)",
-    )
     return p
 
 
 def _apply_runtime_config(args: argparse.Namespace) -> None:
     import consolidation_bot as cb
-    from martingale_calculator import MartingaleCalculator
+    from src.masaniello_engine import MasanielloConfig
 
     cb.MAX_LOSS_SESSION = float(args.max_loss_session)
 
-    # La gestión de montos ya no usa variables globales del bot; se configura
-    # directamente sobre la calculadora dinámica de riesgo.
+    # La gestión de montos ahora usa Masaniello Engine en lugar de MartingaleCalculator.
     # El broker exige monto estrictamente mayor a $1.00.
-    MartingaleCalculator.MIN_ORDER_AMOUNT = max(1.01, float(args.amount_initial))
-    MartingaleCalculator.INCREMENT = max(0.01, float(args.amount_martin))
+    MasanielloConfig.initial_amount = max(1.01, float(args.amount_initial))
+    cb.MASANIELLO_AUTO_INITIAL_FROM_BALANCE = bool(args.amount_initial_auto)
+    cb.MASANIELLO_INITIAL_BALANCE_PCT = max(
+        0.001,
+        min(1.0, float(args.amount_initial_balance_pct) / 100.0),
+    )
+    # Nota: commission_pct (L5) se usa en lugar de INCREMENT para margen
 
-    cb.CYCLE_MAX_OPERATIONS = int(args.cycle_ops)
-    cb.CYCLE_TARGET_WINS = int(args.cycle_wins)
+    # Política fija solicitada: ciclo Masaniello 5 operaciones con objetivo 2 ITM.
+    cb.CYCLE_MAX_OPERATIONS = 5
+    cb.CYCLE_TARGET_WINS = 2
     cb.CYCLE_TARGET_PROFIT_PCT = float(args.cycle_profit_pct)
+    cb.MASANIELLO_EXCEL_MIRROR_ENABLED = bool(args.masaniello_excel_mirror)
+    cb.MASANIELLO_EXCEL_MIRROR_PATH = str(args.masaniello_excel_path)
+    cb.MASANIELLO_EXCEL_MIRROR_SHEET = str(args.masaniello_excel_sheet)
+    cb.MASANIELLO_EXCEL_MIRROR_COLUMN = str(args.masaniello_excel_column).strip().upper() or "A"
+    cb.MASANIELLO_EXCEL_MIRROR_START_ROW = max(1, int(args.masaniello_excel_start_row))
 
     cb.MIN_PAYOUT = int(args.min_payout)
     cb.SCAN_LEAD_SEC = float(args.scan_lead_sec)
@@ -374,9 +304,9 @@ def _apply_runtime_config(args: argparse.Namespace) -> None:
     cb.ADAPTIVE_THRESHOLD_LOW = max(30, min(90, int(args.adaptive_threshold_low)))
     cb.ADAPTIVE_THRESHOLD_HIGH = max(30, min(90, int(args.adaptive_threshold_high)))
 
-    cb.STRAT_B_CAN_TRADE = bool(args.strat_b_live)
+    # STRAT-B se mantiene archivada temporalmente (sin ejecución desde main).
+    cb.STRAT_B_CAN_TRADE = False
     cb.STRAT_B_DURATION_SEC = 300
-    cb.STRAT_B_MIN_CONFIDENCE = max(0.0, min(1.0, float(args.strat_b_min_confidence)))
     cb.SAME_ASSET_REENTRY_COOLDOWN_SEC = max(0.0, float(args.same_asset_cooldown_sec))
     cb.REJECTION_CALL_MIN_LOWER_WICK = max(0.0, min(1.0, float(args.rejection_call_min_lower_wick)))
     cb.REJECTION_ENTRY_WINDOW_ENABLED = bool(args.rejection_entry_window_enabled)
@@ -386,32 +316,8 @@ def _apply_runtime_config(args: argparse.Namespace) -> None:
     cb.REJECTION_ALLOW_PARTIAL = not bool(args.rejection_disallow_partial)
     cb.STRUCTURE_ENTRY_LOCK_TTL_MIN = max(0.0, float(args.structure_entry_lock_ttl_min))
 
-    # STRAT-C (Rechazo M1 — 30s) — configura el módulo estrategia_30s/detector.py
-    try:
-        from estrategia_30s import detector as strat_c_detector
-        # Set calibrado desde grid-search sobre snapshots reales.
-        strat_c_detector.ATR_PERIOD = 7
-        strat_c_detector.BB_PERIOD = 14
-        strat_c_detector.BB_STD_DEV = 2.0
-        strat_c_detector.STOCH_K_PERIOD = 5
-        strat_c_detector.STOCH_D_PERIOD = 3
-        strat_c_detector.STOCH_SLOW_K_PERIOD = 14
-        strat_c_detector.STOCH_SLOW_D_PERIOD = 3
-        strat_c_detector.EMA_FAST_PERIOD = 8
-        strat_c_detector.EMA_SLOW_PERIOD = 21
-        strat_c_detector.SR_LOOKBACK = 40
-        strat_c_detector.SR_PIVOT_WINDOW = 2
-        strat_c_detector.SR_MERGE_ATR_MULT = 0.3
-        strat_c_detector.ZONE_TOLERANCE_ATR_MULT = 1.2
-        strat_c_detector.MIN_WICK_TO_BODY_RATIO = 0.8
-
-        strat_c_detector.MIN_SCORE     = max(0.0, float(args.strat_c_min_score))
-        strat_c_detector.WICK_ATR_MIN  = max(0.0, float(args.strat_c_wick_atr_min))
-        strat_c_detector.WICK_ATR_MAX  = max(0.0, float(args.strat_c_wick_atr_max))
-    except ImportError:
-        pass  # módulo aún en desarrollo
-
-    cb.STRAT_C_CAN_TRADE = bool(args.strat_c_enabled)
+    # STRAT-C apagada por completo en main.
+    cb.STRAT_C_CAN_TRADE = False
 
     # Modo HUB (solo lectura): fuerza escaneo por minuto y deshabilita trading.
     if bool(args.hub_readonly):
@@ -484,6 +390,67 @@ async def _run_cycle_with_loading(cb, *, dry_run: bool, real_account: bool):
     return await task
 
 
+_SILENT_RECONNECT_INTERVAL_SEC = 600  # reconexión preventiva cada 10 min
+
+
+async def _silent_reconnect_watchdog(bot_ref: list) -> None:
+    """Reconexión silenciosa preventiva cada 10 min o al recibir WIN/LOSS.
+    Nunca interrumpe el loop principal; si falla, reintenta en el siguiente ciclo.
+    """
+    last_reconnect = _time.time()
+    while True:
+        try:
+            bot = bot_ref[0] if bot_ref else None
+            trade_event = None
+            if bot is not None and hasattr(bot, "hub") and hasattr(bot.hub, "trade_result_event"):
+                trade_event = bot.hub.trade_result_event
+
+            # Esperar lo que llegue primero: WIN/LOSS o el intervalo de 10 min
+            remaining = max(5.0, _SILENT_RECONNECT_INTERVAL_SEC - (_time.time() - last_reconnect))
+            if trade_event is not None:
+                sleep_task = asyncio.create_task(asyncio.sleep(remaining))
+                event_wait = asyncio.create_task(trade_event.wait())
+                done, pending = await asyncio.wait(
+                    {sleep_task, event_wait},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for t in pending:
+                    t.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                triggered_by_trade = event_wait in done and event_wait.done() and not event_wait.cancelled()
+            else:
+                await asyncio.sleep(remaining)
+                triggered_by_trade = False
+
+            bot = bot_ref[0] if bot_ref else None
+            if bot is None:
+                continue
+
+            # No reconectar si hay operación activa para no interrumpir un trade en vuelo
+            m = getattr(getattr(bot, "hub", None), "state", None)
+            is_active = getattr(getattr(m, "masaniello", None), "active", False) if m else False
+            if is_active and not triggered_by_trade:
+                continue
+
+            reason = "trade WIN/LOSS" if triggered_by_trade else "preventiva 10min"
+            try:
+                ok = await asyncio.wait_for(bot.ensure_connection(), timeout=20.0)
+                if ok:
+                    pass  # silenciosa — no log de consola; el HUB muestra estado actualizado
+                else:
+                    import logging as _log_mod
+                    _log_mod.getLogger(__name__).warning("[watchdog] Reconexión %s falló; reintentará en breve", reason)
+            except Exception:
+                pass
+
+            last_reconnect = _time.time()
+
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            await asyncio.sleep(10.0)
+
+
 async def _hub_ticker(bot_ref: list, interval: float = 0.5) -> None:
     """Refresca el HUB en segundo plano cada `interval` segundos sin esperar ciclos.
     Si llega un resultado de trade (WIN/LOSS) antes del intervalo, re-renderiza al instante.
@@ -511,8 +478,10 @@ async def _hub_ticker(bot_ref: list, interval: float = 0.5) -> None:
                     t.cancel()
                 if pending:
                     await asyncio.gather(*pending, return_exceptions=True)
-                # Limpiar el evento para el siguiente ciclo.
-                trade_event.clear()
+                    # Limpiar SOLO si este ciclo realmente consumió el evento.
+                    # Si otro trade terminó justo entre wait() y aquí, su señal se preserva.
+                    if trade_triggered:
+                        trade_event.clear()
             else:
                 await asyncio.sleep(interval)
 
@@ -562,16 +531,22 @@ async def _run_forever_with_initial_loading(cb, *, dry_run: bool, real_account: 
     )
 
     # Render de carga hasta que termina el primer ciclo.
-    while not first_cycle_done.is_set() and not task.done():
-        await _render_hub_once(bot_ref[0])
-        await asyncio.sleep(1)
-
-    # Ticker de fondo: refresca el HUB cada 1s independiente de los ciclos.
+    # Ticker permanente: arranca de inmediato, independiente del primer ciclo.
+    # Así el dashboard es visible desde el primer segundo, aunque el scan aún no termine.
     ticker = asyncio.create_task(_hub_ticker(bot_ref, interval=0.5))
+    watchdog = asyncio.create_task(_silent_reconnect_watchdog(bot_ref))
+
     try:
+        # Render de carga hasta que termina el primer ciclo.
+        while not first_cycle_done.is_set() and not task.done():
+            await _render_hub_once(bot_ref[0])
+            await asyncio.sleep(1)
+
         return await task
+
     finally:
         ticker.cancel()
+        watchdog.cancel()
 
 
 async def _run(args: argparse.Namespace) -> None:
@@ -603,8 +578,6 @@ async def _run(args: argparse.Namespace) -> None:
     # El HUB se muestra siempre desde el inicio para evitar pantalla en blanco.
     _configure_hub_console(cb)
     await _render_hub_once()
-
-    monitor_procs = _launch_strategy_monitors(bool(args.hub_multi_monitor))
 
     # En modo HUB no se ejecutan ordenes (dry_run=True), solo lectura/analisis.
     dry_run = hub_readonly
@@ -647,7 +620,6 @@ async def _run(args: argparse.Namespace) -> None:
                     real_account=bool(args.real),
                 )
     finally:
-        _stop_strategy_monitors(monitor_procs)
         try:
             if _HUB_RUNTIME_STATE_FILE.exists():
                 _HUB_RUNTIME_STATE_FILE.unlink()
@@ -657,23 +629,63 @@ async def _run(args: argparse.Namespace) -> None:
 
 if __name__ == "__main__":
     parser = _build_parser()
-    try:
-        asyncio.run(_run(parser.parse_args()))
-    except ModuleNotFoundError as exc:
-        if getattr(exc, "name", "") == "pyquotex":
-            venv_python = ROOT / ".venv" / "Scripts" / "python.exe"
-            print("ERROR: Falta el modulo 'pyquotex' en el Python actual.")
-            print("Ejecuta el bot con el entorno virtual del proyecto:")
-            print(f'  "{venv_python}" main.py --hub-readonly')
-            print("O instala dependencias en el entorno actual:")
-            print("  python -m pip install -r requirements.txt")
-            raise SystemExit(1)
-        raise
-    except KeyboardInterrupt:
-        raise SystemExit(0)
-    finally:
+    args = parser.parse_args()
+    run_once = bool(args.once)
+    restart_count = 0
+    max_consecutive_errors = 99999  # Sin límite — modo continuo de recolección de datos
+    
+    while True:
         try:
-            from hub.hub_dashboard import HubDashboard
-            HubDashboard.shutdown()
-        except Exception:
-            pass
+            print(f"\n{'='*80}")
+            if restart_count > 0:
+                print(f"[BOT] Iniciando intento #{restart_count+1}...")
+            else:
+                print(f"[BOT] Iniciando bot en modo 24/7...")
+            print(f"{'='*80}\n")
+            
+            asyncio.run(_run(args))
+            
+            # Si llegamos aquí sin error, el bot terminó limpiamente (--once)
+            if run_once:
+                raise SystemExit(0)
+            
+            # Si no es --once pero termino, algo inesperado pasó
+            restart_count += 1
+            if restart_count >= max_consecutive_errors:
+                print(f"\n[ERROR] El bot ha fallado {restart_count} veces consecutivas.")
+                print("Revisar los logs en data/logs/bot/ para más detalles.")
+                raise SystemExit(1)
+            
+            print(f"\n[BOT] Reiniciando en 5 segundos (intento {restart_count+1}/{max_consecutive_errors})...\n")
+            _time.sleep(5)
+            
+        except ModuleNotFoundError as exc:
+            if getattr(exc, "name", "") == "pyquotex":
+                venv_python = ROOT / ".venv" / "Scripts" / "python.exe"
+                print("\n[ERROR] Falta el modulo 'pyquotex' en el Python actual.")
+                print("Ejecuta el bot con el entorno virtual del proyecto:")
+                print(f'  "{venv_python}" main.py')
+                print("O instala dependencias en el entorno actual:")
+                print("  python -m pip install -r requirements.txt")
+                raise SystemExit(1)
+            raise
+        except KeyboardInterrupt:
+            print("\n[BOT] Interrupción del usuario (Ctrl+C). Cerrando...")
+            raise SystemExit(0)
+        except Exception as e:
+            restart_count += 1
+            if restart_count >= max_consecutive_errors:
+                print(f"\n[ERROR] El bot ha fallado {restart_count} veces consecutivas.")
+                print(f"Última excepción: {type(e).__name__}: {e}")
+                print("Revisar los logs en data/logs/bot/ para más detalles.")
+                raise SystemExit(1)
+            print(f"\n[BOT] Error inesperado: {type(e).__name__}: {e}")
+            print(f"Reiniciando en 5 segundos (intento {restart_count+1}/{max_consecutive_errors})...\n")
+            _time.sleep(5)
+        finally:
+            try:
+                from hub.hub_dashboard import HubDashboard
+                HubDashboard.shutdown()
+            except Exception:
+                pass
+

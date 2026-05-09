@@ -150,27 +150,71 @@ class HubScanSnapshot:
 
 @dataclass
 class GaleState:
-    """Estado en tiempo real del GaleWatcher (motor de compensación)."""
-    active:          bool  = False   # hay una operación siendo vigilada
+    """[DEPRECATED] Estado anterior del GaleWatcher. Use MasanielloState en su lugar."""
+    active:          bool  = False
     asset:           str   = ""
-    direction:       str   = ""      # "call" | "put"
+    direction:       str   = ""
     entry_price:     float = 0.0
     current_price:   float = 0.0
     secs_remaining:  float = 0.0
     duration_sec:    int   = 300
     payout:          int   = 0
-    amount_invested: float = 0.0     # monto de la operación base
-    gale_amount:     float = 0.0     # monto calculado para el gale (según calculadora)
+    amount_invested: float = 0.0
+    gale_amount:     float = 0.0
     is_losing:       bool  = False
-    delta_pct:       float = 0.0     # variación % precio vs entrada
-    updated_at:      float = 0.0     # epoch del último tick recibido desde GaleWatcher
-    gale_fired:          bool  = False   # ya se disparó el gale
-    gale_order_id:       str   = ""      # order_id del gale si fue enviado
-    gale_success:        bool  = False   # True si el broker aceptó el gale
-    consecutive_count:   int   = 0       # entrada actual en el ciclo (1=base, 2=1er gale, 3=2do gale)
-    cycle_target_amount: float = 0.0    # objetivo de ganancia del ciclo ($)
-    safety_status:       str   = "OK"   # estado de seguridad: OK | RIESGO | LIMITE | ERROR
-    context_key:         str   = ""      # clave aislada de gale: "STRAT-X|ASSET" (protocolo por par)
+    delta_pct:       float = 0.0
+    updated_at:      float = 0.0
+    gale_fired:          bool  = False
+    gale_order_id:       str   = ""
+    gale_success:        bool  = False
+    consecutive_count:   int   = 0
+    cycle_target_amount: float = 0.0
+    safety_status:       str   = "OK"
+    context_key:         str   = ""
+
+
+@dataclass
+class MasanielloState:
+    """Estado en tiempo real del motor Masaniello (gestión dinámica de riesgo)."""
+    active:              bool  = False       # hay una operación activa
+    cycle_num:           int   = 1           # número de ciclo actual
+    trades_in_cycle:     int   = 0           # operaciones completadas en ciclo
+    wins_in_cycle:       int   = 0           # aciertos en ciclo actual
+    losses_in_cycle:     int   = 0           # fallos en ciclo actual
+    sequence:            str   = ""          # secuencia W/L del ciclo en curso
+    
+    # Operación actual
+    asset:               str   = ""
+    direction:           str   = ""          # "call" | "put"
+    entry_price:         float = 0.0
+    current_price:       float = 0.0
+    current_amount:      float = 0.0         # monto actual de operación
+    next_amount:         float = 0.0         # monto calculado para siguiente
+    
+    # Tiempos
+    secs_remaining:      float = 0.0
+    duration_sec:        int   = 300
+    payout:              int   = 0           # payout %
+    delta_pct:           float = 0.0         # variación %
+    updated_at:          float = 0.0
+    
+    # Histórico y estadísticas
+    total_pnl:           float = 0.0         # P&L acumulado
+    win_rate_pct:        float = 0.0         # porcentaje de aciertos
+    daily_loss:          float = 0.0         # pérdida diaria acumulada
+    max_daily_loss:      float = 500.0       # límite de pérdida diaria
+    
+    # Configuración Masaniello (L1-L5)
+    cycle_target_ops:    int   = 5           # L1: objetivo ops/ciclo
+    cycle_target_wins:   int   = 2           # L2: objetivo wins/ciclo
+    reference_balance:   float = 100.0       # banca base fija para cálculo inicial
+    multiplier:          float = 1.5         # L3: multiplicador
+    commission_pct:      float = 2.0         # L5: comisión %
+    
+    # Estado
+    safety_status:       str   = "OK"        # OK | RIESGO | LIMITE | ERROR
+
+
 
 
 @dataclass
@@ -194,13 +238,15 @@ class HubState:
     last_update: datetime = field(default_factory=_utc_now)
     live_wins: int = 0
     live_losses: int = 0
-    known_balance: float = 0.0  # último balance conocido (se actualiza al conectar y en cada scan)
-    gale: "GaleState" = field(default_factory=lambda: GaleState())  # estado del GaleWatcher
+    known_balance: float = 0.0  # último balance conocido
+    masaniello: "MasanielloState" = field(default_factory=lambda: MasanielloState())  # estado del Masaniello
+    gale: "GaleState" = field(default_factory=lambda: GaleState())  # [DEPRECATED] usar masaniello
 
 
 __all__ = [
     "CandidateData",
     "GaleState",
+    "MasanielloState",
     "HubScanSnapshot",
     "HubState",
     "VALID_DIRECTIONS",

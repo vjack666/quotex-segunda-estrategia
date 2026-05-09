@@ -19,7 +19,7 @@ from .zonas import detectar_zonas_sr
 ENTRY_WINDOW_START_SEC: int   = 30
 ENTRY_WINDOW_END_SEC: int     = 41
 MIN_WICK_TO_BODY_RATIO: float = 1.5
-MIN_SCORE: float              = 6.0
+MIN_SCORE: float              = 7.0
 # Filtro ATR normalizado (wick medido en unidades de ATR del propio activo)
 # Reemplaza ATR_MIN/ATR_MAX absolutos — funciona en Forex, crypto y acciones.
 WICK_ATR_MIN: float           = 0.15   # wick < 15% de un ATR → ruido, no estructura
@@ -88,10 +88,13 @@ def evaluar_vela(
     Returns:
         (direccion, score, detalle) si hay señal, None si no.
         direccion: "CALL" | "PUT"
-        score:     Puntuación de confluencia (0–17)
+        score:     Puntuación de confluencia (0–11)
+                   Máx real: wick(2)+zona(2)+StochLento(2)+BB(2)+StochRápido(2)+EMA(1)=11
         detalle:   Dict con valores de cada indicador
     """
-    if len(candles) < 10:
+    if len(candles) < 20:
+        # Mínimo 20: Stoch Lento necesita k_period+d_period-1=16 velas para %D válido.
+        # Con menos de 20, el fallback k==d hace los cruces indetectables.
         return None
 
     # ── 1. Ventana de tiempo ──────────────────────────────────────────────────
@@ -199,11 +202,18 @@ def evaluar_vela(
 
     dual_wick = call_wick_ok and put_wick_ok
     if dual_wick:
-        if call_zone_active and put_zone_active and call_bias != put_bias:
-            direction = 'CALL' if call_bias > put_bias else 'PUT'
-        elif call_zone_active and not put_zone_active:
+        if call_zone_active and put_zone_active:
+            # Ambas zonas activas: resolver por bias primero, luego por wick dominante.
+            if call_bias != put_bias:
+                direction = 'CALL' if call_bias > put_bias else 'PUT'
+            elif abs(lower_ratio - upper_ratio) >= 1.0:
+                # Bias empatado → wick dominante decide (más informativo que descartar).
+                direction = 'CALL' if lower_ratio > upper_ratio else 'PUT'
+            else:
+                return None  # empate total sin desempate posible
+        elif call_zone_active:
             direction = 'CALL'
-        elif put_zone_active and not call_zone_active:
+        elif put_zone_active:
             direction = 'PUT'
         elif abs(lower_ratio - upper_ratio) >= 1.0:
             direction = 'CALL' if lower_ratio > upper_ratio else 'PUT'
@@ -219,11 +229,13 @@ def evaluar_vela(
     wick = lower_wick if direction == 'CALL' else upper_wick
     wick_ratio = lower_ratio if direction == 'CALL' else upper_ratio
     zona_precio = current['low'] if direction == 'CALL' else current['high']
+    # wick (valor absoluto) se incluye en detalle para auditoría post-señal.
 
     # ── 5. Calcular score de confluencia ──────────────────────────────────────
     score: float = 0.0
     detalle: Dict[str, Any] = {
         'direction': direction,
+        'wick': round(wick, 8),          # valor absoluto — útil para auditoría en pares de precio alto
         'wick_ratio': round(wick_ratio, 2),
         'wick_atr_ratio': round(wick_atr_ratio, 2),
         'atr': round(current_atr, 6),

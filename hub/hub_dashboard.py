@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, List, Optional
 
 from .hub_models import CandidateData, HubState
-from src.martingale_calculator import MartingaleCalculator
 
 if TYPE_CHECKING:
     from rich.console import Console
@@ -104,7 +103,7 @@ def _enable_ansi_windows() -> bool:
         pass
     return False
 
-_LOG_TAIL_LINES = 8
+_LOG_TAIL_LINES = 6
 _LOG_TAIL_MAX_BYTES = 64 * 1024
 _LOG_RECENT_WINDOW_MIN = 20
 _LOG_RECENT_WINDOW_SEC = _LOG_RECENT_WINDOW_MIN * 60
@@ -295,7 +294,7 @@ def _live_log_lines() -> List[str]:
 def _waiting_first_order(state: HubState) -> bool:
     """True cuando el sistema aun no tuvo una operacion real para mostrar."""
     return (
-        not state.gale.active
+        not state.masaniello.active
         and state.active_trade_asset is None
         and state.last_trade_outcome is None
     )
@@ -340,83 +339,6 @@ def _build_strat_a_table(candidates: List[CandidateData]) -> "Table":
     return t
 
 
-def _build_strat_b_table(candidates: List[CandidateData]) -> "Table":
-    table_cls = _require_table_class()
-    t = table_cls(show_header=True, header_style="bold magenta", box=None, padding=(0, 1), expand=True)
-    t.add_column("#",      width=2,  justify="right")
-    t.add_column("Activo", width=14, no_wrap=True)
-    t.add_column("Dir",    width=6)
-    t.add_column("Conf%",  width=6,  justify="right")
-    t.add_column("P%",     width=4,  justify="right")
-    t.add_column("Dist",   width=7,  justify="right")
-    t.add_column("Sup",    width=10, justify="right")
-    t.add_column("Res",    width=10, justify="right")
-    t.add_column("Señal",  width=11, no_wrap=True)
-    t.add_column("Patron", min_width=12)
-
-    if not candidates:
-        t.add_row("[dim]—[/dim]", "[dim]Sin candidatos en este escaneo[/dim]",
-              "", "", "", "", "", "", "", "")
-        return t
-
-    for i, c in enumerate(candidates[:5], 1):
-        conf  = 0.0 if c.confidence is None else c.confidence * 100.0
-        c_col = "green" if conf >= 70 else "yellow" if conf >= 60 else "red"
-        p_col = "green" if c.payout >= 80 else "yellow" if c.payout >= 70 else "red"
-        signal = _abbrev(c.signal_type or c.entry_mode or "none")
-        t.add_row(
-            str(i),
-            f"[bold]{c.asset}[/bold]",
-            _direction_markup(c.direction),
-            f"[{c_col}]{conf:.1f}[/{c_col}]",
-            f"[{p_col}]{c.payout}[/{p_col}]",
-            _dist_markup(c.dist_pct),
-            f"[dim]{c.zone_floor:.5f}[/dim]",
-            f"[dim]{c.zone_ceiling:.5f}[/dim]",
-            f"[dim]{signal}[/dim]",
-            f"[dim]{c.pattern[:18]}[/dim]",
-        )
-    return t
-
-
-def _build_strat_c_table(candidates: List[CandidateData]) -> "Table":
-    table_cls = _require_table_class()
-    t = table_cls(show_header=True, header_style="bold blue", box=None, padding=(0, 1), expand=True)
-    t.add_column("#",      width=2,  justify="right")
-    t.add_column("Activo", width=14, no_wrap=True)
-    t.add_column("Dir",    width=6)
-    t.add_column("Score",  width=6,  justify="right")
-    t.add_column("P%",     width=4,  justify="right")
-    t.add_column("Dist",   width=7,  justify="right")
-    t.add_column("Sup",    width=10, justify="right")
-    t.add_column("Res",    width=10, justify="right")
-    t.add_column("Señal",  width=11, no_wrap=True)
-    t.add_column("Patron", min_width=12)
-
-    if not candidates:
-        t.add_row("[dim]—[/dim]", "[dim]Sin candidatos en este escaneo[/dim]",
-              "", "", "", "", "", "", "", "")
-        return t
-
-    for i, c in enumerate(candidates[:5], 1):
-        s_col = "green" if c.score >= 65 else "yellow" if c.score >= 50 else "red"
-        p_col = "green" if c.payout >= 80 else "yellow" if c.payout >= 70 else "red"
-        signal = _abbrev(c.signal_type or c.entry_mode or "none")
-        t.add_row(
-            str(i),
-            f"[bold]{c.asset}[/bold]",
-            _direction_markup(c.direction),
-            f"[{s_col}]{c.score:.1f}[/{s_col}]",
-            f"[{p_col}]{c.payout}[/{p_col}]",
-            _dist_markup(c.dist_pct),
-            f"[dim]{c.zone_floor:.5f}[/dim]",
-            f"[dim]{c.zone_ceiling:.5f}[/dim]",
-            f"[dim]{signal}[/dim]",
-            f"[dim]{c.pattern[:18]}[/dim]",
-        )
-    return t
-
-
 def _build_status_table(state: HubState, balance: float) -> "Table":
     table_cls = _require_table_class()
     now = datetime.now(tz=timezone.utc).strftime("%H:%M:%S")
@@ -425,6 +347,7 @@ def _build_status_table(state: HubState, balance: float) -> "Table":
 
     t = table_cls.grid(padding=(0, 2))
     t.add_column(); t.add_column(); t.add_column(); t.add_column(); t.add_column()
+    freshness = max(0, int((datetime.now(tz=timezone.utc) - state.last_update).total_seconds()))
     t.add_row(
         f"[cyan]UTC {now}[/cyan]",
         f"[magenta]Scans {state.total_scans}[/magenta]",
@@ -433,13 +356,13 @@ def _build_status_table(state: HubState, balance: float) -> "Table":
         f"Ops [cyan]{ops}[/cyan]  |  "
         f"[bold green]{state.live_wins}W[/bold green]"
         f"[dim]/[/dim]"
-        f"[bold red]{state.live_losses}L[/bold red]",
+        f"[bold red]{state.live_losses}L[/bold red]  [dim]| act. {freshness}s[/dim]",
     )
 
     if state.active_trade_asset:
         secs = int(state.active_trade_time_remaining_sec or 0)
         direction = (state.active_trade_direction or "").upper()
-        row = f"[bold red]▶ ACTIVA {state.active_trade_asset} {direction} {secs}s[/bold red]"
+        row = f"[bold red]OPERACION ACTIVA {state.active_trade_asset} {direction} {secs}s[/bold red]"
         if state.active_trade_entry_price is not None:
             row += f"  EP {state.active_trade_entry_price:.5f}"
         if state.active_trade_current_price is not None:
@@ -454,118 +377,111 @@ def _build_status_table(state: HubState, balance: float) -> "Table":
         asset   = state.last_trade_asset or "?"
         profit  = state.last_trade_profit or 0.0
         if outcome == "WIN":
-            result = f"[bold green]✔ LAST WIN  {asset}  +${profit:.2f}[/bold green]"
+            result = f"[bold green]ULTIMO RESULTADO: WIN  {asset}  +${profit:.2f}[/bold green]"
         elif outcome == "LOSS":
-            result = f"[bold red]✘ LAST LOSS  {asset}  -${abs(profit):.2f}[/bold red]"
+            result = f"[bold red]ULTIMO RESULTADO: LOSS  {asset}  -${abs(profit):.2f}[/bold red]"
         else:
-            result = f"[yellow]» LAST {outcome}  {asset}[/yellow]"
+            result = f"[yellow]ULTIMO RESULTADO: {outcome}  {asset}[/yellow]"
         t.add_row(result, "", "", "", "")
 
     return t
 
 
 def _build_gale_panel(state: HubState) -> "Panel":
-    """Construye el panel GALE WATCHER con el estado en tiempo real."""
+    """Construye el panel MASANIELLO MANAGER con el estado en tiempo real."""
     panel_cls = _require_panel_class()
     table_cls = _require_table_class()
-    g = state.gale
+    m = state.masaniello
 
     t = table_cls.grid(expand=True, padding=(0, 1))
     t.add_column(style="bold", min_width=14)
     t.add_column()
 
-    if not g.active:
+    if not m.active:
+        first_amount = m.next_amount if m.next_amount > 0 else (m.current_amount if m.current_amount > 0 else 1.01)
+        wr = m.win_rate_pct
+        if wr >= 60:
+            wr_mu = f"[bold green]{wr:.0f}%[/bold green]"
+        elif wr >= 50:
+            wr_mu = f"[yellow]{wr:.0f}%[/yellow]"
+        else:
+            wr_mu = f"[bold red]{wr:.0f}%[/bold red]"
+
         t.add_row("Estado:", "[dim]Sin operación activa[/dim]")
-        return panel_cls(t, title="[bold yellow]GALE WATCHER[/bold yellow]",
-                 border_style="yellow", padding=(0, 1))
+        t.add_row("Ciclo:", f"#{m.cycle_num}  |  {m.trades_in_cycle}/{m.cycle_target_ops} ops  |  {m.wins_in_cycle}W/{m.losses_in_cycle}L")
+        t.add_row("Tiempo:", "[dim]00:00[/dim]")
+        t.add_row("Monto Actual:", f"[bold]${m.current_amount:.2f}[/bold]")
+        t.add_row("Monto Próximo:", f"[bold yellow]${first_amount:.2f}[/bold yellow]")
+        t.add_row("Secuencia:", f"[dim]{m.sequence or '-'}[/dim]")
+        t.add_row("Win Rate:", wr_mu)
+        t.add_row("P&L:", f"[bold]{'+' if m.total_pnl >= 0 else ''}{m.total_pnl:.2f}$[/bold]")
+        t.add_row("Pérdida Diaria:", f"${m.daily_loss:.2f} / {'sin límite' if m.max_daily_loss >= 999999.0 else f'${m.max_daily_loss:.2f}'}")
+        t.add_row("Base/Ciclo:", f"[bold]${m.reference_balance:.2f}[/bold]  |  [bold]{m.cycle_target_ops}/{m.cycle_target_wins}[/bold]")
+        t.add_row("Config:", f"L3={m.multiplier}x  |  L5={m.commission_pct}%")
+        return panel_cls(t, title="[bold cyan]MASANIELLO MANAGER[/bold cyan]",
+                 border_style="cyan", padding=(0, 1))
 
     # dirección
-    dir_mu = _direction_markup(g.direction)
+    dir_mu = _direction_markup(m.direction)
 
     # delta color
-    delta = g.delta_pct
+    delta = m.delta_pct
     if abs(delta) < 0.001:
         delta_mu = f"[dim]{delta:+.4f}%[/dim]"
-    elif g.direction.upper() == "CALL":
+    elif m.direction.upper() == "CALL":
         delta_mu = f"[bold green]{delta:+.4f}%[/bold green]" if delta >= 0 else f"[bold red]{delta:+.4f}%[/bold red]"
     else:  # PUT
         delta_mu = f"[bold green]{delta:+.4f}%[/bold green]" if delta <= 0 else f"[bold red]{delta:+.4f}%[/bold red]"
 
-    # estado ganando/perdiendo
-    if g.is_losing:
-        status_mu = "[bold red]⚠  PERDIENDO[/bold red]"
-    else:
-        status_mu = "[bold green]✓  GANANDO[/bold green]"
-
     # tiempo restante
     drift = 0.0
-    if g.updated_at > 0:
-        drift = max(0.0, time.time() - g.updated_at)
-    secs = max(0.0, g.secs_remaining - drift)
+    if m.updated_at > 0:
+        drift = max(0.0, time.time() - m.updated_at)
+    secs = max(0.0, m.secs_remaining - drift)
     mm, ss = divmod(int(secs), 60)
-    time_mu = f"[bold]{mm:02d}:{ss:02d}[/bold]  [dim]/ {g.duration_sec}s[/dim]"
+    time_mu = f"[bold]{mm:02d}:{ss:02d}[/bold]  [dim]/ {m.duration_sec}s[/dim]"
 
-    # monto gale
-    if g.gale_amount > 0:
-        gale_mu = f"[bold yellow]${g.gale_amount:.2f}[/bold yellow]"
+    # monto siguiente
+    if m.next_amount > 0:
+        next_mu = f"[bold yellow]${m.next_amount:.2f}[/bold yellow]"
     else:
-        gale_mu = "[dim]calculando...[/dim]"
+        next_mu = "[dim]calculando...[/dim]"
 
-    # estado disparo
-    if g.gale_fired:
-        fired_mu = (
-            "[bold green]✔ ENVIADO[/bold green]" if g.gale_success
-            else "[bold red]✗ ERROR[/bold red]"
-        ) + (f"  [dim]#{g.gale_order_id}[/dim]" if g.gale_order_id else "")
+    # win rate
+    wr = m.win_rate_pct
+    if wr >= 60:
+        wr_mu = f"[bold green]{wr:.0f}%[/bold green]"
+    elif wr >= 50:
+        wr_mu = f"[yellow]{wr:.0f}%[/yellow]"
     else:
-        fired_mu = "[dim]En espera...[/dim]" if secs > 1 else "[bold yellow]⏳ Por disparar[/bold yellow]"
+        wr_mu = f"[bold red]{wr:.0f}%[/bold red]"
 
-    safety = str(getattr(g, "safety_status", "OK") or "OK").upper()
+    safety = str(m.safety_status or "OK").upper()
     if safety == "OK":
         safety_mu = "[bold green]OK[/bold green]"
     elif safety == "RIESGO":
         safety_mu = "[bold red]RIESGO[/bold red]"
     elif safety == "LIMITE":
         safety_mu = "[bold yellow]LIMITE[/bold yellow]"
-    elif safety == "CICLO":
-        safety_mu = "[cyan]CICLO[/cyan]"
     else:
-        safety_mu = "[bold red]ERROR[/bold red]"
+        safety_mu = "[bold yellow]AVISO[/bold yellow]"
 
-    t.add_row("Activo:",   f"{g.asset.upper()}  {dir_mu}  [dim]payout {g.payout}%[/dim]")
-    t.add_row("Entrada:",  f"EP [bold]{g.entry_price:.5f}[/bold]  PX [bold]{g.current_price:.5f}[/bold]  {delta_mu}")
-    t.add_row("Estado:",   status_mu)
-    t.add_row("⏱ Tiempo:",  time_mu)
-    t.add_row("Monto:",    f"Base ${g.amount_invested:.2f}  →  Gale {gale_mu}")
-    t.add_row("Disparo:",  fired_mu)
-    t.add_row("Seguridad:", safety_mu)
+    t.add_row("Activo:",       f"{m.asset.upper()}  {dir_mu}  [dim]payout {m.payout}%[/dim]")
+    t.add_row("Entrada:",      f"EP [bold]{m.entry_price:.5f}[/bold]  PX [bold]{m.current_price:.5f}[/bold]  {delta_mu}")
+    t.add_row("Ciclo:",        f"#{m.cycle_num}  |  {m.trades_in_cycle}/{m.cycle_target_ops} ops  |  {m.wins_in_cycle}W/{m.losses_in_cycle}L")
+    t.add_row("Tiempo:",       time_mu)
+    t.add_row("Monto Actual:", f"[bold]${m.current_amount:.2f}[/bold]")
+    t.add_row("Monto Próximo:", next_mu)
+    t.add_row("Win Rate:",     wr_mu)
+    t.add_row("P&L:",          f"[bold]{'+' if m.total_pnl >= 0 else ''}{m.total_pnl:.2f}$[/bold]")
+    t.add_row("Pérdida Diaria:", f"${m.daily_loss:.2f} / {'sin límite' if m.max_daily_loss >= 999999.0 else f'${m.max_daily_loss:.2f}'}")
+    t.add_row("Seguridad:",    safety_mu)
+    t.add_row("Base/Ciclo:",   f"${m.reference_balance:.2f}  |  {m.cycle_target_ops}/{m.cycle_target_wins}")
+    t.add_row("Config:",       f"L3={m.multiplier}x  |  L5={m.commission_pct}%")
 
-    # objetivo del ciclo y consecutivas
-    if g.cycle_target_amount > 0:
-        objetivo_mu = f"[bold green]+${g.cycle_target_amount:.2f}[/bold green]"
-    else:
-        objetivo_mu = "[dim]calculando...[/dim]"
-    max_consec = MartingaleCalculator.MAX_CONSECUTIVE_ENTRIES
-    used = min(g.consecutive_count, max_consec)
-    if used >= max_consec:
-        consec_mu = f"[bold red]{used}/{max_consec}[/bold red]  [dim](límite)[/dim]"
-    elif used >= max_consec - 1:
-        consec_mu = f"[bold yellow]{used}/{max_consec}[/bold yellow]"
-    else:
-        consec_mu = f"[bold]{used}/{max_consec}[/bold]"
-    t.add_row("Objetivo:",     objetivo_mu)
-    t.add_row("Consecutivas:", consec_mu)
-
-    # contexto de gale (protocolo por estrategia+par)
-    ctx = str(getattr(g, "context_key", "") or "")
-    if ctx:
-        t.add_row("Protocolo:", f"[dim]{ctx}[/dim]")
-
-    border = "red" if g.is_losing else "green"
-    if g.gale_fired:
-        border = "yellow"
-    title_suffix = "  [bold red]● ACTIVO[/bold red]" if g.active else ""
-    return panel_cls(t, title=f"[bold yellow]GALE WATCHER[/bold yellow]{title_suffix}",
+    border = "red" if (m.max_daily_loss < 999999.0 and m.daily_loss >= m.max_daily_loss * 0.8) else "cyan"
+    title_suffix = "  [bold red]● ACTIVO[/bold red]" if m.active else ""
+    return panel_cls(t, title=f"[bold cyan]MASANIELLO MANAGER[/bold cyan]{title_suffix}",
                      border_style=border, padding=(0, 1))
 
 
@@ -589,7 +505,7 @@ def _build_logs_panel(state: HubState) -> "Panel":
 
     return panel_cls(
         inner,
-        title="[bold white]MINI TERMINAL LOGS[/bold white] [dim](tail en vivo)[/dim]",
+        title="[bold white]EVENTOS RECIENTES[/bold white] [dim](log en vivo)[/dim]",
         border_style="white",
         padding=(0, 1),
     )
@@ -602,8 +518,6 @@ def _build_quick_levels_panel(state: HubState) -> "Panel":
 
     all_candidates: List[CandidateData] = (
         list(state.strat_a_watching[:5])
-        + list(state.strat_b_watching[:5])
-        + list(state.strat_c_watching[:5])
     )
 
     # Priorizar candidatos mas cercanos al trigger y luego por score/conf.
@@ -636,7 +550,7 @@ def _build_quick_levels_panel(state: HubState) -> "Panel":
 
     return panel_cls(
         t,
-        title="[bold white]NIVELES RAPIDOS[/bold white] [dim](Soporte / Resistencia)[/dim]",
+        title="[bold white]NIVELES CLAVE[/bold white] [dim](Soporte / Resistencia)[/dim]",
         border_style="white",
         padding=(0, 1),
     )
@@ -658,12 +572,12 @@ def _build_layout(state: HubState, balance: float) -> "Layout":
         layout_cls(name="footer", size=1),
     )
 
-    layout["body"].split_row(layout_cls(name="strat_a"), layout_cls(name="strat_b"), layout_cls(name="strat_c"))
+    layout["body"].split_row(layout_cls(name="strat_a"))
 
     layout["header"].update(
         panel_cls(
             _build_status_table(state, balance),
-            title="[bold cyan]QUOTEX BOT HUB — LIVE[/bold cyan]",
+            title="[bold cyan]QUOTEX OPERATIONS HUB[/bold cyan]",
             border_style="cyan",
         )
     )
@@ -682,42 +596,13 @@ def _build_layout(state: HubState, balance: float) -> "Layout":
         )
     )
 
-    b_count = len(state.strat_b_watching)
-    b_inner = table_cls.grid(expand=True)
-    b_inner.add_column()
-    b_inner.add_row(text_cls.from_markup("[dim]Conf · Dir · Dist-trigger · Soporte/Resistencia · Señal · Patron[/dim]"))
-    b_inner.add_row(_build_strat_b_table(state.strat_b_watching))
-    layout["strat_b"].update(
-        panel_cls(
-            b_inner,
-            title=f"[bold magenta]STRAT-B | SPRING/WYCKOFF[/bold magenta]  [dim]({b_count})[/dim]",
-            border_style="magenta",
-            padding=(0, 1),
-        )
-    )
-
-    c_count = len(state.strat_c_watching)
-    c_inner = table_cls.grid(expand=True)
-    c_inner.add_column()
-    c_inner.add_row(text_cls.from_markup("[dim]Score · Dir · Dist-trigger · Soporte/Resistencia · Señal · Patron[/dim]"))
-    c_inner.add_row(_build_strat_c_table(state.strat_c_watching))
-    layout["strat_c"].update(
-        panel_cls(
-            c_inner,
-            title=f"[bold blue]STRAT-C | RECHAZO 30s[/bold blue]  [dim]({c_count})[/dim]",
-            border_style="blue",
-            padding=(0, 1),
-        )
-    )
-
     layout["gale"].update(_build_gale_panel(state))
     layout["levels"].update(_build_quick_levels_panel(state))
     layout["logs"].update(_build_logs_panel(state))
 
     layout["footer"].update(
         text_cls(
-            "CTRL+C para salir  |  Escaneo continuo  |  "
-            "● verde=≤0.10%  ● amarillo=≤0.30%  ● dim=lejos del trigger",
+            "CTRL+C para salir  |  Escaneo continuo  |  Distancia al trigger: verde <=0.10%, amarillo <=0.30%, tenue >0.30%",
             justify="center",
             style="dim",
         )
@@ -863,8 +748,6 @@ class HubDashboard:
         # ── Secciones de estrategias ──────────────────────────────────────
         strat_defs = [
             ("A", "STRAT-A  Consolidación / Rebote",  state.strat_a_watching),
-            ("B", "STRAT-B  Spring / Sweep",           state.strat_b_watching),
-            ("C", "STRAT-C  Rechazo M1 (30s)",         state.strat_c_watching),
         ]
         for _key, label, candidates in strat_defs:
             lines.append(f"{_BOLD}  [{label}]{_RESET}")
@@ -883,74 +766,64 @@ class HubDashboard:
                     )
             lines.append(sep2)
 
-        # ── Niveles rápidos (sección combinada) ───────────────────────────
-        lines.append(f"{_BOLD}  [NIVELES S/R]{_RESET}")
-        quick = (
-            list(state.strat_a_watching[:5])
-            + list(state.strat_b_watching[:5])
-            + list(state.strat_c_watching[:5])
-        )
-        quick.sort(key=lambda c: (9999.0 if c.dist_pct is None else c.dist_pct, -c.rank_value))
-        if not quick:
-            lines.append(f"  {_DIM}  Sin niveles en este escaneo{_RESET}")
-        else:
-            for i, c in enumerate(quick[:10], 1):
-                strat_tag = c.strategy.replace("STRAT-", "S")
-                dir_color = _GREEN if c.direction.lower() == "call" else _RED
-                dist = f"Dist:{c.dist_pct * 100:.2f}%" if c.dist_pct is not None else ""
-                lines.append(
-                    f"  {i:>2}. {_DIM}{strat_tag:<2}{_RESET} {c.asset:<13}"
-                    f"  {dir_color}{c.direction.upper():<4}{_RESET}"
-                    f"  {c.zone_floor:.5f} ── {c.zone_ceiling:.5f}"
-                    f"  {_DIM}{dist}{_RESET}"
-                )
         lines.append(sep)
 
-        # ── GALE WATCHER ──────────────────────────────────────────────────
-        g = state.gale
-        lines.append(f"{_BOLD}{_YELLOW}  [GALE WATCHER]{_RESET}")
-        if not g.active:
+        # ── MASANIELLO MANAGER ────────────────────────────────────────────
+        m = state.masaniello
+        lines.append(f"{_BOLD}{_CYAN}  [MASANIELLO MANAGER]{_RESET}")
+        if not m.active:
             lines.append(f"  {_DIM}  Sin operación activa{_RESET}")
+            first_amount = m.next_amount if m.next_amount > 0 else (m.current_amount if m.current_amount > 0 else 1.01)
+            lines.append(f"  {_YELLOW}  Primer monto: ${first_amount:.2f}{_RESET}")
+            if m.trades_in_cycle > 0 or m.sequence:
+                wr_color = _GREEN if m.win_rate_pct >= 60 else (_YELLOW if m.win_rate_pct >= 50 else _RED)
+                pnl_color = _GREEN if m.total_pnl >= 0 else _RED
+                loss_color = _GREEN if m.max_daily_loss >= 999999.0 else (_RED if m.daily_loss >= m.max_daily_loss * 0.8 else _YELLOW if m.daily_loss >= m.max_daily_loss * 0.5 else _GREEN)
+                _loss_limit_str = "sin límite" if m.max_daily_loss >= 999999.0 else f"${m.max_daily_loss:.2f}"
+                lines.append(
+                    f"  Ciclo #{m.cycle_num}  {m.trades_in_cycle}/{m.cycle_target_ops} ops  "
+                    f"{m.wins_in_cycle}W/{m.losses_in_cycle}L  {_DIM}Tiempo 00:00{_RESET}"
+                )
+                lines.append(
+                    f"  Monto:${m.current_amount:.2f}  →  Próximo:${m.next_amount:.2f}  "
+                    f"{wr_color}WR:{m.win_rate_pct:.0f}%{_RESET}  {pnl_color}P&L:{m.total_pnl:+.2f}${_RESET}"
+                )
+                lines.append(f"  {_DIM}Secuencia ciclo: {m.sequence or '-'}{_RESET}")
+                lines.append(
+                    f"  Pérdida Diaria:{loss_color}${m.daily_loss:.2f}/{_loss_limit_str}{_RESET}  "
+                    f"Config:L3={m.multiplier}x  L5={m.commission_pct}%"
+                )
+            lines.append(f"  {_DIM}  Base/Ciclo: ${m.reference_balance:.2f} | {m.cycle_target_ops}/{m.cycle_target_wins}{_RESET}")
         else:
-            dir_color = _GREEN if g.direction.upper() == "CALL" else _RED
-            status = f"{_RED}⚠ PERDIENDO{_RESET}" if g.is_losing else f"{_GREEN}✓ GANANDO{_RESET}"
-            drift = max(0.0, time.time() - g.updated_at) if g.updated_at > 0 else 0.0
-            secs = max(0.0, g.secs_remaining - drift)
+            dir_color = _GREEN if m.direction.upper() == "CALL" else _RED
+            drift = max(0.0, time.time() - m.updated_at) if m.updated_at > 0 else 0.0
+            secs = max(0.0, m.secs_remaining - drift)
             mm, ss = divmod(int(secs), 60)
-            fired = (
-                f"{_GREEN}✔ ENVIADO{_RESET}" if g.gale_fired and g.gale_success
-                else (f"{_RED}✗ ERROR{_RESET}" if g.gale_fired else f"{_DIM}En espera{_RESET}")
-            )
-            safety = str(getattr(g, "safety_status", "OK") or "OK").upper()
-            if safety == "OK":
-                safety_txt = f"{_GREEN}OK{_RESET}"
-            elif safety == "RIESGO":
-                safety_txt = f"{_RED}RIESGO{_RESET}"
-            elif safety == "LIMITE":
-                safety_txt = f"{_YELLOW}LIMITE{_RESET}"
-            elif safety == "CICLO":
-                safety_txt = f"{_BLUE}CICLO{_RESET}"
-            else:
-                safety_txt = f"{_RED}ERROR{_RESET}"
-            obj = f"+${g.cycle_target_amount:.2f}" if g.cycle_target_amount > 0 else "calculando..."
-            max_c = MartingaleCalculator.MAX_CONSECUTIVE_ENTRIES
-            used = min(g.consecutive_count, max_c)
-            c_color = _RED if used >= max_c else (_YELLOW if used >= max_c - 1 else "")
-            ctx = str(getattr(g, "context_key", "") or "")
+            wr_color = _GREEN if m.win_rate_pct >= 60 else (_YELLOW if m.win_rate_pct >= 50 else _RED)
+            pnl_color = _GREEN if m.total_pnl >= 0 else _RED
+            
             lines.append(
-                f"  {g.asset.upper():<14} {dir_color}{g.direction.upper():<4}{_RESET}"
-                f"  EP:{g.entry_price:.5f}  PX:{g.current_price:.5f}"
-                f"  {g.delta_pct:+.4f}%  {status}"
+                f"  {m.asset.upper():<14} {dir_color}{m.direction.upper():<4}{_RESET}"
+                f"  EP:{m.entry_price:.5f}  PX:{m.current_price:.5f}"
+                f"  {m.delta_pct:+.4f}%"
             )
             lines.append(
-                f"  ⏱ {mm:02d}:{ss:02d}"
-                f"  Base:${g.amount_invested:.2f}  Gale:{_YELLOW}${g.gale_amount:.2f}{_RESET}"
-                f"  Disparo:{fired}  Seguridad:{safety_txt}"
+                f"  Ciclo #{m.cycle_num}  {m.trades_in_cycle}/{m.cycle_target_ops} ops  "
+                f"{m.wins_in_cycle}W/{m.losses_in_cycle}L  {_DIM}Tiempo {mm:02d}:{ss:02d}{_RESET}"
             )
             lines.append(
-                f"  Objetivo:{_GREEN}{obj}{_RESET}"
-                f"  Consecutivas:{c_color}{used}/{max_c}{_RESET}"
-                + (f"  {_DIM}{ctx}{_RESET}" if ctx else "")
+                f"  Monto:${m.current_amount:.2f}  →  Próximo:${m.next_amount:.2f}  "
+                f"{wr_color}WR:{m.win_rate_pct:.0f}%{_RESET}  {pnl_color}P&L:{m.total_pnl:+.2f}${_RESET}"
+            )
+            lines.append(f"  {_DIM}Secuencia ciclo: {m.sequence or '-'}{_RESET}")
+            loss_color = _GREEN if m.max_daily_loss >= 999999.0 else (_RED if m.daily_loss >= m.max_daily_loss * 0.8 else _YELLOW if m.daily_loss >= m.max_daily_loss * 0.5 else _GREEN)
+            _loss_limit_str = "sin límite" if m.max_daily_loss >= 999999.0 else f"${m.max_daily_loss:.2f}"
+            lines.append(
+                f"  Pérdida Diaria:{loss_color}${m.daily_loss:.2f}/{_loss_limit_str}{_RESET}  "
+                f"Config:L3={m.multiplier}x  L5={m.commission_pct}%"
+            )
+            lines.append(
+                f"  {_DIM}Base/Ciclo:${m.reference_balance:.2f} | {m.cycle_target_ops}/{m.cycle_target_wins}{_RESET}"
             )
         lines.append(sep)
 

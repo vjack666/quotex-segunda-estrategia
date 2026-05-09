@@ -1,62 +1,193 @@
 # QUOTEX Trading System
 
-Sistema de entrenamiento y ejecución para estrategias OTC en Quotex.
+Bot asyncio 24/7 para operar activos OTC en Quotex con tres estrategias independientes,
+martingala por contexto aislado, GaleWatcher en hilo dedicado y caja negra SQLite por día.
 
-## Estado actual
+---
 
-- STRAT-A (Consolidación) activa
-- STRAT-B (Spring/Upthrust) integrada y registrando en caja negra
-- Duración de orden: 300s (5m)
-- Caja negra en SQLite por día: data/db/trade_journal-YYYY-MM-DD.db
-- Stop-loss de sesión desactivado para entrenamiento (flag interno)
+## Estrategias activas
 
-## Estructura relevante
+| ID | Nombre | Duración | Estado |
+|----|--------|----------|--------|
+| STRAT-A | Consolidación (techo/piso en 5 min) | 300 s | **Opera** |
+| STRAT-B | Spring / Upthrust (sweep de liquidez) | 300 s | Solo aviso (usar `--strat-b-live` para operar) |
+| STRAT-C | Rechazo M1 en ventana 30–41 s | 60 s | **Opera** (habilitado por defecto) |
 
-- main.py: entrada principal (CLI + loop)
-- src/consolidation_bot.py: motor central
-- src/entry_scorer.py: scoring y selección de candidatos
-- src/strategy_spring_sweep.py: detección STRAT-B
-- src/trade_journal.py: persistencia de caja negra
-- documentacion/: documentación técnica
-- aprendizaje/: flujo de entrenamiento y mejora
-- lab/: scripts de análisis offline
+### STRAT-A — Consolidación
+- Escanea todos los activos OTC con payout ≥ 80 %.
+- Detecta consolidación en M5: mínimo 15 velas dentro del rango, ancho máximo 0.3 %.
+- Entra en techo (PUT) o piso (CALL) cuando el precio llega a la zona.
+- Umbral de score dinámico: base 50, rango bajo/alto 48–54 (configurable por CLI).
+- Bloqueo de re-entrada en la misma estructura: 180 min (configurable).
+
+### STRAT-B — Spring / Upthrust
+- Detecta barridos de liquidez en zonas de estructura.
+- Por defecto solo registra en caja negra sin abrir órdenes.
+- Activar con `--strat-b-live` y confianza mínima `--strat-b-min-confidence 0.70`.
+
+### STRAT-C — Rechazo M1 (30 s)
+- Evalúa la vela M1 en construcción entre el segundo 30 y 41.
+- Indicadores: ATR(7), BB(14,2), Estocástico Rápido(5,3), Estocástico Lento(14,3), EMA(8/21),
+  detección de zonas S/R (lookback=40).
+- Score máximo alcanzable: 11 puntos. Umbral de entrada: `MIN_SCORE = 7.0`.
+- Filtro ATR normalizado: `WICK_ATR_MIN = 0.15`, `WICK_ATR_MAX = 3.50`.
+- Mínimo 20 velas históricas requeridas para evaluar.
+- Módulo: `estrategia_30s/detector.py`.
+
+---
+
+## Martingala y gestión de capital
+
+- `MartingaleCalculator` (src/martingale_calculator.py): calcula la inversión siguiente
+  en base al saldo actual, objetivo de incremento y máximo de entradas consecutivas (4).
+- **Contexto aislado por estrategia+activo**: cada par (estrategia, activo) tiene su
+  propia instancia de calculadora para que una pérdida en EURUSD no contamine la secuencia
+  de GBPUSD. El martin anticipado usa siempre el calculador del contexto correcto.
+- Monto mínimo: `$1.01` (broker exige estrictamente > $1.00).
+- GaleWatcher (`mg/mg_watcher.py`): hilo independiente que monitorea la operación abierta,
+  consulta precio cada 1 s y dispara el gale exactamente 3 s antes del cierre si va perdiendo.
+
+---
+
+## Arquitectura
+
+```
+main.py                      ← Entrada CLI, configuración de runtime, lanzador de monitores
+src/
+  consolidation_bot.py       ← Motor central (STRAT-A, B, C), place_order, GaleWatcher bridge
+  entry_scorer.py            ← Scoring de candidatos STRAT-A
+  candle_patterns.py         ← Patrones de vela (rechazo, doji, envolvente…)
+  strategy_spring_sweep.py   ← Detección STRAT-B
+  martingale_calculator.py   ← Calculadora de martingala con contexto aislado
+  trade_journal.py           ← Registro de operaciones (SQLite trade_journal)
+  black_box_recorder.py      ← Caja negra completa (SQLite black_box_strat)
+  hub_strategy_monitor.py    ← Monitores externos A/B/C (consolas separadas)
+  smc_analysis.py            ← Análisis SMC auxiliar
+estrategia_30s/
+  detector.py                ← Detector STRAT-C (evaluar_vela)
+  indicadores_calc.py        ← EMA, BB, Estocástico, ATR
+  zonas.py                   ← Detección de zonas S/R
+mg/
+  mg_watcher.py              ← GaleWatcher (hilo dedicado)
+hub/
+  hub_dashboard.py           ← Panel HUB (render live/static)
+  hub_models.py              ← HubState, modelos de datos del panel
+data/
+  db/                        ← trade_journal-YYYY-MM-DD.db, black_box_strat-YYYY-MM-DD.db
+  logs/bot/                  ← consolidation_bot-YYYY-MM-DD.log
+  hub_runtime_state.json     ← Snapshot en vivo para los monitores A/B/C
+documentacion/               ← Documentación técnica detallada
+aprendizaje/                 ← Scripts de entrenamiento y archivo de sesión
+lab/                         ← Análisis offline y scripts de diagnóstico
+```
+
+### Detalles críticos de implementación
+
+- **GaleWatcher bridge**: `_run_on_main_loop_bounded` delega corrutinas del hilo GaleWatcher
+  al event loop principal vía `asyncio.run_coroutine_threadsafe`. Si el bridge supera el timeout
+  (`GALE_BRIDGE_PRICE_TIMEOUT_SEC = 2.2 s`), cancela el `concurrent.futures.Future` para evitar
+  acumulación de tareas huérfanas que congelen el loop.
+- **Reset de flags pyquotex**: si `buy()` expira en 30 s, se resetean
+  `ssl_Mutual_exclusion` y `ssl_Mutual_exclusion_write` para desbloquear el spin-lock interno
+  de la librería y permitir el siguiente `buy()` sin reconectar.
+- **Caja negra SQLite**: tablas `scans`, `scan_candidates`, `strategy_metrics`, `phase_log`.
+  Rotación diaria automática. Retención de archivos: 31 días.
+
+---
 
 ## Setup rápido (Windows PowerShell)
 
-1. cd c:\Users\v_jac\Desktop\QUOTEX - segunda estrategia
-2. python -m venv .venv
-3. .\.venv\Scripts\Activate.ps1
-4. pip install --upgrade pip
-5. pip install -r requirements.txt
+```powershell
+cd "C:\Users\v_jac\Desktop\QUOTEX - segunda estrategia"
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install --upgrade pip
+pip install -r requirements.txt
+```
 
-## Variables requeridas en .env
+## Variables requeridas en `.env`
 
-- QUOTEX_EMAIL
-- QUOTEX_PASSWORD
+```
+QUOTEX_EMAIL=tu@email.com
+QUOTEX_PASSWORD=tupassword
+```
+
+---
 
 ## Ejecución
 
-- Un ciclo: python main.py --once
-- Loop continuo: python main.py
-- Cuenta real: python main.py --real
-- HUB solo monitoreo (sin órdenes): python main.py --hub-readonly
+| Comando | Descripción |
+|---------|-------------|
+| `python main.py` | Loop continuo (DEMO) |
+| `python main.py --once` | Un solo ciclo y salir |
+| `python main.py --real` | Loop en cuenta REAL ⚠️ |
+| `python main.py --hub-readonly` | Solo monitoreo, sin órdenes |
+| `python main.py --strat-b-live` | Activa STRAT-B para operar |
+| `python main.py --no-strat-c-enabled` | Deshabilita STRAT-C |
+| `python main.py --no-hub-multi-monitor` | Sin consolas de monitor A/B/C |
 
-## Parámetros útiles (CLI)
+## Parámetros CLI principales
 
-- --min-payout 80
-- --cycle-ops 5
-- --cycle-wins 2
-- --cycle-profit-pct 0.10
-- --strat-b-live
-- --strat-b-min-confidence 0.70
-- --same-asset-cooldown-sec 65
-- --structure-entry-lock-ttl-min 180
+```
+Gestión de capital
+  --amount-initial 1.01          Monto mínimo de orden (broker: > $1.00)
+  --amount-martin 2.0            Incremento objetivo por ciclo
+  --max-loss-session 0.20        Stop-loss de sesión (fracción del saldo)
+  --cycle-ops 5                  Máximo de operaciones por ciclo
+  --cycle-wins 2                 Objetivo de aciertos por ciclo
+  --cycle-profit-pct 0.10        Take-profit por ciclo (fracción)
 
-## Flujo de aprendizaje recomendado
+Filtros operativos
+  --min-payout 80                Payout mínimo permitido
+  --scan-lead-sec 35.0           Anticipación del scan antes del open de vela
+  --same-asset-cooldown-sec 65   Cooldown entre entradas al mismo activo
 
-1. Ejecutar sesión de entrenamiento
-2. Exportar métricas: .venv\Scripts\python.exe aprendizaje\scripts\exportar_metricas_aprendizaje.py
-3. Revisar caja negra: .venv\Scripts\python.exe lab\full_session_review.py
-4. Revisar A/B: .venv\Scripts\python.exe lab\black_box_stratb.py
-5. Exportar velas: .venv\Scripts\python.exe lab\dump_candidate_candles.py
-6. Archivar sesión: powershell -ExecutionPolicy Bypass -File aprendizaje\scripts\cerrar_sesion_aprendizaje.ps1
+STRAT-A
+  --adaptive-threshold-base 50   Umbral base de score
+  --adaptive-threshold-low 48    Umbral bajo dinámico
+  --adaptive-threshold-high 54   Umbral alto dinámico
+  --structure-entry-lock-ttl-min 180
+
+STRAT-B
+  --strat-b-live                 Habilitar órdenes STRAT-B
+  --strat-b-min-confidence 0.70  Confianza mínima para entrar
+
+STRAT-C
+  --strat-c-min-score 7.0        Score mínimo [0–11]
+  --strat-c-wick-atr-min 0.15    Wick mínimo en unidades ATR
+  --strat-c-wick-atr-max 3.50    Wick máximo en unidades ATR
+
+STRAT-C — ventana de entrada M1
+  --rejection-entry-window-start-sec 30
+  --rejection-entry-window-end-sec 41
+  --rejection-call-min-lower-wick 0.30
+  --rejection-total-min-body 0.55
+  --rejection-disallow-partial    Solo rechazos totales
+```
+
+---
+
+## Análisis y flujo de aprendizaje
+
+```powershell
+# Revisar caja negra del día
+.venv\Scripts\python.exe lab\full_session_review.py
+
+# Análisis STRAT-C en detalle
+.venv\Scripts\python.exe real_strat_c_analysis.py
+
+# Análisis STRAT-B
+.venv\Scripts\python.exe lab\black_box_stratb.py
+
+# Exportar velas de candidatos
+.venv\Scripts\python.exe lab\dump_candidate_candles.py
+
+# Buscar orden por ID
+.venv\Scripts\python.exe buscar_orden.py <ORDER_ID>
+
+# Exportar métricas de aprendizaje
+.venv\Scripts\python.exe aprendizaje\scripts\exportar_metricas_aprendizaje.py
+
+# Archivar sesión
+powershell -ExecutionPolicy Bypass -File aprendizaje\scripts\cerrar_sesion_aprendizaje.ps1
+```

@@ -51,7 +51,7 @@ from datetime import timedelta
 from math import ceil
 from pathlib import Path
 from statistics import mean
-from typing import Any, Awaitable, Callable, Coroutine, Deque, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Coroutine, Deque, List, Optional, Tuple, cast
 
 # ── Cargar .env ───────────────────────────────────────────────────────────────
 for _candidate in (Path(__file__).parent / ".env", Path(__file__).parent.parent / ".env"):
@@ -78,17 +78,30 @@ from strategy_spring_sweep import detect_spring_or_upthrust
 from trade_journal import get_journal
 from black_box_recorder import get_black_box
 from martingale_calculator import MartingaleCalculator
+from src.masaniello_engine import MasanielloEngine, MasanielloConfig
 from hub.hub_scanner import HubScanner
 from hub.hub_models import CandidateData
 
-try:
-    from estrategia_30s import detector as strat_c_detector
-    from estrategia_30s.zonas import detectar_zonas_sr as _strat_c_detect_zones
-    _STRAT_C_AVAILABLE = True
-except Exception:
-    strat_c_detector = None  # type: ignore
-    _strat_c_detect_zones = None  # type: ignore
-    _STRAT_C_AVAILABLE = False
+
+class _StratCDetectorStub:
+    """Stub para mantener compatibilidad cuando STRAT-C está archivada."""
+
+    def __getattr__(self, _name: str):
+        def _noop(*_args, **_kwargs):
+            return None
+        return _noop
+
+
+# STRAT-C archivada temporalmente: se deja stub para no romper código legado.
+strat_c_detector = _StratCDetectorStub()
+
+
+def _strat_c_detect_zones(*_args, **_kwargs):
+    return []
+
+
+_STRAT_C_AVAILABLE = os.getenv("DISABLE_STRAT_C_RUNTIME", "1") != "1"
+StratCSignal = Tuple[str, float, dict[str, Any]]
 
 # Motor de Gale — ruta relativa al ROOT del proyecto
 import sys as _sys
@@ -174,11 +187,11 @@ MIN_CONSOLIDATION_BARS = 12      # mínimo de velas DENTRO del rango
 MAX_RANGE_PCT          = 0.003   # 0.3% — amplitud máxima del rango
 TOUCH_TOLERANCE_PCT    = 0.00035 # 0.035% — tolerancia para "tocar" techo/piso
 MAX_CONSOLIDATION_MIN  = 0       # 0 = sin límite de tiempo para descartar zona
-MIN_PAYOUT             = 80      # payout mínimo %
+MIN_PAYOUT             = 85      # payout mínimo base de riesgo
 DURATION_SEC           = 300     # duración fija de cada opción binaria (5 min)
 SCAN_INTERVAL_SEC      = 60      # segundos entre escaneos completos
 CONNECT_RETRIES        = 3       # reintentos de conexión con delay
-MAX_CONCURRENT_TRADES  = 2       # máximo de operaciones abiertas simultáneas (1 por estrategia)
+MAX_CONCURRENT_TRADES  = 1       # una sola operación activa a la vez para controlar el gale
 COOLDOWN_BETWEEN_ENTRIES = 30    # espera entre órdenes exitosas (segundos)
 LIVE_SCAN_MODE           = True  # escaneo continuo "super live" guiado por flujo de Quotex
 LIVE_SCAN_SLEEP_SEC      = 1.0   # pausa mínima entre ciclos live para no saturar WS
@@ -318,6 +331,16 @@ BROKER_TZ_LABEL = "UTC-3"
 # Gestión de monto dinámico para cerrar en enteros y evitar centavos residuales.
 # Broker OTC: monto mínimo aceptado estrictamente mayor a $1.00.
 MIN_ORDER_AMOUNT       = 1.01
+MASANIELLO_AUTO_INITIAL_FROM_BALANCE = True
+MASANIELLO_INITIAL_BALANCE_PCT = 0.01  # 1% del saldo detectado
+MASANIELLO_REFERENCE_BALANCE = 100.0
+MASANIELLO_FIXED_CYCLE_OPS = 5
+MASANIELLO_FIXED_CYCLE_WINS = 2
+MASANIELLO_EXCEL_MIRROR_ENABLED = True
+MASANIELLO_EXCEL_MIRROR_PATH = r"C:\Users\v_jac\Documents\Downloads\Masaniello.xlsx"
+MASANIELLO_EXCEL_MIRROR_SHEET = "Calcolatore"
+MASANIELLO_EXCEL_MIRROR_COLUMN = "B"
+MASANIELLO_EXCEL_MIRROR_START_ROW = 3
 MARTIN_MAX_PCT_BALANCE = 0.20  # cap global: martingala <= 20% del balance actual
 MARTIN_MAX_ATTEMPTS_SESSION = 2
 MARTIN_LOW_BALANCE_THRESHOLD = 100.0
@@ -749,7 +772,8 @@ async def get_open_assets(client: Quotex, min_payout: int = MIN_PAYOUT) -> List[
             payout  = int(i[18]) if len(i) > 18 else 0
         except (IndexError, TypeError, ValueError):
             continue
-        if sym.endswith("_otc") and is_open and payout >= min_payout:
+        # Escaneo conservador: solo activos con payout estrictamente mayor al mínimo.
+        if sym.endswith("_otc") and is_open and payout > min_payout:
             result.append((sym, payout))
 
     result.sort(key=lambda x: -x[1])
@@ -936,7 +960,14 @@ async def place_order(
         last_reason = ""
         for attempt in range(1, CONNECT_RETRIES + 1):
             try:
-                await client.close()
+                await asyncio.wait_for(client.close(), timeout=3.0)
+            except asyncio.TimeoutError:
+                log.warning(
+                    "  Reconexión %s timeout en close() intento %d/%d",
+                    step_label,
+                    attempt,
+                    CONNECT_RETRIES,
+                )
             except Exception:
                 pass
 
@@ -981,7 +1012,9 @@ async def place_order(
 
     async def _log_pre_buy() -> None:
         try:
-            ws_alive = await client.check_connect()
+            ws_alive = await asyncio.wait_for(client.check_connect(), timeout=3.0)
+        except asyncio.TimeoutError:
+            ws_alive = False
         except Exception:
             ws_alive = False
         log.info(
@@ -1018,6 +1051,17 @@ async def place_order(
             "abierta en broker. Verificar manualmente.",
             elapsed,
         )
+        # Pyquotex usa un busy-wait sobre ssl_Mutual_exclusion_write.
+        # Si buy() fue cancelado a mitad del websocket.send(), el flag queda
+        # en True para siempre y el próximo send congela el event loop entero.
+        # Resetear aquí garantiza que _force_reconnect() posterior pueda enviar.
+        try:
+            _api = client.api
+            if _api is not None:
+                _api.state.ssl_Mutual_exclusion = False
+                _api.state.ssl_Mutual_exclusion_write = False
+        except Exception:
+            pass
         return False, "", 0.0, 0, "buy_timeout_30s", 0.0, "", 0.0
     except Exception as exc:
         elapsed = time.time() - t0
@@ -1050,6 +1094,13 @@ async def place_order(
                 "  ⏱ buy() reintento sin respuesta en 30s (elapsed=%.1fs)",
                 elapsed_retry,
             )
+            try:
+                _api = client.api
+                if _api is not None:
+                    _api.state.ssl_Mutual_exclusion = False
+                    _api.state.ssl_Mutual_exclusion_write = False
+            except Exception:
+                pass
             return False, "", 0.0, 0, "buy_timeout_30s_retry", 0.0, "", 0.0
         except Exception as retry_exc:
             elapsed_retry = time.time() - t0_retry
@@ -1126,6 +1177,13 @@ async def place_order(
                 "  ⏱ buy() reintento sin respuesta en 30s (elapsed=%.1fs)",
                 elapsed_retry,
             )
+            try:
+                _api = client.api
+                if _api is not None:
+                    _api.state.ssl_Mutual_exclusion = False
+                    _api.state.ssl_Mutual_exclusion_write = False
+            except Exception:
+                pass
             return False, "", 0.0, 0, "buy_timeout_30s_retry", 0.0, "", 0.0
         except Exception as retry_exc:
             elapsed_retry = time.time() - t0_retry
@@ -1222,6 +1280,38 @@ class ConsolidationBot:
         self.last_closed_outcome:   str   = ""
         self.session_start_balance: Optional[float] = None
         self.current_balance:       Optional[float] = None
+        self._masaniello_initial_auto_applied: bool = False
+        # ── Masaniello Engine para gestión de riesgo dinámica ──
+        initial_amount_cfg = max(
+            MIN_ORDER_AMOUNT,
+            float(getattr(MasanielloConfig, "initial_amount", MIN_ORDER_AMOUNT)),
+        )
+        masaniello_cfg = MasanielloConfig(
+            cycle_target_ops=MASANIELLO_FIXED_CYCLE_OPS,
+            cycle_target_wins=MASANIELLO_FIXED_CYCLE_WINS,
+            multiplier=1.0 + (float(MIN_PAYOUT) / 100.0),  # L3 (Excel): 1 + payout
+            commission_pct=2.0,  # L5 — porcentaje de comisión
+            initial_amount=initial_amount_cfg,
+            reference_balance=float(MASANIELLO_REFERENCE_BALANCE),
+            max_daily_loss=999999.0,  # Sin límite diario — modo recolección de datos
+            # Payout base de riesgo: por arriba de este valor no se asume ventaja extra.
+            payout_pct=float(MIN_PAYOUT),
+            excel_mirror_enabled=bool(MASANIELLO_EXCEL_MIRROR_ENABLED),
+            excel_mirror_path=str(MASANIELLO_EXCEL_MIRROR_PATH),
+            excel_mirror_sheet=str(MASANIELLO_EXCEL_MIRROR_SHEET),
+            excel_mirror_column=str(MASANIELLO_EXCEL_MIRROR_COLUMN),
+            excel_mirror_start_row=int(MASANIELLO_EXCEL_MIRROR_START_ROW),
+        )
+        self.masaniello: MasanielloEngine = MasanielloEngine(masaniello_cfg)
+        # Política fija pedida: ciclo Masaniello siempre calibrado sobre banca base de $100.
+        _fixed_initial_raw = self.masaniello.calculate_initial_amount_from_balance(
+            float(MASANIELLO_REFERENCE_BALANCE)
+        )
+        _fixed_initial = max(MIN_ORDER_AMOUNT, self._round_up_to_cents(_fixed_initial_raw))
+        self.masaniello.config.initial_amount = float(_fixed_initial)
+        self.masaniello.state.current_capital = float(_fixed_initial)
+        self._masaniello_initial_auto_applied = True
+        # ── Legacy martingale para compatibilidad histórica ──
         self.martingale:            MartingaleCalculator = MartingaleCalculator()
         # Calculadoras aisladas para GALE por contexto (estrategia+par).
         # Evita que una pérdida en STRAT-B/ASSET_X contamine STRAT-A/ASSET_Y.
@@ -1264,6 +1354,19 @@ class ConsolidationBot:
         # Blacklist temporal de activos por racha de pérdidas.
         # Hub para registrar candidatos en tiempo real
         self.hub = HubScanner()
+        self.hub.update_masaniello_state(
+            active=False,
+            current_amount=float(self.masaniello.config.initial_amount),
+            next_amount=float(self.masaniello.config.initial_amount),
+            sequence="",
+            cycle_target_ops=int(self.masaniello.config.cycle_target_ops),
+            cycle_target_wins=int(self.masaniello.config.cycle_target_wins),
+            reference_balance=float(MASANIELLO_REFERENCE_BALANCE),
+            multiplier=float(self.masaniello.config.multiplier),
+            commission_pct=float(self.masaniello.config.commission_pct),
+            max_daily_loss=float(self.masaniello.config.max_daily_loss),
+            payout=int(self.masaniello.config.payout_pct),
+        )
         self.black_box = get_black_box()
         self.last_scan_strat_a: List[CandidateEntry] = []
         self.last_scan_strat_b: List[CandidateEntry] = []
@@ -1285,6 +1388,8 @@ class ConsolidationBot:
         # Bloquea nuevas entradas de estrategia aunque self.trades ya esté vacío
         # (la trade base expiró pero el gale todavía está corriendo).
         self._gale_order_active: bool = False
+        # Timestamp del momento en que se activó el flag (para watchdog de seguridad)
+        self._gale_order_active_since: float = 0.0
         # Motor de Gale — vigila operaciones activas y dispara compensación en T-1s
         if _GALE_WATCHER_AVAILABLE and GaleWatcher is not None:
             self._gale_watcher = GaleWatcher(
@@ -1443,6 +1548,7 @@ class ConsolidationBot:
         self.martingale.set_balance(float(balance))
         self.martingale.configure_growth_target(float(balance), pct=0.02)
         self.hub.state.known_balance = float(balance)
+        self._maybe_apply_balance_based_initial_amount(float(balance), source="session_start")
         if self.cycle_start_balance is None:
             self.cycle_start_balance = float(balance)
 
@@ -1450,43 +1556,97 @@ class ConsolidationBot:
     def _round_up_to_cents(value: float) -> float:
         return ceil(max(0.0, value) * 100.0) / 100.0
 
+    def _maybe_apply_balance_based_initial_amount(self, balance: float, source: str = "unknown") -> None:
+        """Aplica monto inicial auto al detectar balance, incluso si llega tarde."""
+        if self._masaniello_initial_auto_applied:
+            return
+        if not MASANIELLO_AUTO_INITIAL_FROM_BALANCE:
+            return
+        if balance <= 0:
+            return
+
+        # Política fija: cálculo siempre sobre banca de referencia, no sobre saldo variable.
+        computed_raw = self.masaniello.calculate_initial_amount_from_balance(
+            float(MASANIELLO_REFERENCE_BALANCE)
+        )
+
+        if computed_raw <= 0:
+            # Respaldo por porcentaje configurable si la fórmula no resulta evaluable.
+            pct = max(0.001, float(MASANIELLO_INITIAL_BALANCE_PCT))
+            computed_raw = float(balance) * pct
+
+        computed = self._round_up_to_cents(computed_raw)
+        computed = max(MIN_ORDER_AMOUNT, computed)
+
+        self.masaniello.config.initial_amount = float(computed)
+        # Solo ajustar capital interno si aún no hay operaciones registradas.
+        if self.masaniello.state.trades_in_cycle == 0 and self.masaniello.state.wins_in_cycle == 0 and self.masaniello.state.losses_in_cycle == 0:
+            self.masaniello.state.current_capital = float(computed)
+
+        self.hub.update_masaniello_state(
+            active=False,
+            current_amount=float(computed),
+            next_amount=float(computed),
+            sequence="",
+            cycle_target_ops=int(self.masaniello.config.cycle_target_ops),
+            cycle_target_wins=int(self.masaniello.config.cycle_target_wins),
+            reference_balance=float(MASANIELLO_REFERENCE_BALANCE),
+        )
+        self._masaniello_initial_auto_applied = True
+        log.info(
+            "Masaniello monto inicial auto aplicado (%s): saldo=%.2f referencia=%.2f ops=%d wins=%d payout=%.1f%% -> $%.2f",
+            source,
+            float(balance),
+            float(MASANIELLO_REFERENCE_BALANCE),
+            int(self.masaniello.config.cycle_target_ops),
+            int(self.masaniello.config.cycle_target_wins),
+            float(self.masaniello.config.payout_pct),
+            float(computed),
+        )
+
     def _compute_initial_amount(self, payout_pct: int) -> Tuple[float, float]:
         """
-        Calcula monto inicial usando MartingaleCalculator.
+        Calcula monto inicial usando MasanielloEngine.
         Retorna (monto, ganancia_esperada).
         """
-        if self.current_balance is not None:
-            self.martingale.sync_balance(self.current_balance)
-
-        amount, status = self.martingale.calculate_investment(payout_pct)
-
-        if status != "OK":
-            log.warning(f"⚠ _compute_initial_amount: {status} | amount={amount:.2f}")
-            return 0.0, 0.0
-
-        # Calcular ganancia esperada
-        payout_rate = max(0.01, float(payout_pct) / 100.0)
+        # Usar el monto ya sincronizado por Masaniello para la siguiente entrada.
+        current_capital = (
+            self.masaniello.state.current_capital
+            if hasattr(self.masaniello.state, "current_capital")
+            else self.masaniello.config.initial_amount
+        )
+        amount = self._round_up_to_cents(max(MIN_ORDER_AMOUNT, float(current_capital)))
+        
+        # Cálculo conservador: no capitaliza payout por encima del mínimo base.
+        effective_payout_pct = min(int(payout_pct), int(MIN_PAYOUT))
+        payout_rate = max(0.01, float(effective_payout_pct) / 100.0)
         expected_profit = self._round_up_to_cents(amount * payout_rate)
 
         return amount, expected_profit
 
-    def _compute_compensation_amount(self, payout_pct: int, base_loss: float) -> Tuple[float, float]:
+    def _compute_compensation_amount(
+        self,
+        payout_pct: int,
+        base_loss: float,
+        calc: Optional["MartingaleCalculator"] = None,
+    ) -> Tuple[float, float]:
         """
-        Calcula monto de compensación (gale) usando MartingaleCalculator.
+        Calcula monto de compensación (gale) usando MasanielloEngine.
         Retorna (monto, ganancia_esperada).
+
+        El parámetro ``calc`` se mantiene solo por compatibilidad histórica.
         """
-        # Registra pérdida anterior
-        if self.current_balance is not None:
-            self.martingale.sync_balance(self.current_balance)
+        # Usar el monto ya sincronizado por Masaniello tras el último resultado.
+        current_amount = (
+            self.masaniello.state.current_capital
+            if hasattr(self.masaniello.state, "current_capital")
+            else self.masaniello.config.initial_amount
+        )
+        amount = self._round_up_to_cents(max(MIN_ORDER_AMOUNT, float(current_amount)))
 
-        # Calcula inversión para el próximo gale
-        amount, status = self.martingale.calculate_investment(payout_pct)
-
-        if status != "OK":
-            log.warning(f"⚠ _compute_compensation_amount: {status} | amount={amount:.2f}")
-            return 0.0, 0.0
-
-        payout_rate = max(0.01, float(payout_pct) / 100.0)
+        # Cálculo conservador: no capitaliza payout por encima del mínimo base.
+        effective_payout_pct = min(int(payout_pct), int(MIN_PAYOUT))
+        payout_rate = max(0.01, float(effective_payout_pct) / 100.0)
         expected_profit = self._round_up_to_cents(amount * payout_rate)
 
         return amount, expected_profit
@@ -2680,6 +2840,17 @@ class ConsolidationBot:
                     range_pct=0.0,
                 )
                 trade.martin_fired = True
+                # Usar la calculadora de contexto del trade (aislada por estrategia+activo)
+                # para evitar que pérdidas de otros pares/estrategias inflen el monto del gale.
+                _ctx_key = self._gale_context_key(trade.strategy_origin, asset)
+                _ctx_calc = self._get_context_martingale(_ctx_key)
+                amount, _ = self._compute_compensation_amount(payout_now, trade.amount, calc=_ctx_calc)
+                if amount <= 0.0:
+                    log.warning(
+                        "⚠ MARTIN ANTICIPADO %s: monto calculado inválido (%.2f) — operación omitida",
+                        asset, amount,
+                    )
+                    return
                 log.info(
                     "⚡ MARTIN ANTICIPADO %s %s $%.2f — precio en contra con %.0fs restantes",
                     asset,
@@ -2949,6 +3120,10 @@ class ConsolidationBot:
         self.current_balance = bal
         self.martingale.sync_balance(bal)
         self.hub.state.known_balance = bal
+        if self.session_start_balance is None:
+            self.set_session_start_balance(bal)
+        else:
+            self._maybe_apply_balance_based_initial_amount(bal, source="hub_refresh")
         return True
 
     async def reconcile_pending_candidates(self, max_age_minutes: Optional[float] = None) -> None:
@@ -3228,12 +3403,12 @@ class ConsolidationBot:
         time_since_open = (send_adj - phase) % TF_1M
         secs_to_close = max(0.0, TF_1M - time_since_open)
 
-        if lag_sec > ENTRY_MAX_LAG_SEC or secs_to_close <= ENTRY_REJECT_LAST_SEC:
+        # Rechazo duro solo si queda muy poco tiempo en la vela 1m actual
+        if secs_to_close <= ENTRY_REJECT_LAST_SEC:
             log.info(
-                "⏳ Señal rechazada por timing 1m: lag=%.2fs, restante=%.2fs (max_lag=%.2fs)",
-                lag_sec,
+                "⏳ Señal rechazada por timing 1m: restante=%.2fs < mínimo %.2fs",
                 secs_to_close,
-                ENTRY_MAX_LAG_SEC,
+                ENTRY_REJECT_LAST_SEC,
             )
             return EntryTimingInfo(
                 ok=False,
@@ -3242,6 +3417,15 @@ class ConsolidationBot:
                 time_since_open_sec=time_since_open,
                 secs_to_close_sec=secs_to_close,
                 decision="REJECT_LATE_1M",
+            )
+
+        # Lag alto: advertencia pero no rechazo (reconexión puede causar lag legítimo)
+        if lag_sec > ENTRY_MAX_LAG_SEC:
+            log.warning(
+                "⚠ Lag alto en timing 1m: %.2fs > %.2fs — continuando (restante=%.2fs)",
+                lag_sec,
+                ENTRY_MAX_LAG_SEC,
+                secs_to_close,
             )
 
         duration_dynamic = DURATION_SEC
@@ -3503,7 +3687,7 @@ class ConsolidationBot:
                 _now = time.time()
                 _best_score: float = -1.0
                 _best_sym: Optional[str] = None
-                _best_result = None
+                _best_result: Optional[StratCSignal] = None
                 _best_payout: int = 0
                 _best_zones: list = []
 
@@ -3525,11 +3709,14 @@ class ConsolidationBot:
                         _zones_ts, _zones_list = self._strat_c_zones_cache.get(_sym, (0.0, []))
                         _zonas = _zones_list if (_now - _zones_ts < 300.0 and _zones_list) else None
 
-                        _result = strat_c_detector.evaluar_vela(
-                            _c_candles,
-                            zonas=_zonas,
-                            check_time=True,
-                            broker_ts=_broker_ts,
+                        _result = cast(
+                            Optional[StratCSignal],
+                            strat_c_detector.evaluar_vela(
+                                _c_candles,
+                                zonas=_zonas,
+                                check_time=True,
+                                broker_ts=_broker_ts,
+                            ),
                         )
                         if _result is not None:
                             _dir, _score, _detalle = _result
@@ -3679,6 +3866,19 @@ class ConsolidationBot:
         if await self.refresh_balance_and_risk():
             return
 
+        # Safety watchdog: liberar flag de gale si expiró el tiempo máximo posible
+        _MAX_GALE_LIFETIME_SEC = float(DURATION_SEC) + float(GALE_BRIDGE_ORDER_TIMEOUT_SEC) + 30.0
+        if self._gale_order_active and self._gale_order_active_since > 0:
+            _gale_elapsed = time.time() - self._gale_order_active_since
+            if _gale_elapsed > _MAX_GALE_LIFETIME_SEC:
+                log.warning(
+                    "⚠ _gale_order_active watchdog: flag activo por %.0fs > max %.0fs — liberando",
+                    _gale_elapsed,
+                    _MAX_GALE_LIFETIME_SEC,
+                )
+                self._gale_order_active = False
+                self._gale_order_active_since = 0.0
+
         assets = await get_open_assets(self.client, MIN_PAYOUT)
         if not assets:
             log.warning("No se obtuvieron activos OTC disponibles.")
@@ -3700,7 +3900,13 @@ class ConsolidationBot:
                  self.stats["scans"], len(assets), MIN_PAYOUT)
 
         # 1) Revisar martingalas de trades abiertos
-        for sym in list(self.trades.keys()):
+        # Snapshot de keys al inicio — evita KeyError si _resolve_trade elimina el trade
+        # durante un await interno de _check_martin (race condition asyncio)
+        _active_syms = list(self.trades.keys())
+        for sym in _active_syms:
+            if sym not in self.trades:
+                # Trade resuelto por task en background mientras iterábamos
+                continue
             entered = await self._check_martin(sym)
             if entered:
                 await sleep_with_inline_countdown(COOLDOWN_BETWEEN_ENTRIES, "⏳ Cooldown post-orden")
@@ -3927,12 +4133,15 @@ class ConsolidationBot:
                         # check_time=True + broker_ts: verificación definitiva sin UTC-3 hardcodeado.
                         # _in_entry_window es pre-filtro rápido; evaluar_vela confirma con broker_ts.
                         _c_broker_ts = self._broker_now_ts()
-                        _c_result = strat_c_detector.evaluar_vela(
-                            _c_candles_dict,
-                            zonas=_zonas_precomp if _zonas_precomp else None,
-                            check_time=True,
-                            broker_ts=_c_broker_ts,
-                        ) if _in_entry_window else None
+                        _c_result = cast(
+                            Optional[StratCSignal],
+                            strat_c_detector.evaluar_vela(
+                                _c_candles_dict,
+                                zonas=_zonas_precomp if _zonas_precomp else None,
+                                check_time=True,
+                                broker_ts=_c_broker_ts,
+                            ) if _in_entry_window else None,
+                        )
                         if _c_result is not None:
                             _c_direction, _c_score, _c_detalle = _c_result
                             _c_direction_lower = _c_direction.lower()
@@ -4834,6 +5043,11 @@ class ConsolidationBot:
                 log.info("⏳→✅ %d candidato(s) de pending_reversals agregados al ciclo.", len(pending_confirmed))
                 candidates.extend(pending_confirmed)
 
+        # Procesar martingalas diferidas antes de limpiar la cola
+        if self.pending_martin and len(self.trades) < MAX_CONCURRENT_TRADES and not self._gale_order_active:
+            candidates, _martin_entered = await self._process_pending_martin(candidates)
+            if _martin_entered:
+                log.info("🔄 Martin diferido ejecutado desde pending_martin")
         self.pending_martin.clear()
 
         prev_threshold = self.current_score_threshold
@@ -5203,6 +5417,10 @@ class ConsolidationBot:
         """
         if trade.resolved:
             return
+        # Marcar inmediatamente para evitar que dos llamadas concurrentes
+        # (ej. _resolve_trade_after_expiry + _check_martin) escriban doble
+        # en el black_box y el journal para el mismo trade.
+        trade.resolved = True
 
         journal = get_journal()
         order_id = str(trade.order_id or "").strip()
@@ -5283,8 +5501,6 @@ class ConsolidationBot:
             except Exception:
                 close_price = None
 
-        trade.resolved = True
-
         if trade.journal_id:
             journal.update_outcome_by_id(row_id=trade.journal_id, outcome=outcome, profit=profit)
         else:
@@ -5322,7 +5538,111 @@ class ConsolidationBot:
         log.info("🏁 %s %s $%.2f | saldo: $%.2f", sym, outcome, profit, balance_now)
         self._update_cycle_after_result(outcome=outcome, profit=profit)
 
-        # Sincronizar calculadora global (compatibilidad histórica).
+        # ── Procesar con Masaniello Engine ──
+        try:
+            masaniello_result = self.masaniello.process_trade(
+                result="W" if outcome == "WIN" else "L",
+                amount_risked=float(trade.amount),
+                payout_earned=float(profit) if outcome == "WIN" else 0.0
+            )
+            
+            # Actualizar HUB con estado Masaniello
+            m_trades = int(masaniello_result.get("trade_num", self.masaniello.state.trades_in_cycle))
+            m_wins = int(masaniello_result.get("wins", self.masaniello.state.wins_in_cycle))
+            m_losses = int(masaniello_result.get("losses", self.masaniello.state.losses_in_cycle))
+            win_rate = (m_wins / max(1, m_trades) * 100) if m_trades > 0 else 0.0
+            
+            await self._gale_on_status_bridge(
+                active=False,
+                asset="",
+                direction="",
+                entry_price=0.0,
+                current_price=0.0,
+                secs_remaining=0.0,
+                delta_pct=0.0,
+                sequence=str(masaniello_result.get("sequence", "")),
+                cycle_num=int(masaniello_result.get("cycle", self.masaniello.state.cycle_num)),
+                trades_in_cycle=m_trades,
+                wins_in_cycle=m_wins,
+                losses_in_cycle=m_losses,
+                cycle_target_ops=int(self.masaniello.config.cycle_target_ops),
+                cycle_target_wins=int(self.masaniello.config.cycle_target_wins),
+                reference_balance=float(MASANIELLO_REFERENCE_BALANCE),
+                current_amount=float(trade.amount),
+                next_amount=masaniello_result.get("next_amount", 1.01),
+                total_pnl=self.masaniello.state.total_pnl,
+                win_rate_pct=win_rate,
+                daily_loss=self.masaniello.state.daily_loss_accumulated,
+                max_daily_loss=self.masaniello.config.max_daily_loss,
+                multiplier=self.masaniello.config.multiplier,
+                commission_pct=self.masaniello.config.commission_pct,
+            )
+            
+            # Si ciclo está completo, refrescar inmediatamente el nuevo ciclo listo para operar.
+            if masaniello_result.get("cycle_complete", False):
+                next_cycle_first = float(
+                    self.masaniello.state.current_capital
+                    if hasattr(self.masaniello.state, "current_capital")
+                    else self.masaniello.config.initial_amount
+                )
+                await self._gale_on_status_bridge(
+                    active=False,
+                    asset="",
+                    direction="",
+                    entry_price=0.0,
+                    current_price=0.0,
+                    secs_remaining=0.0,
+                    delta_pct=0.0,
+                    sequence="",
+                    cycle_num=self.masaniello.state.cycle_num,
+                    trades_in_cycle=self.masaniello.state.trades_in_cycle,
+                    wins_in_cycle=self.masaniello.state.wins_in_cycle,
+                    losses_in_cycle=self.masaniello.state.losses_in_cycle,
+                    cycle_target_ops=int(self.masaniello.config.cycle_target_ops),
+                    cycle_target_wins=int(self.masaniello.config.cycle_target_wins),
+                    reference_balance=float(MASANIELLO_REFERENCE_BALANCE),
+                    current_amount=next_cycle_first,
+                    next_amount=next_cycle_first,
+                    total_pnl=self.masaniello.state.total_pnl,
+                    win_rate_pct=0.0,
+                    daily_loss=self.masaniello.state.daily_loss_accumulated,
+                    max_daily_loss=self.masaniello.config.max_daily_loss,
+                    multiplier=self.masaniello.config.multiplier,
+                    commission_pct=self.masaniello.config.commission_pct,
+                )
+                log.info("✓ Ciclo Masaniello completado | WR: %.0f%% | P&L: $%.2f",
+                         win_rate, self.masaniello.state.total_pnl)
+
+            if trade.black_box_candidate_id:
+                try:
+                    self.black_box.update_candidate(
+                        int(trade.black_box_candidate_id),
+                        masaniello_snapshot={
+                            "cycle": int(masaniello_result.get("cycle", self.masaniello.state.cycle_num)),
+                            "trade_num": int(masaniello_result.get("trade_num", self.masaniello.state.trades_in_cycle)),
+                            "sequence": str(masaniello_result.get("sequence", "")),
+                            "result": str(masaniello_result.get("result", "")),
+                            "amount_used": float(trade.amount),
+                            "next_amount": float(masaniello_result.get("next_amount", 0.0) or 0.0),
+                            "wins": int(masaniello_result.get("wins", self.masaniello.state.wins_in_cycle)),
+                            "losses": int(masaniello_result.get("losses", self.masaniello.state.losses_in_cycle)),
+                            "cycle_complete": bool(masaniello_result.get("cycle_complete", False)),
+                            "close_reason": str(masaniello_result.get("close_reason", "")),
+                            "total_pnl": float(masaniello_result.get("total_pnl", self.masaniello.state.total_pnl)),
+                            "bankroll": float(getattr(self.masaniello.state, "bankroll", 0.0)),
+                            "reference_balance": float(MASANIELLO_REFERENCE_BALANCE),
+                            "target_ops": int(self.masaniello.config.cycle_target_ops),
+                            "target_wins": int(self.masaniello.config.cycle_target_wins),
+                            "l3": float(self.masaniello.config.multiplier),
+                            "l5": float(self.masaniello.config.commission_pct),
+                        },
+                    )
+                except Exception as exc:
+                    log.debug("No se pudo guardar snapshot Masaniello en black box: %s", exc)
+        except Exception as exc:
+            log.debug("No se pudo procesar Masaniello tras %s: %s", outcome, exc)
+
+        # ── Sincronizar calculadora legacy (compatibilidad histórica) ──
         try:
             if outcome == "WIN":
                 self.martingale.sync_balance(self.current_balance if self.current_balance is not None else 0.0)
@@ -5479,9 +5799,8 @@ class ConsolidationBot:
         async def _await_in_main_loop() -> Any:
             return await coro
 
-        main_loop_coro: Coroutine[Any, Any, Any] = _await_in_main_loop()
-        fut = asyncio.run_coroutine_threadsafe(main_loop_coro, main_loop)
-        return await asyncio.wrap_future(fut)
+        cf_future = asyncio.run_coroutine_threadsafe(_await_in_main_loop(), main_loop)
+        return await asyncio.wrap_future(cf_future)
 
     async def _run_on_main_loop_bounded(
         self,
@@ -5490,17 +5809,49 @@ class ConsolidationBot:
         timeout_sec: float,
         bridge_name: str,
     ) -> Any:
-        """Ejecuta un bridge en loop principal con timeout duro y cancelación segura."""
+        """Ejecuta un bridge en loop principal con timeout duro y cancelación segura.
+
+        IMPORTANTE — fuga de tasks:
+        asyncio.wait_for sólo cancela el wrap_future local; NO cancela la task
+        que ya fue enviada al main loop vía run_coroutine_threadsafe.  Sin
+        cf_future.cancel() explícito, cada timeout deja una tarea huérfana
+        bloqueada en el main loop.  Con polling cada 1 s durante horas, esto
+        acumula miles de tasks → freeze del event loop.
+        """
+        main_loop = self._main_loop
+        if main_loop is None:
+            main_loop = asyncio.get_running_loop()
+            self._main_loop = main_loop
+
+        if main_loop.is_closed() or not main_loop.is_running():
+            raise RuntimeError("Main loop no disponible para bridge GALE")
+
+        current = asyncio.get_running_loop()
+        if main_loop is current:
+            # Mismo loop: no se necesita bridge, el timeout es suficiente.
+            try:
+                return await asyncio.wait_for(coro, timeout=timeout_sec)
+            except asyncio.TimeoutError as exc:
+                raise TimeoutError(f"bridge timeout (same-loop): {bridge_name}") from exc
+
+        # Loop remoto: retener cf_future para poder cancelar la task del main
+        # loop si este lado del bridge hace timeout.
+        async def _await_in_main_loop() -> Any:
+            return await coro
+
+        cf_future = asyncio.run_coroutine_threadsafe(_await_in_main_loop(), main_loop)
         try:
-            return await asyncio.wait_for(self._run_on_main_loop(coro), timeout=timeout_sec)
+            return await asyncio.wait_for(asyncio.wrap_future(cf_future), timeout=timeout_sec)
         except asyncio.TimeoutError as exc:
+            # Cancelar la task en el main loop para evitar acumulación.
+            cf_future.cancel()
             now = time.time()
             if not hasattr(self, "_gale_bridge_last_warn_ts"):
-                self._gale_bridge_last_warn_ts = {}
+                self._gale_bridge_last_warn_ts: dict[str, float] = {}
             last = float(self._gale_bridge_last_warn_ts.get(bridge_name, 0.0))
             if (now - last) >= GALE_BRIDGE_WARN_EVERY_SEC:
                 log.warning(
-                    "Gale bridge timeout (%s): %.1fs; se aplica fallback no bloqueante",
+                    "Gale bridge timeout (%s): %.1fs — task en main loop cancelada",
                     bridge_name,
                     timeout_sec,
                 )
@@ -5560,7 +5911,8 @@ class ConsolidationBot:
 
     async def _gale_on_status_bridge(self, **kwargs) -> None:
         async def _inner() -> None:
-            self.hub.update_gale_state(**kwargs)
+            # Usar Masaniello en lugar de GALE
+            self.hub.update_masaniello_state(**kwargs)
 
         try:
             await self._run_on_main_loop_bounded(
@@ -5573,10 +5925,11 @@ class ConsolidationBot:
 
     async def _gale_on_clear_bridge(self) -> None:
         async def _inner() -> None:
-            self.hub.clear_gale_state()
-            # El GaleWatcher terminó su ciclo — ya no hay gale activo en el broker.
+            # Limpiar estado Masaniello
+            self.hub.clear_masaniello_state()
+            # El ciclo terminó — ya no hay operación activa en el broker.
             self._gale_order_active = False
-            log.debug("_gale_on_clear_bridge: gale terminado — _gale_order_active=False")
+            log.debug("_gale_on_clear_bridge: ciclo Masaniello terminado — _gale_order_active=False")
 
         try:
             await self._run_on_main_loop_bounded(
@@ -5622,17 +5975,23 @@ class ConsolidationBot:
         def _done_callback(done_fut: ConcurrentFuture[Any]) -> None:
             self._gale_futures.discard(done_fut)
             if done_fut.cancelled():
+                # Tarea cancelada — limpiar flag para no bloquear próximas entradas
+                self._gale_order_active = False
+                self._gale_order_active_since = 0.0
                 return
             try:
                 done_fut.result()
             except Exception as exc:
                 log.error(
-                    "GaleWatcher task falló (%s | %s): %s",
+                    "GaleWatcher task falló (%s | %s): %s — forzando _gale_order_active=False",
                     stage,
                     context_key,
                     exc,
                     exc_info=(type(exc), exc, exc.__traceback__),
                 )
+                # Si el watcher murió sin llamar on_clear_fn, liberar el flag
+                self._gale_order_active = False
+                self._gale_order_active_since = 0.0
 
         fut.add_done_callback(_done_callback)
 
@@ -5661,6 +6020,7 @@ class ConsolidationBot:
             # Marcar que hay una orden de gale activa en el broker.
             # Esto bloquea nuevas entradas de estrategia mientras el gale corre.
             self._gale_order_active = True
+            self._gale_order_active_since = time.time()
             log.debug("_gale_place_order: gale confirmado — _gale_order_active=True")
         return ok, oid, open_price, order_ref, reason
 
