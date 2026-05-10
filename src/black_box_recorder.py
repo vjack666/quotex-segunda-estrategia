@@ -138,6 +138,18 @@ CREATE TABLE IF NOT EXISTS phase_log (
     
     created_at      TEXT DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS maintenance_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts              REAL NOT NULL,
+    ts_iso          TEXT NOT NULL,
+    category        TEXT NOT NULL,          -- HTF_LIBRARY | VIP_LIBRARY | SPIKE_FILTER | etc
+    subtype         TEXT NOT NULL,          -- REFRESH | ENTER | EXIT | PURGE | SUMMARY
+    asset           TEXT,
+    severity        TEXT DEFAULT 'INFO',
+    payload_json    TEXT,
+    created_at      TEXT DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 
@@ -165,6 +177,26 @@ class BlackBoxRecorder:
             ]
             if "masaniello_snapshot" not in cols:
                 con.execute("ALTER TABLE scan_candidates ADD COLUMN masaniello_snapshot TEXT")
+            maintenance_cols = [
+                str(row[1]).lower()
+                for row in con.execute("PRAGMA table_info(maintenance_log)").fetchall()
+            ]
+            if not maintenance_cols:
+                con.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS maintenance_log (
+                        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                        ts              REAL NOT NULL,
+                        ts_iso          TEXT NOT NULL,
+                        category        TEXT NOT NULL,
+                        subtype         TEXT NOT NULL,
+                        asset           TEXT,
+                        severity        TEXT DEFAULT 'INFO',
+                        payload_json    TEXT,
+                        created_at      TEXT DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """
+                )
             con.commit()
             con.close()
         except Exception as e:
@@ -340,6 +372,43 @@ class BlackBoxRecorder:
         
         con = sqlite3.connect(self.db_path)
         cur = con.cursor()
+
+    def record_maintenance_event(
+        self,
+        category: str,
+        subtype: str,
+        *,
+        asset: str = "",
+        severity: str = "INFO",
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Registra eventos de mantenimiento / salud del sistema en la caja negra."""
+        ts = datetime.now(timezone.utc).timestamp()
+        ts_iso = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+        payload_json = json.dumps(payload or {}, ensure_ascii=False)
+
+        con = sqlite3.connect(self.db_path)
+        cur = con.cursor()
+        cur.execute(
+            '''
+            INSERT INTO maintenance_log (ts, ts_iso, category, subtype, asset, severity, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (ts, ts_iso, str(category), str(subtype), str(asset or ""), str(severity or "INFO"), payload_json),
+        )
+        con.commit()
+        con.close()
+
+        self._log_jsonl({
+            "event": "maintenance",
+            "ts": ts,
+            "ts_iso": ts_iso,
+            "category": category,
+            "subtype": subtype,
+            "asset": asset,
+            "severity": severity,
+            "payload": payload or {},
+        })
         cur.execute('''
             INSERT INTO phase_log (ts, ts_iso, strategy, asset, phase, message)
             VALUES (?, ?, ?, ?, ?, ?)

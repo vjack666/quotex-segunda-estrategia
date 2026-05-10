@@ -1,6 +1,6 @@
 # QUOTEX Trading System
 
-Bot asyncio 24/7 para operar activos OTC en Quotex con tres estrategias independientes,
+Bot asyncio 24/7 para operar activos OTC en Quotex con estrategias independientes,
 martingala por contexto aislado, GaleWatcher en hilo dedicado y caja negra SQLite por día.
 
 ---
@@ -11,7 +11,6 @@ martingala por contexto aislado, GaleWatcher en hilo dedicado y caja negra SQLit
 |----|--------|----------|--------|
 | STRAT-A | Consolidación (techo/piso en 5 min) | 300 s | **Opera** |
 | STRAT-B | Spring / Upthrust (sweep de liquidez) | 300 s | Solo aviso (usar `--strat-b-live` para operar) |
-| STRAT-C | Rechazo M1 en ventana 30–41 s | 60 s | **Opera** (habilitado por defecto) |
 
 ### STRAT-A — Consolidación
 - Escanea todos los activos OTC con payout ≥ 80 %.
@@ -24,15 +23,6 @@ martingala por contexto aislado, GaleWatcher en hilo dedicado y caja negra SQLit
 - Detecta barridos de liquidez en zonas de estructura.
 - Por defecto solo registra en caja negra sin abrir órdenes.
 - Activar con `--strat-b-live` y confianza mínima `--strat-b-min-confidence 0.70`.
-
-### STRAT-C — Rechazo M1 (30 s)
-- Evalúa la vela M1 en construcción entre el segundo 30 y 41.
-- Indicadores: ATR(7), BB(14,2), Estocástico Rápido(5,3), Estocástico Lento(14,3), EMA(8/21),
-  detección de zonas S/R (lookback=40).
-- Score máximo alcanzable: 11 puntos. Umbral de entrada: `MIN_SCORE = 7.0`.
-- Filtro ATR normalizado: `WICK_ATR_MIN = 0.15`, `WICK_ATR_MAX = 3.50`.
-- Mínimo 20 velas históricas requeridas para evaluar.
-- Módulo: `estrategia_30s/detector.py`.
 
 ---
 
@@ -54,19 +44,15 @@ martingala por contexto aislado, GaleWatcher en hilo dedicado y caja negra SQLit
 ```
 main.py                      ← Entrada CLI, configuración de runtime, lanzador de monitores
 src/
-  consolidation_bot.py       ← Motor central (STRAT-A, B, C), place_order, GaleWatcher bridge
+  consolidation_bot.py       ← Motor central (STRAT-A, B), place_order, GaleWatcher bridge
   entry_scorer.py            ← Scoring de candidatos STRAT-A
   candle_patterns.py         ← Patrones de vela (rechazo, doji, envolvente…)
   strategy_spring_sweep.py   ← Detección STRAT-B
   martingale_calculator.py   ← Calculadora de martingala con contexto aislado
   trade_journal.py           ← Registro de operaciones (SQLite trade_journal)
   black_box_recorder.py      ← Caja negra completa (SQLite black_box_strat)
-  hub_strategy_monitor.py    ← Monitores externos A/B/C (consolas separadas)
+  hub_strategy_monitor.py    ← Monitores externos (consolas separadas)
   smc_analysis.py            ← Análisis SMC auxiliar
-estrategia_30s/
-  detector.py                ← Detector STRAT-C (evaluar_vela)
-  indicadores_calc.py        ← EMA, BB, Estocástico, ATR
-  zonas.py                   ← Detección de zonas S/R
 mg/
   mg_watcher.py              ← GaleWatcher (hilo dedicado)
 hub/
@@ -123,7 +109,6 @@ QUOTEX_PASSWORD=tupassword
 | `python main.py --real` | Loop en cuenta REAL ⚠️ |
 | `python main.py --hub-readonly` | Solo monitoreo, sin órdenes |
 | `python main.py --strat-b-live` | Activa STRAT-B para operar |
-| `python main.py --no-strat-c-enabled` | Deshabilita STRAT-C |
 | `python main.py --no-hub-multi-monitor` | Sin consolas de monitor A/B/C |
 
 ## Parámetros CLI principales
@@ -151,18 +136,6 @@ STRAT-A
 STRAT-B
   --strat-b-live                 Habilitar órdenes STRAT-B
   --strat-b-min-confidence 0.70  Confianza mínima para entrar
-
-STRAT-C
-  --strat-c-min-score 7.0        Score mínimo [0–11]
-  --strat-c-wick-atr-min 0.15    Wick mínimo en unidades ATR
-  --strat-c-wick-atr-max 3.50    Wick máximo en unidades ATR
-
-STRAT-C — ventana de entrada M1
-  --rejection-entry-window-start-sec 30
-  --rejection-entry-window-end-sec 41
-  --rejection-call-min-lower-wick 0.30
-  --rejection-total-min-body 0.55
-  --rejection-disallow-partial    Solo rechazos totales
 ```
 
 ---
@@ -172,9 +145,6 @@ STRAT-C — ventana de entrada M1
 ```powershell
 # Revisar caja negra del día
 .venv\Scripts\python.exe lab\full_session_review.py
-
-# Análisis STRAT-C en detalle
-.venv\Scripts\python.exe real_strat_c_analysis.py
 
 # Análisis STRAT-B
 .venv\Scripts\python.exe lab\black_box_stratb.py

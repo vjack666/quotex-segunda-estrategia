@@ -275,6 +275,10 @@ def _apply_runtime_config(args: argparse.Namespace) -> None:
     from src.masaniello_engine import MasanielloConfig
 
     cb.MAX_LOSS_SESSION = float(args.max_loss_session)
+    # Regla operativa: en DEMO nunca detener el loop por stop-loss de sesión.
+    if not bool(args.real):
+        cb.ENABLE_SESSION_STOP_LOSS = False
+        cb.MAX_LOSS_SESSION = 1.0
 
     # La gestión de montos ahora usa Masaniello Engine en lugar de MartingaleCalculator.
     # El broker exige monto estrictamente mayor a $1.00.
@@ -315,9 +319,6 @@ def _apply_runtime_config(args: argparse.Namespace) -> None:
     cb.REJECTION_TOTAL_MIN_BODY_RATIO = max(0.0, min(1.0, float(args.rejection_total_min_body)))
     cb.REJECTION_ALLOW_PARTIAL = not bool(args.rejection_disallow_partial)
     cb.STRUCTURE_ENTRY_LOCK_TTL_MIN = max(0.0, float(args.structure_entry_lock_ttl_min))
-
-    # STRAT-C apagada por completo en main.
-    cb.STRAT_C_CAN_TRADE = False
 
     # Modo HUB (solo lectura): fuerza escaneo por minuto y deshabilita trading.
     if bool(args.hub_readonly):
@@ -391,6 +392,8 @@ async def _run_cycle_with_loading(cb, *, dry_run: bool, real_account: bool):
 
 
 _SILENT_RECONNECT_INTERVAL_SEC = 600  # reconexión preventiva cada 10 min
+_HUB_TICK_INTERVAL_SEC = 0.25
+_HUB_BALANCE_REFRESH_EVERY_SEC = 2.0
 
 
 async def _silent_reconnect_watchdog(bot_ref: list) -> None:
@@ -451,10 +454,11 @@ async def _silent_reconnect_watchdog(bot_ref: list) -> None:
             await asyncio.sleep(10.0)
 
 
-async def _hub_ticker(bot_ref: list, interval: float = 0.5) -> None:
+async def _hub_ticker(bot_ref: list, interval: float = _HUB_TICK_INTERVAL_SEC) -> None:
     """Refresca el HUB en segundo plano cada `interval` segundos sin esperar ciclos.
     Si llega un resultado de trade (WIN/LOSS) antes del intervalo, re-renderiza al instante.
     """
+    last_balance_refresh_ts = 0.0
     while True:
         try:
             bot = bot_ref[0] if bot_ref else None
@@ -492,9 +496,16 @@ async def _hub_ticker(bot_ref: list, interval: float = 0.5) -> None:
                     await _render_hub_once(bot)
                 if hasattr(bot, "refresh_balance_for_hub"):
                     try:
-                        # Timeout corto: el HUB nunca debe quedar esperando red.
-                        timeout_sec = 0.35 if trade_triggered else 0.8
-                        await asyncio.wait_for(bot.refresh_balance_for_hub(), timeout=timeout_sec)
+                        # Refrescar balance en cadencia separada evita congelar el reloj del HUB.
+                        now_ts = _time.time()
+                        should_refresh_balance = (
+                            trade_triggered
+                            or (now_ts - last_balance_refresh_ts) >= _HUB_BALANCE_REFRESH_EVERY_SEC
+                        )
+                        if should_refresh_balance:
+                            timeout_sec = 0.25 if trade_triggered else 0.35
+                            await asyncio.wait_for(bot.refresh_balance_for_hub(), timeout=timeout_sec)
+                            last_balance_refresh_ts = now_ts
                     except Exception:
                         pass
                 await _render_hub_once(bot)
@@ -507,12 +518,21 @@ async def _hub_ticker(bot_ref: list, interval: float = 0.5) -> None:
 async def _run_forever_with_initial_loading(cb, *, dry_run: bool, real_account: bool):
     """Ejecuta loop continuo mostrando el HUB hasta finalizar el primer ciclo."""
     first_cycle_done = asyncio.Event()
+    bot_ready_event = asyncio.Event()
     # Referencia mutable al bot para que el ticker siempre use la instancia actual.
     bot_ref: list = [None]
+    # Referencia mutable al HTFScanner (se crea más abajo, antes de on_bot_ready).
+    htf_ref: list = [None]
 
     def _on_bot_ready(bot):
         """Llamado apenas el bot se conecta y conoce el balance (antes del primer scan)."""
         bot_ref[0] = bot
+        # Conectar el client real al HTFScanner y exponerlo en el bot.
+        htf = htf_ref[0]
+        if htf is not None:
+            htf._client = bot.client
+            bot.htf_scanner = htf
+        bot_ready_event.set()
 
     async def _on_cycle_end_with_event(bot):
         bot_ref[0] = bot
@@ -533,8 +553,44 @@ async def _run_forever_with_initial_loading(cb, *, dry_run: bool, real_account: 
     # Render de carga hasta que termina el primer ciclo.
     # Ticker permanente: arranca de inmediato, independiente del primer ciclo.
     # Así el dashboard es visible desde el primer segundo, aunque el scan aún no termine.
-    ticker = asyncio.create_task(_hub_ticker(bot_ref, interval=0.5))
+    ticker = asyncio.create_task(_hub_ticker(bot_ref, interval=_HUB_TICK_INTERVAL_SEC))
     watchdog = asyncio.create_task(_silent_reconnect_watchdog(bot_ref))
+
+    # HTF Scanner: corre en background, refresca velas 15m cada ~15 min.
+    # El scan loop las lee vía bot.htf_scanner.get_candles_15m(sym) sin bloquear.
+    from src.htf_scanner import HTFScanner
+
+    def _on_htf_asset_refresh(asset: str, payout: int, candles: int, age_sec: float, ttl_sec: float, ts: float) -> None:
+        bot = bot_ref[0]
+        if bot is None or not hasattr(bot, "hub"):
+            return
+        try:
+            lib_size = int(htf_scanner.library_size())
+            bot.hub.update_htf_status(
+                asset=asset,
+                payout=payout,
+                candles=candles,
+                library_size=lib_size,
+                cache_age_sec=age_sec,
+                cache_ttl_sec=ttl_sec,
+                refreshed_at_ts=ts,
+            )
+        except Exception:
+            return
+
+    htf_scanner = HTFScanner(
+        client=None,
+        min_payout=int(getattr(cb, "MIN_PAYOUT", 85)),
+        on_asset_refresh=_on_htf_asset_refresh,
+    )
+    htf_ref[0] = htf_scanner   # on_bot_ready ya puede conectar el client cuando el bot esté listo
+
+    # El HTF scanner arranca apenas el bot tenga client; no usa espera fija.
+    async def _htf_runner():
+        await bot_ready_event.wait()
+        await htf_scanner.run_forever()
+
+    htf_task = asyncio.create_task(_htf_runner(), name="htf_scanner_15m")
 
     try:
         # Render de carga hasta que termina el primer ciclo.
@@ -547,6 +603,8 @@ async def _run_forever_with_initial_loading(cb, *, dry_run: bool, real_account: 
     finally:
         ticker.cancel()
         watchdog.cancel()
+        htf_task.cancel()
+        await asyncio.gather(ticker, watchdog, htf_task, return_exceptions=True)
 
 
 async def _run(args: argparse.Namespace) -> None:
@@ -600,6 +658,12 @@ async def _run(args: argparse.Namespace) -> None:
                     if run_once:
                         return
                     continue
+                except RuntimeError as exc:
+                    print(f"[HUB] Error recuperable: {exc}. Reintentando en 60s...")
+                    await asyncio.sleep(60)
+                    if run_once:
+                        return
+                    continue
                 if run_once:
                     return
                 try:
@@ -631,6 +695,7 @@ if __name__ == "__main__":
     parser = _build_parser()
     args = parser.parse_args()
     run_once = bool(args.once)
+    demo_mode = not bool(args.real)
     restart_count = 0
     max_consecutive_errors = 99999  # Sin límite — modo continuo de recolección de datos
     
@@ -655,9 +720,8 @@ if __name__ == "__main__":
                 print(f"\n[ERROR] El bot ha fallado {restart_count} veces consecutivas.")
                 print("Revisar los logs en data/logs/bot/ para más detalles.")
                 raise SystemExit(1)
-            
-            print(f"\n[BOT] Reiniciando en 5 segundos (intento {restart_count+1}/{max_consecutive_errors})...\n")
             _time.sleep(5)
+            print(f"\n[BOT] Reiniciando en 5 segundos (intento {restart_count+1}/{max_consecutive_errors})...\n")
             
         except ModuleNotFoundError as exc:
             if getattr(exc, "name", "") == "pyquotex":
@@ -669,6 +733,18 @@ if __name__ == "__main__":
                 print("  python -m pip install -r requirements.txt")
                 raise SystemExit(1)
             raise
+        except SystemExit as exc:
+            code = exc.code if isinstance(exc.code, int) else 1
+            # Blindaje DEMO: cualquier salida no-cero reinicia el supervisor.
+            if demo_mode and not run_once and code != 0:
+                restart_count += 1
+                _time.sleep(5)
+                print(
+                    f"\n[BOT] SystemExit({code}) capturado en DEMO. "
+                    f"Reiniciando en 5s (intento {restart_count+1}/{max_consecutive_errors})...\n"
+                )
+                continue
+            raise
         except KeyboardInterrupt:
             print("\n[BOT] Interrupción del usuario (Ctrl+C). Cerrando...")
             raise SystemExit(0)
@@ -679,9 +755,9 @@ if __name__ == "__main__":
                 print(f"Última excepción: {type(e).__name__}: {e}")
                 print("Revisar los logs en data/logs/bot/ para más detalles.")
                 raise SystemExit(1)
+            _time.sleep(5)
             print(f"\n[BOT] Error inesperado: {type(e).__name__}: {e}")
             print(f"Reiniciando en 5 segundos (intento {restart_count+1}/{max_consecutive_errors})...\n")
-            _time.sleep(5)
         finally:
             try:
                 from hub.hub_dashboard import HubDashboard

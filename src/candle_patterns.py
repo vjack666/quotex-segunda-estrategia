@@ -5,6 +5,7 @@ import time
 from typing import List
 
 from models import Candle
+from spike_filter import sanitize_spike_candles
 
 REVERSAL_MIN_STRENGTH = 0.55
 
@@ -247,4 +248,6 @@ async def fetch_candles_1m(client, asset: str, count: int = 10) -> List[Candle]:
         if candle.high > 0:
             candles.append(candle)
 
-    return sorted(candles, key=lambda c: c.ts)
+    ordered = sorted(candles, key=lambda c: c.ts)
+    filtered, _stats = sanitize_spike_candles(ordered)
+    return filtered

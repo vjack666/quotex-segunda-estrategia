@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, List, Optional
 
-from .hub_models import CandidateData, HubState
+from .hub_models import CandidateData, CandleSnapshot, HubState, VipWindowData
 
 if TYPE_CHECKING:
     from rich.console import Console
@@ -556,6 +556,57 @@ def _build_quick_levels_panel(state: HubState) -> "Panel":
     )
 
 
+def _build_vip_panel(state: HubState) -> "Panel":
+    """Ventana VIP: candidatos casi listos para entrada."""
+    panel_cls = _require_panel_class()
+    table_cls = _require_table_class()
+
+    vip_items: List[VipWindowData] = list(state.vip_windows[:5])
+    t = table_cls.grid(expand=True)
+    t.add_column("Act.", style="bold cyan", min_width=10)
+    t.add_column("Dir", min_width=4)
+    t.add_column("Score", justify="right", min_width=6)
+    t.add_column("Faltan", justify="right", min_width=6)
+    t.add_column("15m", min_width=28)
+    t.add_column("5m", min_width=28)
+    t.add_column("1m", min_width=28)
+
+    if not vip_items:
+        t.add_row("-", "-", "-", "-", "Sin VIP", "", "")
+    else:
+        for v in vip_items[:4]:
+            dir_color = _GREEN if v.direction == "call" else _RED
+            score_color = _GREEN if v.ready_to_execute else (_YELLOW if v.missing_conditions <= 3 else _RED)
+            m15 = "N/D"
+            if v.ma15_fast is not None and v.ma15_slow is not None:
+                m15 = f"EMA10 {v.ma15_fast:.5f}\nEMA20 {v.ma15_slow:.5f}"
+            m5 = "N/D"
+            if v.ma5_fast is not None and v.ma5_slow is not None:
+                m5 = f"EMA10 {v.ma5_fast:.5f}\nEMA20 {v.ma5_slow:.5f}"
+            m1 = "N/D"
+            if v.ma1_fast is not None and v.ma1_slow is not None:
+                m1 = f"EMA10 {v.ma1_fast:.5f}\nEMA20 {v.ma1_slow:.5f}"
+
+            head = f"{v.payout}% | {v.entry_mode}"
+            tail = f"{v.candles_15m_count} velas 15m\nfaltan: {', '.join(v.missing_labels[:2]) or '0'}"
+            t.add_row(
+                v.asset,
+                f"{dir_color}{v.direction.upper()}{_RESET}",
+                f"{score_color}{v.score:.1f}{_RESET}",
+                f"{v.missing_conditions}/{v.total_conditions}",
+                f"{head}\n{tail}",
+                m5,
+                m1,
+            )
+
+    return panel_cls(
+        t,
+        title="[bold white]VIP LIBRARY[/bold white] [dim](candidatos casi listos)[/dim]",
+        border_style="magenta",
+        padding=(0, 1),
+    )
+
+
 def _build_layout(state: HubState, balance: float) -> "Layout":
     layout_cls = _require_layout_class()
     panel_cls = _require_panel_class()
@@ -566,6 +617,7 @@ def _build_layout(state: HubState, balance: float) -> "Layout":
     layout.split_column(
         layout_cls(name="header", size=5),
         layout_cls(name="body",   ratio=1),
+        layout_cls(name="vip",    size=11),
         layout_cls(name="levels", size=6),
         layout_cls(name="gale",   size=8),
         layout_cls(name="logs",   size=10),
@@ -597,6 +649,7 @@ def _build_layout(state: HubState, balance: float) -> "Layout":
     )
 
     layout["gale"].update(_build_gale_panel(state))
+    layout["vip"].update(_build_vip_panel(state))
     layout["levels"].update(_build_quick_levels_panel(state))
     layout["logs"].update(_build_logs_panel(state))
 
@@ -827,6 +880,52 @@ class HubDashboard:
             )
         lines.append(sep)
 
+        # ── HTF CACHE (15m) ───────────────────────────────────────────────
+        lines.append(f"{_BOLD}{_CYAN}  [HTF CACHE 15M]{_RESET}")
+        lines.append(
+            f"  {_DIM}Biblioteca:{int(state.htf_library_size or 0)} activos | mostrando ultimo refresco{_RESET}"
+        )
+        if state.htf_asset:
+            if state.htf_last_refresh_ts > 0:
+                age = max(0.0, time.time() - float(state.htf_last_refresh_ts))
+            else:
+                age = max(0.0, float(state.htf_cache_age_sec or 0.0))
+            ttl = max(0.0, float(state.htf_cache_ttl_sec or 0.0))
+            freshness = (age / ttl) if ttl > 0 else 1.0
+            status_color = _GREEN if freshness < 0.70 else (_YELLOW if freshness < 1.0 else _RED)
+            status_label = "FRESCO" if freshness < 0.70 else ("ATENCION" if freshness < 1.0 else "VENCIDO")
+            lines.append(
+                f"  {state.htf_asset:<14} Payout:{state.htf_payout:>2}%  "
+                f"Velas:{state.htf_candles:>2}  "
+                f"Age:{age:>5.0f}s/{ttl:>4.0f}s  "
+                f"{status_color}{status_label}{_RESET}"
+            )
+        else:
+            lines.append(f"  {_DIM}  Sin cache HTF inicializado aún{_RESET}")
+        lines.append(sep2)
+
+        # ── VIP LIBRARY ──────────────────────────────────────────────────
+        lines.append(f"{_BOLD}{_MAGENTA}  [VIP LIBRARY]{_RESET}")
+        if state.vip_windows:
+            for v in state.vip_windows[:3]:
+                dir_color = _GREEN if v.direction == "call" else _RED
+                status = "READY" if v.ready_to_execute else f"MISS {v.missing_conditions}/{v.total_conditions}"
+                lines.append(
+                    f"  {v.asset:<12} {dir_color}{v.direction.upper():<4}{_RESET}  "
+                    f"S:{v.score:5.1f}  {status}  15m:{v.candles_15m_count:2d}  "
+                    f"EMA15:{(f'{v.ma15_fast:.5f}/{v.ma15_slow:.5f}' if v.ma15_fast is not None and v.ma15_slow is not None else 'N/D')}"
+                )
+        else:
+            lines.append(f"  {_DIM}  Sin candidatos VIP aún{_RESET}")
+        lines.append(sep2)
+
+        # ── Chart ASCII ──────────────────────────────────────────────────
+        chart_lines = _render_ascii_chart(state)
+        if chart_lines:
+            for cl in chart_lines:
+                lines.append(cl)
+            lines.append(sep2)
+
         # ── Mini log ─────────────────────────────────────────────────────
         lines.append(f"{_BOLD}  [LOGS]{_RESET}")
         if _waiting_first_order(state):
@@ -841,3 +940,219 @@ class HubDashboard:
         lines.append(f"{_BOLD}{_CYAN}{'━' * 80}{_RESET}")
         lines.append(f"  {_DIM}CTRL+C para salir{_RESET}")
         return "\n".join(lines)
+
+
+# ── ASCII candlestick chart ───────────────────────────────────────────────────
+
+_CHART_HEIGHT     = 10   # filas de precio en el chart
+_CHART_BODY       = "█"  # cuerpo de vela lleno
+_CHART_WICK_UP    = "│"  # mecha superior
+_CHART_WICK_DOWN  = "│"  # mecha inferior
+_CHART_ENTRY      = "◄"  # marcador de entrada (derecha del chart)
+_CHART_LEVEL      = "─"  # línea de soporte/resistencia
+
+
+def _render_ascii_chart(state: "HubState") -> List[str]:
+    """
+    Dibuja un mini chart ASCII de velas OHLC en tiempo real.
+
+    Modos:
+    - CANDIDATO: sin trade activo, muestra el candidato más cercano al trigger.
+      El precio vivo viene de chart_live_price (último precio conocido del activo).
+    - CHART (trade activo): la última vela refleja masaniello.current_price en cada
+      refresh y se traza una línea PX móvil con delta % respecto a la entrada.
+    Marcadores: EP (entrada), PX (precio actual), S (soporte), R (resistencia).
+    """
+    candles_orig = state.chart_candles
+    if not candles_orig:
+        return []
+
+    asset   = state.chart_asset or "?"
+    ep      = state.chart_entry_price
+    dir_str = (state.chart_direction or "").upper()
+    floor   = state.chart_zone_floor
+    ceil_   = state.chart_zone_ceiling
+
+    # ── Precio vivo ───────────────────────────────────────────────────────────
+    # Fuente 1: masaniello.current_price  (cuando hay trade activo)
+    # Fuente 2: chart_live_price          (candidato sin trade activo)
+    live_price: Optional[float] = None
+    m = state.masaniello
+    if m.active and m.current_price > 0 and m.asset.upper() == asset:
+        live_price = m.current_price
+    elif state.chart_live_price is not None and state.chart_live_price > 0:
+        live_price = state.chart_live_price
+
+    # Reconstruir lista de velas con la última actualizada al precio vivo
+    if live_price is not None and candles_orig:
+        last = candles_orig[-1]
+        live_candle = CandleSnapshot(
+            open=last.open,
+            high=max(last.high, live_price),
+            low=min(last.low, live_price),
+            close=live_price,
+            ts=last.ts,
+        )
+        candles: List[CandleSnapshot] = list(candles_orig[:-1]) + [live_candle]
+    else:
+        candles = list(candles_orig)
+
+    n = len(candles)
+    hi_all = max(c.high for c in candles)
+    lo_all = min(c.low  for c in candles)
+
+    # Expandir rango para incluir todos los niveles marcados
+    for lvl in (floor, ceil_, ep, live_price):
+        if lvl is not None:
+            lo_all = min(lo_all, lvl)
+            hi_all = max(hi_all, lvl)
+
+    price_range = hi_all - lo_all
+    if price_range <= 0:
+        return []
+
+    H = _CHART_HEIGHT
+
+    def _price_to_row(price: float) -> int:
+        """Fila 0 = precio más alto, fila H-1 = precio más bajo."""
+        frac = (hi_all - price) / price_range
+        return min(H - 1, max(0, int(round(frac * (H - 1)))))
+
+    # Construir grid
+    cols = n * 2 - 1
+    grid: list[list[str]] = [[" "] * cols for _ in range(H)]
+
+    for ci, c in enumerate(candles):
+        col = ci * 2
+        body_top    = _price_to_row(max(c.open, c.close))
+        body_bottom = _price_to_row(min(c.open, c.close))
+        wick_top    = _price_to_row(c.high)
+        wick_bottom = _price_to_row(c.low)
+        bullish     = c.close >= c.open
+        # última vela está "viva" si hay precio live
+        is_live_candle = live_price is not None and ci == n - 1
+
+        for row in range(H):
+            if wick_top <= row < body_top:
+                grid[row][col] = _CHART_WICK_UP
+            elif body_top <= row <= body_bottom:
+                grid[row][col] = _CHART_BODY
+            elif body_bottom < row <= wick_bottom:
+                grid[row][col] = _CHART_WICK_DOWN
+
+        # Prefijo B/b (bullish/bearish) en la fila del cuerpo para colorear
+        prefix = ("L" if is_live_candle else ("B" if bullish else "b"))
+        if body_top < H:
+            raw = grid[body_top][col]
+            grid[body_top][col] = prefix + (raw[-1:] if len(raw) > 1 else raw)
+
+    def _row_price(row: int) -> float:
+        return hi_all - (row / (H - 1)) * price_range
+
+    ep_row    = _price_to_row(ep)        if ep       is not None else -1
+    floor_row = _price_to_row(floor)     if floor    is not None else -1
+    ceil_row  = _price_to_row(ceil_)     if ceil_    is not None else -1
+    px_row    = _price_to_row(live_price) if live_price is not None else -1
+
+    dir_color = _GREEN if dir_str == "CALL" else (_RED if dir_str == "PUT" else _RESET)
+
+    # Encabezado: "CANDIDATO" si no hay entrada; "CHART" si hay trade activo
+    _mode_label = "CHART" if ep is not None else "CANDIDATO"
+    header = (
+        f"{_BOLD}{_CYAN}  [{_mode_label}  {asset}]{_RESET}"
+        + (f"  {dir_color}{dir_str}{_RESET}" if dir_str else "")
+        + (f"  EP:{ep:.5f}" if ep is not None else "")
+    )
+    if live_price is not None and ep is not None and ep > 0:
+        delta = ((live_price - ep) / ep) * 100.0
+        # Para CALL: positivo es bueno; para PUT: negativo es bueno
+        winning = (delta >= 0 and dir_str == "CALL") or (delta <= 0 and dir_str == "PUT")
+        d_color = _GREEN if winning else _RED
+        header += f"  PX:{live_price:.5f}  {d_color}Δ{delta:+.3f}%{_RESET}"
+    elif live_price is not None:
+        header += f"  PX:{live_price:.5f}"
+
+    result_lines: list[str] = [header]
+
+    for row in range(H):
+        rp = _row_price(row)
+        price_label = f"{rp:.5f}"
+
+        is_ep    = (row == ep_row)
+        is_floor = (row == floor_row)
+        is_ceil  = (row == ceil_row)
+        is_px    = (row == px_row and live_price is not None and row != ep_row)
+
+        row_chars: list[str] = []
+        for ci in range(n):
+            col = ci * 2
+            raw = grid[row][col]
+
+            # Detectar tipo de celda
+            if raw.startswith("L"):
+                # Vela viva (se pinta en magenta para distinguirla)
+                color = _MAGENTA
+                ch = raw[1:] or _CHART_BODY
+            elif raw.startswith("B"):
+                color = _GREEN
+                ch = raw[1:] or _CHART_BODY
+            elif raw.startswith("b"):
+                color = _RED
+                ch = raw[1:] or _CHART_BODY
+            else:
+                color = _DIM
+                ch = raw
+
+            # Trazar línea de nivel si el espacio está vacío
+            if ch == " ":
+                if is_px:
+                    color = _MAGENTA
+                    ch = _CHART_LEVEL
+                elif is_ep:
+                    color = dir_color
+                    ch = _CHART_LEVEL
+                elif is_floor or is_ceil:
+                    color = _YELLOW
+                    ch = _CHART_LEVEL
+
+            row_chars.append(f"{color}{ch}{_RESET}")
+
+            if ci < n - 1:
+                # Separador entre velas
+                if is_px:
+                    sep, sep_color = _CHART_LEVEL, _MAGENTA
+                elif is_ep:
+                    sep, sep_color = _CHART_LEVEL, dir_color
+                elif is_floor or is_ceil:
+                    sep, sep_color = _CHART_LEVEL, _YELLOW
+                else:
+                    sep, sep_color = " ", _DIM
+                row_chars.append(f"{sep_color}{sep}{_RESET}")
+
+        chart_str = "".join(row_chars)
+
+        # Etiqueta derecha
+        suffix = ""
+        if is_px:
+            winning_px = (live_price is not None and ep is not None and (
+                (dir_str == "CALL" and live_price >= ep) or
+                (dir_str == "PUT"  and live_price <= ep)
+            ))
+            px_color = _GREEN if winning_px else _RED
+            suffix = f"  {price_label}  {px_color}◆ PX (vivo){_RESET}"
+        elif is_ep:
+            suffix = f"  {price_label}  {dir_color}{_CHART_ENTRY} ENTRADA{_RESET}"
+        elif is_ceil:
+            suffix = f"  {price_label}  {_YELLOW}↑ Resistencia{_RESET}"
+        elif is_floor:
+            suffix = f"  {price_label}  {_YELLOW}↓ Soporte{_RESET}"
+        elif row == 0:
+            suffix = f"  {price_label}  {_DIM}(max){_RESET}"
+        elif row == H - 1:
+            suffix = f"  {price_label}  {_DIM}(min){_RESET}"
+
+        result_lines.append(f"  {chart_str}{suffix}")
+
+    result_lines.append(f"  {_DIM}{'─' * (cols + 2)}{_RESET}")
+    return result_lines
+

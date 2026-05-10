@@ -51,7 +51,7 @@ from datetime import timedelta
 from math import ceil
 from pathlib import Path
 from statistics import mean
-from typing import Any, Awaitable, Callable, Coroutine, Deque, List, Optional, Tuple, cast
+from typing import Any, Awaitable, Callable, Coroutine, Deque, List, Optional, Sequence, Tuple, cast
 
 # ── Cargar .env ───────────────────────────────────────────────────────────────
 for _candidate in (Path(__file__).parent / ".env", Path(__file__).parent.parent / ".env"):
@@ -74,17 +74,19 @@ from candle_patterns import (
     detect_reversal_pattern,
     explain_no_pattern_reason,
 )
+from spike_filter import sanitize_spike_candles
 from strategy_spring_sweep import detect_spring_or_upthrust
 from trade_journal import get_journal
 from black_box_recorder import get_black_box
 from martingale_calculator import MartingaleCalculator
 from src.masaniello_engine import MasanielloEngine, MasanielloConfig
+from src.vip_library import VipLibraryManager
 from hub.hub_scanner import HubScanner
 from hub.hub_models import CandidateData
 
 
 class _StratCDetectorStub:
-    """Stub para mantener compatibilidad cuando STRAT-C está archivada."""
+    """Stub para mantener compatibilidad cuando LEGACY-RJ está archivada."""
 
     def __getattr__(self, _name: str):
         def _noop(*_args, **_kwargs):
@@ -92,15 +94,17 @@ class _StratCDetectorStub:
         return _noop
 
 
-# STRAT-C archivada temporalmente: se deja stub para no romper código legado.
-strat_c_detector = _StratCDetectorStub()
+# LEGACY-RJ archivada temporalmente: se deja stub para no romper código legado.
+LEGACY_RJ_detector = _StratCDetectorStub()
 
 
-def _strat_c_detect_zones(*_args, **_kwargs):
+def _LEGACY_RJ_detect_zones(*_args, **_kwargs):
     return []
 
 
-_STRAT_C_AVAILABLE = os.getenv("DISABLE_STRAT_C_RUNTIME", "1") != "1"
+# LEGACY-RJ eliminada del runtime por decisión operativa (riesgo elevado).
+# Se conserva código de referencia, pero no debe ejecutarse.
+_LEGACY_RJ_AVAILABLE = False
 StratCSignal = Tuple[str, float, dict[str, Any]]
 
 # Motor de Gale — ruta relativa al ROOT del proyecto
@@ -229,7 +233,7 @@ H1_EMA_FAST              = 20
 H1_EMA_SLOW              = 50
 H1_FETCH_TIMEOUT_SEC     = 12.0
 CANDLE_FETCH_TIMEOUT_SEC = 8.0
-CANDLE_FETCH_1M_TIMEOUT_SEC = 12.0
+CANDLE_FETCH_1M_TIMEOUT_SEC = 6.0
 REALTIME_PRICE_TIMEOUT_SEC = 3.0
 REALTIME_PRICE_STALE_SEC = 4.0
 REALTIME_PRICE_WARN_EVERY_SEC = 15.0
@@ -245,6 +249,12 @@ ORDER_SEND_RETRIES       = 1
 RECONNECT_TIMEOUT_SEC    = 12.0
 SCAN_MAX_ASSETS_PER_CYCLE = 40
 SCAN_PROGRESS_EVERY = 10
+
+# Filtro anti-spike OTC para velas anómalas de feed.
+SPIKE_FILTER_ENABLED            = True
+SPIKE_FILTER_MAX_GAP_PCT        = 0.005   # 0.50%
+SPIKE_FILTER_MAX_BODY_MULT      = 6.0     # cuerpo > 6x mediana reciente
+SPIKE_FILTER_MIN_GAP_FOR_BODY   = 0.002   # 0.20%
 
 # Control de carga para evitar tormenta de requests simultáneas al broker.
 CANDLE_FETCH_CONCURRENCY = 2   # reducido a 2 para evitar mezcla de respuestas WebSocket
@@ -284,6 +294,10 @@ FORCE_EXECUTE_STRONG_BREAKOUT = True
 GREYLIST_ASSETS = {"USDDZD_otc"}
 PATTERN_PUT_BLACKLIST = {"bearish_engulfing"}
 STRICT_PATTERN_CHECK = True
+PATTERN_DIRECT_TRIGGER_MIN_PAYOUT = 85   # trigger directo si payout > 85%
+PATTERN_TIMING_IMMEDIATE = {"hammer", "shooting_star", "bullish_hammer", "bearish_inverted_hammer"}
+PATTERN_TIMING_NEXT_OPEN = {"bullish_engulfing", "bearish_engulfing"}
+PATTERN_TIMING_ANTICIPATORY = {"morning_star_simple", "evening_star_simple"}
 
 ADAPTIVE_THRESHOLD_BASE = 60
 ADAPTIVE_THRESHOLD_LOW = 58
@@ -364,11 +378,11 @@ STRAT_B_ALLOW_WYCKOFF_EARLY = True
 STRAT_B_LOG_TOP_N      = 3
 STRAT_B_PREVIEW_MIN_CONF = 0.45
 
-# STRAT-C (Rechazo M1 en ventana de 30s)
-STRAT_C_CAN_TRADE      = False
-STRAT_C_DURATION_SEC   = 60
-STRAT_C_MIN_SCORE      = 4.0
-STRAT_C_LOG_TOP_N      = 3
+# LEGACY-RJ (Rechazo M1 en ventana de 30s)
+LEGACY_RJ_CAN_TRADE      = False
+LEGACY_RJ_DURATION_SEC   = 60
+LEGACY_RJ_MIN_SCORE      = 4.0
+LEGACY_RJ_LOG_TOP_N      = 3
 
 # Captura forense de velas para eventos BROKEN_* (auditoría operativa)
 BROKEN_CAPTURE_DIR = Path(__file__).resolve().parent.parent / "data" / "vela_ops"
@@ -653,7 +667,42 @@ async def fetch_candles(
         return []
     candles = [raw_to_candle(r) for r in raw_list if isinstance(r, dict)]
     valid = [c for c in candles if c and c.high > 0]
-    return sorted(valid, key=lambda c: c.ts)
+    ordered = sorted(valid, key=lambda c: c.ts)
+
+    if not SPIKE_FILTER_ENABLED:
+        return ordered
+
+    filtered, stats = sanitize_spike_candles(
+        ordered,
+        max_gap_pct=SPIKE_FILTER_MAX_GAP_PCT,
+        max_body_mult=SPIKE_FILTER_MAX_BODY_MULT,
+        min_gap_for_body_rule=SPIKE_FILTER_MIN_GAP_FOR_BODY,
+    )
+    if stats.dropped_count > 0:
+        log.debug(
+            "%s: filtro anti-spike tf=%ss removió %d/%d velas anómalas",
+            asset,
+            tf_sec,
+            stats.dropped_count,
+            stats.input_count,
+        )
+        try:
+            black_box = get_black_box()
+            black_box.record_maintenance_event(
+                "SPIKE_FILTER",
+                "DROP",
+                asset=asset,
+                severity="WARN",
+                payload={
+                    "timeframe_sec": tf_sec,
+                    "input_count": stats.input_count,
+                    "dropped_count": stats.dropped_count,
+                    "kept_count": len(filtered),
+                },
+            )
+        except Exception:
+            pass
+    return filtered
 
 
 async def fetch_candles_with_retry(
@@ -665,13 +714,43 @@ async def fetch_candles_with_retry(
     retries: int = FETCH_RETRIES,
 ) -> List[Candle]:
     """Fetch robusto con timeout local + reintentos cortos con backoff."""
+
+    async def _await_with_hard_timeout(coro: Awaitable[List[Candle]], timeout: float) -> Optional[List[Candle]]:
+        """
+        Timeout duro para evitar cuelgues cuando una coroutine no coopera con cancelación.
+        Usa asyncio.wait(timeout=...) en vez de wait_for para no bloquear esperando el cancel.
+        """
+        task = asyncio.create_task(coro)
+        try:
+            done, pending = await asyncio.wait({task}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+            if task in done:
+                return await task
+
+            # Timeout: cancelar sin esperar a que la cancelación termine.
+            for p in pending:
+                p.cancel()
+
+                def _swallow_exception(t: asyncio.Task[Any]) -> None:
+                    try:
+                        _ = t.exception()
+                    except (asyncio.CancelledError, Exception):
+                        pass
+
+                p.add_done_callback(_swallow_exception)
+            return None
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            task.cancel()
+            raise asyncio.CancelledError()
+
     attempts = max(1, int(retries))
     for attempt in range(1, attempts + 1):
         try:
-            candles = await asyncio.wait_for(
+            candles = await _await_with_hard_timeout(
                 fetch_candles(client, asset, tf_sec, count),
                 timeout=timeout_sec,
             )
+            if candles is None:
+                raise asyncio.TimeoutError()
             if candles:
                 return candles
         except asyncio.TimeoutError:
@@ -1259,10 +1338,10 @@ class ConsolidationBot:
             "scans": 0, "entries": 0, "martins": 0,
             "expired_zones": 0, "skipped": 0, "filtered_sensor": 0,
             "strat_a_signals": 0, "strat_b_signals": 0,
-            "strat_c_signals": 0,
+            "LEGACY_RJ_signals": 0,
             "strat_a_wins": 0, "strat_a_losses": 0,
             "strat_b_wins": 0, "strat_b_losses": 0,
-            "strat_c_wins": 0, "strat_c_losses": 0,
+            "LEGACY_RJ_wins": 0, "LEGACY_RJ_losses": 0,
             "score_rejected_age": 0,   # candidatos rechazados por penaliz. antigüedad
             "score_rejected_score": 0, # candidatos rechazados por score < umbral
             "rejected_young_zone": 0,
@@ -1316,6 +1395,10 @@ class ConsolidationBot:
         # Calculadoras aisladas para GALE por contexto (estrategia+par).
         # Evita que una pérdida en STRAT-B/ASSET_X contamine STRAT-A/ASSET_Y.
         self._martingale_by_context: dict[str, MartingaleCalculator] = {}
+        # Stop-loss de sesión solo puede detener el bot en cuenta REAL.
+        self._session_stop_loss_enabled: bool = (
+            str(account_type).upper() == "REAL" and bool(ENABLE_SESSION_STOP_LOSS)
+        )
         self.session_stop_hit:      bool = False
         self.cycle_id:              int = 1
         self.cycle_ops:             int = 0
@@ -1338,6 +1421,8 @@ class ConsolidationBot:
         # Activos que fallaron en place_order() — skippear por 2 ciclos.
         # key=asset, value=ciclos_restantes_a_skipear
         self.failed_assets: dict[str, int] = {}
+        # Cache de velas 5m por activo para el chart ASCII del HUB.
+        self._last_asset_candles: dict[str, list] = {}
         # Activos esperando confirmación de patrón 1m (espera activa de reversión).
         self.pending_reversals: dict[str, PendingReversal] = {}
         # Martingalas diferidas: esperan hasta 2 scans a que reaparezca señal válida.
@@ -1368,17 +1453,18 @@ class ConsolidationBot:
             payout=int(self.masaniello.config.payout_pct),
         )
         self.black_box = get_black_box()
+        self.vip_library = VipLibraryManager(min_payout=MIN_PAYOUT, min_score=ADAPTIVE_THRESHOLD_BASE)
         self.last_scan_strat_a: List[CandidateEntry] = []
         self.last_scan_strat_b: List[CandidateEntry] = []
-        self.last_scan_strat_c: List[CandidateEntry] = []
-        # Cooldown propio de STRAT-C: evita doble entrada en el mismo activo
-        self._strat_c_last_entry: dict[str, float] = {}
+        self.last_scan_LEGACY_RJ: List[CandidateEntry] = []
+        # Cooldown propio de LEGACY-RJ: evita doble entrada en el mismo activo
+        self._LEGACY_RJ_last_entry: dict[str, float] = {}
         # Cache de zonas S/R por activo (TTL 5min) — evita recalcular en cada scan
-        self._strat_c_zones_cache: dict[str, tuple[float, list]] = {}
+        self._LEGACY_RJ_zones_cache: dict[str, tuple[float, list]] = {}
         # Cache de velas 1m + payout por activo — usado por el ticker dedicado s30-41
-        self._strat_c_candles_cache: dict[str, tuple[float, list[dict], int]] = {}
+        self._LEGACY_RJ_candles_cache: dict[str, tuple[float, list[dict], int]] = {}
         # Controla que el ticker no dispare dos veces en la misma vela M1
-        self._strat_c_window_vela_fired: float = 0.0
+        self._LEGACY_RJ_window_vela_fired: float = 0.0
         self._gale_thread: Optional[threading.Thread] = None
         self._gale_thread_loop: Optional[asyncio.AbstractEventLoop] = None
         self._gale_thread_ready = threading.Event()
@@ -1758,43 +1844,45 @@ class ConsolidationBot:
                 except Exception as exc:
                     log.debug("HUB: Error converting STRAT-B candidate: %s", exc)
 
-            strat_c_for_hub = []
-            sorted_c = sorted(self.last_scan_strat_c, key=lambda c: c.score, reverse=True)
-            for candidate in sorted_c[:5]:
-                try:
-                    dist = self._candidate_trigger_distance_pct(candidate)
-                    cd = CandidateData(
-                        strategy="STRAT-C",
-                        asset=candidate.asset,
-                        direction=candidate.direction,
-                        score=candidate.score,
-                        payout=candidate.payout,
-                        zone_ceiling=candidate.zone.ceiling if candidate.zone else 0.0,
-                        zone_floor=candidate.zone.floor if candidate.zone else 0.0,
-                        zone_age_min=candidate.zone.age_minutes if candidate.zone else 0.0,
-                        pattern=getattr(candidate, "_reversal_pattern", "rejection_30s"),
-                        pattern_strength=getattr(candidate, "_reversal_strength", 0.0),
-                        entry_mode=getattr(candidate, "_entry_mode", "rejection_30s"),
-                        confidence=getattr(candidate, "_reversal_strength", None),
-                        signal_type=getattr(candidate, "_reversal_pattern", None),
-                        raw_reason="scan",
-                        dist_pct=dist,
-                    )
-                    strat_c_for_hub.append(cd)
-                except Exception as exc:
-                    log.debug("HUB: Error converting STRAT-C candidate: %s", exc)
-
             self.hub.record_scan_cycle(
                 total_assets=total_assets,
                 strat_a_candidates=strat_a_for_hub,
                 strat_b_candidates=strat_b_for_hub,
-                strat_c_candidates=strat_c_for_hub,
                 balance=self.current_balance,
                 cycle_id=self.cycle_id,
                 cycle_ops=self.cycle_ops,
                 cycle_wins=self.cycle_wins,
                 cycle_losses=self.cycle_losses,
             )
+
+            # Actualizar chart del candidato más cercano cuando no hay trade activo.
+            # Si hay trade activo, el chart ya fue actualizado al abrir la entrada y
+            # el render en vivo lo mantiene sincronizado con current_price.
+            if not self.trades and strat_a_for_hub:
+                # Ordenar por dist_pct (None → infinito) y luego por score desc.
+                _sorted = sorted(
+                    strat_a_for_hub,
+                    key=lambda c: (
+                        9999.0 if c.dist_pct is None else c.dist_pct,
+                        -c.score,
+                    ),
+                )
+                _best = _sorted[0]
+                _best_candles = self._last_asset_candles.get(_best.asset.upper()) or []
+                if _best_candles:
+                    try:
+                        _best_live_px = self.last_known_price.get(_best.asset.upper())
+                        self.hub.update_chart_candles(
+                            candles=_best_candles,
+                            asset=_best.asset,
+                            entry_price=None,          # sin entrada aún
+                            direction=_best.direction,
+                            zone_floor=_best.zone_floor,
+                            zone_ceiling=_best.zone_ceiling,
+                            live_price=_best_live_px,
+                        )
+                    except Exception as exc:
+                        log.debug("HUB chart candidato: %s", exc)
         except Exception as exc:
             log.debug("Hub registration error: %s", exc)
 
@@ -1933,6 +2021,34 @@ class ConsolidationBot:
     def _is_put_pattern_blacklisted(direction: str, pattern_name: str) -> bool:
         return direction == "put" and pattern_name in PATTERN_PUT_BLACKLIST
 
+    @staticmethod
+    def _pattern_timing_mode(pattern_name: str) -> str:
+        name = str(pattern_name or "none").strip().lower()
+        if name in PATTERN_TIMING_IMMEDIATE:
+            return "immediate"
+        if name in PATTERN_TIMING_NEXT_OPEN:
+            return "next_open"
+        if name in PATTERN_TIMING_ANTICIPATORY:
+            return "anticipatory"
+        return "none"
+
+    @staticmethod
+    def _is_direct_pattern_trigger(
+        *,
+        pattern_name: str,
+        payout: int,
+        confirms: bool,
+        strength: float,
+        required_strength: float,
+    ) -> bool:
+        if int(payout) <= PATTERN_DIRECT_TRIGGER_MIN_PAYOUT:
+            return False
+        if not confirms:
+            return False
+        if float(strength) < float(required_strength):
+            return False
+        return ConsolidationBot._pattern_timing_mode(pattern_name) != "none"
+
     async def _check_overext_support_bounce(
         self,
         rejected_put: "CandidateEntry",
@@ -2041,12 +2157,19 @@ class ConsolidationBot:
         setattr(call_candidate, "_support_touches", touches)
         setattr(call_candidate, "_support_price", support_price)
 
+        self._populate_zone_memory(call_candidate)
         score_candidate(call_candidate)
 
         # Bonus por soporte con múltiples toques (mayor confianza)
         touch_bonus = min(15.0, touches * 3.0)
         call_candidate.score = round(call_candidate.score + touch_bonus, 1)
         call_candidate.score_breakdown["support_touch_bonus"] = touch_bonus
+        self._update_vip_library(
+            call_candidate,
+            candles_1m=(),
+            candles_5m=candles_5m,
+            h1_candles=call_candidate.candles_h1,
+        )
 
         if id(call_candidate) not in existing_ids:
             selected.append(call_candidate)
@@ -2148,6 +2271,65 @@ class ConsolidationBot:
     @staticmethod
     def _structure_key(asset: str, zone: ConsolidationZone) -> str:
         return f"{asset}|{zone.floor:.5f}|{zone.ceiling:.5f}"
+
+    def _populate_zone_memory(self, candidate: "CandidateEntry") -> None:
+        """
+        Popula candidate.zone_memory con las zonas históricas cercanas del activo.
+        Lee la DB de expired_zones via zone_memory.query_nearby_zones().
+        No lanza excepciones — degradación silenciosa si la DB no está disponible.
+        """
+        try:
+            from zone_memory import query_nearby_zones
+            db_path = get_journal().db_path
+            price = float(candidate.candles[-1].close) if candidate.candles else float(candidate.zone.midpoint)
+            candidate.zone_memory = query_nearby_zones(
+                db_path=db_path,
+                asset=candidate.asset,
+                current_price=price,
+            )
+        except Exception:
+            candidate.zone_memory = []
+
+    def _update_vip_library(
+        self,
+        candidate: "CandidateEntry",
+        *,
+        candles_1m: Sequence[Candle] = (),
+        candles_5m: Sequence[Candle] = (),
+        h1_candles: Sequence[Candle] = (),
+    ) -> None:
+        """
+        Mantiene la biblioteca VIP sincronizada con el candidato más reciente.
+        Publica la ventana al HUB si el candidato queda a <=3 condiciones de entrar.
+        """
+        try:
+            htf_scanner = getattr(self, "htf_scanner", None)
+            candles_15m: Sequence[Candle] = ()
+            if htf_scanner is not None:
+                candles_15m = htf_scanner.get_candles_15m(candidate.asset) or ()
+
+            self.vip_library.min_score = float(self.current_score_threshold)
+            window = self.vip_library.refresh_from_candidate(
+                candidate,
+                candles_1m=candles_1m,
+                candles_5m=candles_5m,
+                candles_15m=candles_15m,
+                h1_candles=h1_candles,
+            )
+            if hasattr(self, "hub"):
+                self.hub.update_vip_windows(self.vip_library.get_windows())
+            if window is not None:
+                log.debug(
+                    "[VIP] %s %s score=%.1f missing=%d/%d ready=%s",
+                    window.asset,
+                    window.direction.upper(),
+                    window.score,
+                    window.missing_conditions,
+                    window.total_conditions,
+                    "yes" if window.ready_to_execute else "no",
+                )
+        except Exception:
+            pass
 
     def _cleanup_structure_locks(self) -> None:
         if STRUCTURE_ENTRY_LOCK_TTL_MIN <= 0:
@@ -3089,7 +3271,7 @@ class ConsolidationBot:
             return False
 
         drawdown = (self.session_start_balance - bal) / self.session_start_balance
-        if ENABLE_SESSION_STOP_LOSS and drawdown >= MAX_LOSS_SESSION:
+        if self._session_stop_loss_enabled and drawdown >= MAX_LOSS_SESSION:
             self.session_stop_hit = True
             log.error(
                 "🛑 STOP-LOSS DE SESIÓN activado: drawdown=%.1f%% (inicio=%.2f, actual=%.2f)",
@@ -3098,6 +3280,10 @@ class ConsolidationBot:
                 bal,
             )
             return True
+
+        # En DEMO/PRACTICE nunca frenar el scanner por stop-loss de sesión.
+        if not self._session_stop_loss_enabled and self.session_stop_hit:
+            self.session_stop_hit = False
         return False
 
     async def refresh_balance_for_hub(self, force: bool = False) -> bool:
@@ -3592,6 +3778,19 @@ class ConsolidationBot:
                 candidate._amount = amount  # type: ignore[attr-defined]
                 candidate._stage = "initial"  # type: ignore[attr-defined]
                 candidate._from_pending = True  # type: ignore[attr-defined]
+                pattern_timing_mode = self._pattern_timing_mode(pattern_name)
+                direct_pattern_trigger = self._is_direct_pattern_trigger(
+                    pattern_name=pattern_name,
+                    payout=int(payout),
+                    confirms=bool(confirms),
+                    strength=float(strength),
+                    required_strength=float(req_strength),
+                )
+                candidate._pattern_timing_mode = pattern_timing_mode  # type: ignore[attr-defined]
+                candidate._direct_pattern_trigger = direct_pattern_trigger  # type: ignore[attr-defined]
+                if direct_pattern_trigger and pattern_timing_mode in {"immediate", "anticipatory"}:
+                    candidate._stage = "pattern_immediate"  # type: ignore[attr-defined]
+                self._populate_zone_memory(candidate)
                 score_candidate(candidate)
                 if confirms and strength >= 0.60:
                     candidate.score = round(candidate.score + 8.0, 1)
@@ -3605,6 +3804,12 @@ class ConsolidationBot:
                 if rejection_quality == "total":
                     candidate.score = round(candidate.score + 2.0, 1)
                     candidate.score_breakdown["rejection_total_bonus"] = 2.0
+                self._update_vip_library(
+                    candidate,
+                    candles_1m=candles_1m,
+                    candles_5m=(),
+                    h1_candles=h1_hist,
+                )
                 ready_candidates.append(candidate)
                 to_remove.append(sym)
 
@@ -3647,9 +3852,9 @@ class ConsolidationBot:
 
         return ready_candidates
 
-    async def _strat_c_window_ticker(self) -> None:
+    async def _LEGACY_RJ_window_ticker(self) -> None:
         """
-        Ticker dedicado para STRAT-C — ventana s30-41 de cada vela M1.
+        Ticker dedicado para LEGACY-RJ — ventana s30-41 de cada vela M1.
 
         Corre cada 0.5s. Cuando el segundo del broker entra en [30, 41]:
         - Itera sobre activos con datos de velas cacheados (max 90s de antigüedad).
@@ -3659,14 +3864,14 @@ class ConsolidationBot:
         Propósito: garantizar que NUNCA se pierda la ventana de 11s aunque el
         scan principal esté ocupado con otros activos / lógica de martingala.
         """
-        log.info("🕐 STRAT-C window ticker iniciado (revisa s30-41 cada 0.5s)")
+        log.info("🕐 LEGACY-RJ window ticker iniciado (revisa s30-41 cada 0.5s)")
         while True:
             try:
                 await asyncio.sleep(0.5)
 
-                if not STRAT_C_CAN_TRADE:
+                if not LEGACY_RJ_CAN_TRADE:
                     continue
-                if not _STRAT_C_AVAILABLE or strat_c_detector is None:
+                if not _LEGACY_RJ_AVAILABLE or LEGACY_RJ_detector is None:
                     continue
 
                 _broker_ts = self._broker_now_ts()
@@ -3674,12 +3879,12 @@ class ConsolidationBot:
 
                 # Fuera de la ventana → reset del flag de "ya disparé esta vela"
                 if not (REJECTION_ENTRY_WINDOW_START_SEC <= _broker_second <= REJECTION_ENTRY_WINDOW_END_SEC):
-                    self._strat_c_window_vela_fired = 0.0
+                    self._LEGACY_RJ_window_vela_fired = 0.0
                     continue
 
                 # Clave de vela actual = minuto al que pertenece el timestamp del broker
                 _current_vela_key = _broker_ts - (_broker_ts % 60)
-                if self._strat_c_window_vela_fired >= _current_vela_key:
+                if self._LEGACY_RJ_window_vela_fired >= _current_vela_key:
                     # Ya evaluamos esta vela en la ventana — no disparar dos veces
                     continue
 
@@ -3691,7 +3896,7 @@ class ConsolidationBot:
                 _best_payout: int = 0
                 _best_zones: list = []
 
-                for _sym, _cache_entry in list(self._strat_c_candles_cache.items()):
+                for _sym, _cache_entry in list(self._LEGACY_RJ_candles_cache.items()):
                     _cache_ts, _c_candles, _c_payout = _cache_entry
                     # Sólo usar datos frescos (menos de 90s de antigüedad)
                     if _now - _cache_ts > 90.0:
@@ -3701,17 +3906,17 @@ class ConsolidationBot:
                     if len(_c_candles) < 15:
                         continue
                     # Skip activos con cooldown activo
-                    if _now - self._strat_c_last_entry.get(_sym, 0.0) < STRAT_C_DURATION_SEC + 10:
+                    if _now - self._LEGACY_RJ_last_entry.get(_sym, 0.0) < LEGACY_RJ_DURATION_SEC + 10:
                         continue
 
                     try:
                         # Usar zonas cacheadas si están frescas
-                        _zones_ts, _zones_list = self._strat_c_zones_cache.get(_sym, (0.0, []))
+                        _zones_ts, _zones_list = self._LEGACY_RJ_zones_cache.get(_sym, (0.0, []))
                         _zonas = _zones_list if (_now - _zones_ts < 300.0 and _zones_list) else None
 
                         _result = cast(
                             Optional[StratCSignal],
-                            strat_c_detector.evaluar_vela(
+                            LEGACY_RJ_detector.evaluar_vela(
                                 _c_candles,
                                 zonas=_zonas,
                                 check_time=True,
@@ -3727,10 +3932,10 @@ class ConsolidationBot:
                                 _best_payout = _c_payout
                                 _best_zones = _zonas or []
                     except Exception as _exc:
-                        log.debug("STRAT-C ticker eval error %s: %s", _sym, _exc)
+                        log.debug("LEGACY-RJ ticker eval error %s: %s", _sym, _exc)
 
                 # Marcar la vela como evaluada aunque no haya señal
-                self._strat_c_window_vela_fired = _current_vela_key
+                self._LEGACY_RJ_window_vela_fired = _current_vela_key
 
                 if _best_result is None or _best_sym is None:
                     continue
@@ -3739,30 +3944,30 @@ class ConsolidationBot:
                 _c_direction_lower = _c_direction.lower()
 
                 # Gate de capacidad
-                _strat_c_active = sum(
+                _LEGACY_RJ_active = sum(
                     1 for _t in self.trades.values()
-                    if getattr(_t, 'strategy_origin', '') == 'STRAT-C'
+                    if getattr(_t, 'strategy_origin', '') == 'LEGACY-RJ'
                 )
-                if _strat_c_active >= 1 or len(self.trades) >= MAX_CONCURRENT_TRADES:
-                    log.debug("STRAT-C ticker: señal %s omitida — capacidad llena", _best_sym)
+                if _LEGACY_RJ_active >= 1 or len(self.trades) >= MAX_CONCURRENT_TRADES:
+                    log.debug("LEGACY-RJ ticker: señal %s omitida — capacidad llena", _best_sym)
                     continue
 
                 log.info(
-                    "🔵⚡ STRAT-C TICKER: %s %s score=%.1f/17 s=%d (ventana)",
+                    "🔵⚡ LEGACY-RJ TICKER: %s %s score=%.1f/17 s=%d (ventana)",
                     _best_sym, _c_direction.upper(), _c_score, _broker_second,
                 )
 
                 _c_zone = ConsolidationZone(
                     asset=_best_sym,
-                    ceiling=float(self._strat_c_candles_cache[_best_sym][1][-1]['high']),
-                    floor=float(self._strat_c_candles_cache[_best_sym][1][-1]['low']),
+                    ceiling=float(self._LEGACY_RJ_candles_cache[_best_sym][1][-1]['high']),
+                    floor=float(self._LEGACY_RJ_candles_cache[_best_sym][1][-1]['low']),
                     bars_inside=0,
                     detected_at=_now,
                     range_pct=0.0,
                 )
                 _c_amount, _ = self._compute_initial_amount(_best_payout)
                 _c_strategy = self._strategy_snapshot()
-                _c_strategy.update({"strategy_origin": "STRAT-C", "strat_c_score": float(_c_score), "source": "window_ticker"})
+                _c_strategy.update({"strategy_origin": "LEGACY-RJ", "LEGACY_RJ_score": float(_c_score), "source": "window_ticker"})
                 _c_cached_candles = [
                     Candle(
                         ts=0,
@@ -3771,7 +3976,7 @@ class ConsolidationBot:
                         low=float(_candle["low"]),
                         close=float(_candle["close"]),
                     )
-                    for _candle in self._strat_c_candles_cache[_best_sym][1]
+                    for _candle in self._LEGACY_RJ_candles_cache[_best_sym][1]
                 ]
 
                 _c_candidate = CandidateEntry(
@@ -3787,9 +3992,9 @@ class ConsolidationBot:
                         "rsi": float(_c_detalle.get("rsi", 0.0)),
                     },
                 )
-                setattr(_c_candidate, "_entry_mode", "rejection_30s_ticker")
-                setattr(_c_candidate, "_strat_c_score", float(_c_score))
-                setattr(_c_candidate, "_strat_c_detalle", _c_detalle)
+                setattr(_c_candidate, "_entry_mode", "rejection_m1_ticker")
+                setattr(_c_candidate, "_LEGACY_RJ_score", float(_c_score))
+                setattr(_c_candidate, "_LEGACY_RJ_detalle", _c_detalle)
 
                 _c_black_box_id = 0
                 try:
@@ -3797,7 +4002,7 @@ class ConsolidationBot:
                         "C",
                         int(self.stats.get("scans", 0)),
                         {
-                            "market_state": "strat_c_window",
+                            "market_state": "LEGACY_RJ_window",
                             "volatility_atr": float(_c_detalle.get("atr", 0.0) or 0.0),
                         },
                     )
@@ -3818,12 +4023,12 @@ class ConsolidationBot:
                                 "broker_second": int(_broker_second),
                                 "detalle": _c_detalle,
                             },
-                            "candles_1m": self._strat_c_candles_cache[_best_sym][1][-5:],
+                            "candles_1m": self._LEGACY_RJ_candles_cache[_best_sym][1][-5:],
                         },
                     )
                     self.black_box.update_scan_results(_c_scan_id, found=1, accepted=1, rejected=0)
                 except Exception as exc:
-                    log.debug("Black box STRAT-C ticker error %s: %s", _best_sym, exc)
+                    log.debug("Black box LEGACY-RJ ticker error %s: %s", _best_sym, exc)
 
                 _c_cid = get_journal().log_candidate(
                     _c_candidate,
@@ -3834,28 +4039,28 @@ class ConsolidationBot:
                     strategy=_c_strategy,
                 )
                 setattr(_c_candidate, "_journal_cid", _c_cid)
-                self._strat_c_last_entry[_best_sym] = _now
+                self._LEGACY_RJ_last_entry[_best_sym] = _now
                 await self._enter(
                     _best_sym,
                     _c_direction_lower,
                     _c_amount,
                     _c_zone,
-                    f"STRAT-C⚡ ticker score={_c_score:.1f}/17 {_c_direction.upper()}",
+                    f"LEGACY-RJ⚡ ticker score={_c_score:.1f}/17 {_c_direction.upper()}",
                     "initial",
                     journal_cid=_c_cid,
                     signal_ts=None,
-                    strategy_origin="STRAT-C",
-                    duration_sec=STRAT_C_DURATION_SEC,
+                    strategy_origin="LEGACY-RJ",
+                    duration_sec=LEGACY_RJ_DURATION_SEC,
                     payout=_best_payout,
                     score_original=round(float(_c_score) / 17.0 * 100.0, 1),
                     black_box_candidate_id=_c_black_box_id,
                 )
 
             except asyncio.CancelledError:
-                log.info("STRAT-C window ticker cancelado.")
+                log.info("LEGACY-RJ window ticker cancelado.")
                 return
             except Exception as _ticker_exc:
-                log.debug("STRAT-C ticker loop error: %s", _ticker_exc)
+                log.debug("LEGACY-RJ ticker loop error: %s", _ticker_exc)
 
     async def scan_all(self) -> None:
         """
@@ -3863,8 +4068,16 @@ class ConsolidationBot:
         matemático y opera SOLO el mejor (o los N mejores si MAX_ENTRIES_CYCLE > 1).
         Si ninguno supera el umbral dinámico de score, no opera ese ciclo.
         """
+        print("[DEBUG-SCAN] 1. Starting scan_all()", flush=True)
         if await self.refresh_balance_and_risk():
-            return
+            print("[DEBUG-SCAN] 2a. Stop-loss triggered in REAL account, returning", flush=True)
+            if str(self.account_type).upper() == "REAL" and bool(ENABLE_SESSION_STOP_LOSS):
+                return
+            # Defensa extra: en DEMO/PRACTICE nunca detener el escaneo por stop-loss.
+            self.session_stop_hit = False
+            log.warning("⚠ Stop-loss de sesión ignorado en DEMO/PRACTICE dentro de scan_all.")
+
+        print("[DEBUG-SCAN] 2b. After refresh_balance_and_risk", flush=True)
 
         # Safety watchdog: liberar flag de gale si expiró el tiempo máximo posible
         _MAX_GALE_LIFETIME_SEC = float(DURATION_SEC) + float(GALE_BRIDGE_ORDER_TIMEOUT_SEC) + 30.0
@@ -3879,38 +4092,84 @@ class ConsolidationBot:
                 self._gale_order_active = False
                 self._gale_order_active_since = 0.0
 
-        assets = await get_open_assets(self.client, MIN_PAYOUT)
+        assets: List[Tuple[str, int]] = []
+        htf_scanner = getattr(self, "htf_scanner", None)
+        htf_ready = False
+        print("[DEBUG-SCAN] 3. Getting assets, htf_scanner=%s" % (htf_scanner is not None), flush=True)
+        if htf_scanner is not None:
+            try:
+                assets = list(htf_scanner.get_eligible_assets(max_age_sec=240.0))
+                htf_ready = bool(assets)
+                if assets:
+                    log.debug("📌 Fuente activos scan: HTF biblioteca (%d)", len(assets))
+                else:
+                    log.debug("📚 Biblioteca HTF vacía/no fresca: usando fallback clásico por ahora")
+            except Exception:
+                assets = []
+
+        # Fallback mientras el HTF aún no haya publicado una biblioteca usable.
+        print("[DEBUG-SCAN] 4. Checking fallback, assets=%d" % len(assets), flush=True)
         if not assets:
+            print("[DEBUG-SCAN] 5. Calling get_open_assets()...", flush=True)
+            assets = await get_open_assets(self.client, MIN_PAYOUT)
+            print("[DEBUG-SCAN] 6. get_open_assets() returned %d assets" % len(assets), flush=True)
+            if assets:
+                if htf_scanner is None:
+                    log.debug("📌 Fuente activos scan: get_open_assets fallback (%d)", len(assets))
+                elif not htf_ready:
+                    log.debug("📌 Fuente activos scan: fallback temporal a get_open_assets (%d)", len(assets))
+
+        if not assets:
+            print("[DEBUG-SCAN] 7. No assets available, returning", flush=True)
             log.warning("No se obtuvieron activos OTC disponibles.")
             return
 
+        print("[DEBUG-SCAN] 8. Got %d assets, continuing..." % len(assets), flush=True)
+
         total_assets_available = len(assets)
         if SCAN_MAX_ASSETS_PER_CYCLE > 0 and len(assets) > SCAN_MAX_ASSETS_PER_CYCLE:
+            print("[DEBUG-SCAN] 9a. Limiting assets to %d" % SCAN_MAX_ASSETS_PER_CYCLE, flush=True)
             assets = assets[:SCAN_MAX_ASSETS_PER_CYCLE]
             log.info(
                 "⚡ Aceleración scan: %d/%d activos (top payout)",
                 len(assets),
                 total_assets_available,
             )
+        else:
+            print("[DEBUG-SCAN] 9b. Not limiting assets", flush=True)
 
+        print("[DEBUG-SCAN] 10. About to increment stats and cleanup", flush=True)
         self.stats["scans"] += 1
+        # Reflejar progreso inmediato en el HUB aunque el ciclo aún no termine.
+        try:
+            self.hub.state.total_scans = int(self.stats["scans"])
+        except Exception:
+            pass
+        print("[DEBUG-SCAN] 11. Stats incremented, about to cleanup", flush=True)
         accepted_this_scan = 0
         self._cleanup_asset_blacklist()
+        print("[DEBUG-SCAN] 12. Cleanup done, about to log", flush=True)
         log.info("═══ SCAN #%d | %d activos payout≥%d%% ═══",
                  self.stats["scans"], len(assets), MIN_PAYOUT)
+        print("[DEBUG-SCAN] 13. After log, about to check martingalas", flush=True)
 
         # 1) Revisar martingalas de trades abiertos
         # Snapshot de keys al inicio — evita KeyError si _resolve_trade elimina el trade
         # durante un await interno de _check_martin (race condition asyncio)
         _active_syms = list(self.trades.keys())
+        print("[DEBUG-SCAN] 14. Active syms: %d" % len(_active_syms), flush=True)
         for sym in _active_syms:
+            print("[DEBUG-SCAN] 15. Checking martin for %s" % sym, flush=True)
             if sym not in self.trades:
                 # Trade resuelto por task en background mientras iterábamos
                 continue
             entered = await self._check_martin(sym)
+            print("[DEBUG-SCAN] 16. Martin check done for %s, entered=%s" % (sym, entered), flush=True)
             if entered:
                 await sleep_with_inline_countdown(COOLDOWN_BETWEEN_ENTRIES, "⏳ Cooldown post-orden")
             await asyncio.sleep(0.2)
+
+        print("[DEBUG-SCAN] 17. After martingala checks", flush=True)
 
         # Si hay operaciones abiertas: seguir escaneando para vigilar oportunidades.
         # El bloque de ejecución (paso 5) impedirá abrir nuevas entradas si se alcanzó
@@ -3937,15 +4196,15 @@ class ConsolidationBot:
         strat_b_timeout = 0  # fetches 1m que devolvieron 0 velas (timeout)
         strat_b_hits: list[tuple[str, int, float, str, str]] = []
         strat_b_nearmiss: list[tuple[str, int, float, str]] = []
-        strat_c_hits: list[tuple[str, int, float, str]] = []
-        strat_c_black_box_scan_id = 0
-        strat_c_black_box_found = 0
-        strat_c_black_box_accepted = 0
+        LEGACY_RJ_hits: list[tuple[str, int, float, str]] = []
+        LEGACY_RJ_black_box_scan_id = 0
+        LEGACY_RJ_black_box_found = 0
+        LEGACY_RJ_black_box_accepted = 0
         
         # Limpiar registro de candidatos para este ciclo
         self.last_scan_strat_a = []
         self.last_scan_strat_b = []
-        self.last_scan_strat_c = []
+        self.last_scan_LEGACY_RJ = []
         # Acumuladores para pending_reversals (populados durante el loop).
         candles_1m_collected: dict[str, list] = {}
         last_prices_collected: dict[str, float] = {}
@@ -3967,6 +4226,9 @@ class ConsolidationBot:
                     )
             except (KeyboardInterrupt, asyncio.CancelledError):
                 raise asyncio.CancelledError()
+            except Exception as exc:
+                log.debug("%s: _fetch_5m_limited error: %s", symbol, exc)
+                return []
 
         async def _fetch_1m_limited(symbol: str) -> List[Candle]:
             try:
@@ -3977,6 +4239,7 @@ class ConsolidationBot:
                         60,
                         36,
                         timeout_sec=CANDLE_FETCH_1M_TIMEOUT_SEC,
+                        retries=1,
                     )
                     if len(result) < 20:
                         log.debug(
@@ -3986,6 +4249,9 @@ class ConsolidationBot:
                     return result
             except (KeyboardInterrupt, asyncio.CancelledError):
                 raise asyncio.CancelledError()
+            except Exception as exc:
+                log.debug("%s: _fetch_1m_limited error: %s", symbol, exc)
+                return []
 
         async def _fetch_h1_limited(symbol: str) -> List[Candle]:
             try:
@@ -3999,6 +4265,9 @@ class ConsolidationBot:
                     )
             except (KeyboardInterrupt, asyncio.CancelledError):
                 raise asyncio.CancelledError()
+            except Exception as exc:
+                log.debug("%s: _fetch_h1_limited error: %s", symbol, exc)
+                return []
 
         async def _fetch_ob_limited(symbol: str) -> List[Candle]:
             try:
@@ -4013,14 +4282,21 @@ class ConsolidationBot:
                     )
             except (KeyboardInterrupt, asyncio.CancelledError):
                 raise asyncio.CancelledError()
+            except Exception as exc:
+                log.debug("%s: _fetch_ob_limited error: %s", symbol, exc)
+                return []
 
         # Solo pre-lanzamos los fetches 5m en paralelo (concurrencia limitada).
         # Los fetches 1m se hacen de forma SECUENCIAL en el loop para evitar
         # que las respuestas WebSocket se mezclen entre activos.
+        print("[DEBUG-SCAN] 18. Setting up prefetch tasks for %d assets" % len(assets), flush=True)
         candles_tasks: dict[str, asyncio.Task[List[Candle]]] = {}
         prefetch_window = max(1, min(SCAN_5M_PREFETCH_WINDOW, len(assets)))
+        print("[DEBUG-SCAN] 19. Prefetch window: %d" % prefetch_window, flush=True)
         for sym, _ in assets[:prefetch_window]:
+            print("[DEBUG-SCAN] 20a. Pre-launching fetch for %s" % sym, flush=True)
             candles_tasks[sym] = asyncio.create_task(_fetch_5m_limited(sym), name=f"fetch_5m:{sym}")
+        print("[DEBUG-SCAN] 20b. Prefetch tasks created", flush=True)
 
         try:
             # Decrementar contadores de activos en cooldown post-fallo.
@@ -4030,7 +4306,9 @@ class ConsolidationBot:
             for a in self.failed_assets:
                 self.failed_assets[a] -= 1
 
+            print("[DEBUG-SCAN] 21. Starting asset iteration loop for %d assets" % len(assets), flush=True)
             for idx, (sym, payout) in enumerate(assets, start=1):
+                print("[DEBUG-SCAN] 22. Processing asset %d/%d: %s (payout=%d)" % (idx, len(assets), sym, payout), flush=True)
                 next_prefetch_idx = idx - 1 + prefetch_window
                 if next_prefetch_idx < len(assets):
                     next_sym, _ = assets[next_prefetch_idx]
@@ -4044,14 +4322,17 @@ class ConsolidationBot:
                     log.info("⏱ Progreso scan: %d/%d activos", idx, len(assets))
 
                 if sym in self.trades:
+                    print("[DEBUG-SCAN] 23a. %s has open trade, skipping" % sym, flush=True)
                     continue
 
                 if sym in self.greylist_assets:
+                    print("[DEBUG-SCAN] 23b. %s in greylist, skipping" % sym, flush=True)
                     log.info("⏭ %s: en lista gris — skip", sym)
                     self.stats["skipped"] += 1
                     continue
 
                 if self._is_asset_blacklisted(sym):
+                    print("[DEBUG-SCAN] 24. %s is blacklisted, skipping" % sym, flush=True)
                     until_ts = self.asset_blacklist_until.get(sym, time.time())
                     remain_min = max(0.0, (until_ts - time.time()) / 60.0)
                     log.warning("⏭ %s: blacklist temporal activa (%.1f min restantes)", sym, remain_min)
@@ -4060,24 +4341,35 @@ class ConsolidationBot:
 
                 # Skip activos que fallaron recientemente en place_order().
                 if sym in self.failed_assets:
+                    print("[DEBUG-SCAN] 25. %s failed recently, skipping" % sym, flush=True)
                     log.info("⏭ %s skipped — falló en ciclo anterior (%d ciclos restantes)",
                              sym, self.failed_assets[sym])
                     continue
 
+                print("[DEBUG-SCAN] 26. About to pop candles for %s" % sym, flush=True)
                 candles = await candles_tasks.pop(sym)
+                print("[DEBUG-SCAN] 27. Got %d candles for %s" % (len(candles) if candles else 0, sym), flush=True)
+                # Cachear para el chart ASCII del HUB (últimas 20 velas).
+                if candles:
+                    self._last_asset_candles[sym] = candles[-20:]
 
                 # STRAT-B (Spring Sweep): fetch 1m SECUENCIAL para este activo.
                 # Un pequeño sleep antes del request 1m deja que el WebSocket
                 # liquide la respuesta 5m antes de enviar el nuevo request.
+                print("[DEBUG-SCAN] 28. About to sleep and fetch 1m for %s" % sym, flush=True)
                 await asyncio.sleep(0.25)
                 strat_b_total += 1
+                print("[DEBUG-SCAN] 29. Fetching 1m for %s" % sym, flush=True)
                 candles_1m = await _fetch_1m_limited(sym)
+                print("[DEBUG-SCAN] 30. Got %d 1m candles for %s" % (len(candles_1m) if candles_1m else 0, sym), flush=True)
                 candles_1m_collected[sym] = candles_1m
                 # Calibrar reloj local contra timestamps del servidor Quotex.
                 if candles_1m:
                     self._update_clock_offset(candles_1m, TF_1M)
+                print("[DEBUG-SCAN] 31. After clock update", flush=True)
                 if len(candles_1m_collected) > SCAN_CANDLES_BUFFER_MAX:
                     candles_1m_collected.pop(next(iter(candles_1m_collected)), None)
+                print("[DEBUG-SCAN] 32. After buffer cleanup, candles_1m len=%d" % len(candles_1m), flush=True)
                 strat_b_signal = False
                 strat_b_info = {
                     "confidence": 0.0,
@@ -4085,7 +4377,9 @@ class ConsolidationBot:
                     "signal_type": None,
                     "direction": None,
                 }
+                print("[DEBUG-SCAN] 33. About to check if candles_1m >= 20: %d" % len(candles_1m), flush=True)
                 if len(candles_1m) >= 20:
+                    print("[DEBUG-SCAN] 34a. Creating DataFrame for %s" % sym, flush=True)
                     spring_df = pd.DataFrame(
                         {
                             "open": [c.open for c in candles_1m],
@@ -4094,19 +4388,21 @@ class ConsolidationBot:
                             "close": [c.close for c in candles_1m],
                         }
                     )
+                    print("[DEBUG-SCAN] 34b. DataFrame created, calling detect_spring_or_upthrust", flush=True)
                     strat_b_signal, strat_b_info = detect_spring_or_upthrust(
                         spring_df,
                         allow_early=STRAT_B_ALLOW_WYCKOFF_EARLY,
                     )
+                    print("[DEBUG-SCAN] 34c. After detect_spring_or_upthrust, signal=%s" % strat_b_signal, flush=True)
                 elif len(candles_1m) == 0:
                     strat_b_timeout += 1
                 else:
                     strat_b_insufficient += 1
 
-                # ── STRAT-C (Rechazo M1 — 60s) ──────────────────────────────────────────
-                # Se evalúa siempre que STRAT-C esté disponible y haya velas 1m suficientes.
-                # El trading solo se habilita si STRAT_C_CAN_TRADE=True.
-                if _STRAT_C_AVAILABLE and strat_c_detector is not None and len(candles_1m) >= 15:
+                # ── LEGACY-RJ (Rechazo M1 — 60s) ──────────────────────────────────────────
+                # Se evalúa siempre que LEGACY-RJ esté disponible y haya velas 1m suficientes.
+                # El trading solo se habilita si LEGACY_RJ_CAN_TRADE=True.
+                if _LEGACY_RJ_AVAILABLE and LEGACY_RJ_detector is not None and len(candles_1m) >= 15:
                     try:
                         # Verificar ventana de tiempo usando el reloj calibrado del broker.
                         # La estrategia requiere segundo 30-41 del broker (no hora local).
@@ -4124,18 +4420,18 @@ class ConsolidationBot:
                             for c in candles_1m
                         ]
                         # Actualizar cache de velas (+ payout) para el ticker dedicado s30-41
-                        self._strat_c_candles_cache[sym] = (time.time(), _c_candles_dict, payout)
+                        self._LEGACY_RJ_candles_cache[sym] = (time.time(), _c_candles_dict, payout)
                         # Zonas S/R: cache por activo con TTL de 5 minutos
-                        _zones_cached_ts, _zonas_precomp = self._strat_c_zones_cache.get(sym, (0.0, []))
-                        if time.time() - _zones_cached_ts > 300.0 and _strat_c_detect_zones is not None:
-                            _zonas_precomp = _strat_c_detect_zones(_c_candles_dict)
-                            self._strat_c_zones_cache[sym] = (time.time(), _zonas_precomp)
+                        _zones_cached_ts, _zonas_precomp = self._LEGACY_RJ_zones_cache.get(sym, (0.0, []))
+                        if time.time() - _zones_cached_ts > 300.0 and _LEGACY_RJ_detect_zones is not None:
+                            _zonas_precomp = _LEGACY_RJ_detect_zones(_c_candles_dict)
+                            self._LEGACY_RJ_zones_cache[sym] = (time.time(), _zonas_precomp)
                         # check_time=True + broker_ts: verificación definitiva sin UTC-3 hardcodeado.
                         # _in_entry_window es pre-filtro rápido; evaluar_vela confirma con broker_ts.
                         _c_broker_ts = self._broker_now_ts()
                         _c_result = cast(
                             Optional[StratCSignal],
-                            strat_c_detector.evaluar_vela(
+                            LEGACY_RJ_detector.evaluar_vela(
                                 _c_candles_dict,
                                 zonas=_zonas_precomp if _zonas_precomp else None,
                                 check_time=True,
@@ -4166,59 +4462,59 @@ class ConsolidationBot:
                                     "rsi": float(_c_detalle.get("rsi", 0.0)),
                                 },
                             )
-                            setattr(_c_candidate, "_entry_mode", "rejection_30s")
-                            setattr(_c_candidate, "_strat_c_score", float(_c_score))
-                            setattr(_c_candidate, "_strat_c_detalle", _c_detalle)
-                            self.last_scan_strat_c.append(_c_candidate)
-                            strat_c_hits.append((sym, payout, float(_c_score), _c_direction_lower))
+                            setattr(_c_candidate, "_entry_mode", "rejection_m1")
+                            setattr(_c_candidate, "_LEGACY_RJ_score", float(_c_score))
+                            setattr(_c_candidate, "_LEGACY_RJ_detalle", _c_detalle)
+                            self.last_scan_LEGACY_RJ.append(_c_candidate)
+                            LEGACY_RJ_hits.append((sym, payout, float(_c_score), _c_direction_lower))
                             log.info(
-                                "🔵 STRAT-C señal: %s %s score=%.1f/17 rsi=%.1f atr=%.6f",
+                                "🔵 LEGACY-RJ señal: %s %s score=%.1f/17 rsi=%.1f atr=%.6f",
                                 sym, _c_direction.upper(), _c_score,
                                 float(_c_detalle.get("rsi", 0.0)),
                                 float(_c_detalle.get("atr", 0.0)),
                             )
-                            # Entrada operativa si STRAT_C_CAN_TRADE y capacidad disponible.
-                            # STRAT-C tiene su propio cooldown y no se bloquea por gale externo.
-                            _strat_c_active = sum(
+                            # Entrada operativa si LEGACY_RJ_CAN_TRADE y capacidad disponible.
+                            # LEGACY-RJ tiene su propio cooldown y no se bloquea por gale externo.
+                            _LEGACY_RJ_active = sum(
                                 1 for _t in self.trades.values()
-                                if getattr(_t, 'strategy_origin', '') == 'STRAT-C'
+                                if getattr(_t, 'strategy_origin', '') == 'LEGACY-RJ'
                             )
-                            _strat_c_cooldown_ok = (
-                                time.time() - self._strat_c_last_entry.get(sym, 0.0)
-                                >= STRAT_C_DURATION_SEC + 10
+                            _LEGACY_RJ_cooldown_ok = (
+                                time.time() - self._LEGACY_RJ_last_entry.get(sym, 0.0)
+                                >= LEGACY_RJ_DURATION_SEC + 10
                             )
-                            _strat_c_should_enter = (
-                                STRAT_C_CAN_TRADE
-                                and _strat_c_active < 1
-                                and _strat_c_cooldown_ok
+                            _LEGACY_RJ_should_enter = (
+                                LEGACY_RJ_CAN_TRADE
+                                and _LEGACY_RJ_active < 1
+                                and _LEGACY_RJ_cooldown_ok
                                 and len(self.trades) < MAX_CONCURRENT_TRADES
                             )
-                            if not STRAT_C_CAN_TRADE:
-                                _strat_c_bb_decision = "REJECTED_DISABLED"
-                                _strat_c_bb_reason = "STRAT-C trading deshabilitado"
-                            elif _strat_c_active >= 1 or len(self.trades) >= MAX_CONCURRENT_TRADES:
-                                _strat_c_bb_decision = "REJECTED_CAPACITY"
-                                _strat_c_bb_reason = f"capacidad llena trades={len(self.trades)}/{MAX_CONCURRENT_TRADES}"
-                            elif not _strat_c_cooldown_ok:
-                                _strat_c_bb_decision = "REJECTED_COOLDOWN"
-                                _strat_c_bb_reason = "cooldown STRAT-C activo"
+                            if not LEGACY_RJ_CAN_TRADE:
+                                _LEGACY_RJ_bb_decision = "REJECTED_DISABLED"
+                                _LEGACY_RJ_bb_reason = "LEGACY-RJ trading deshabilitado"
+                            elif _LEGACY_RJ_active >= 1 or len(self.trades) >= MAX_CONCURRENT_TRADES:
+                                _LEGACY_RJ_bb_decision = "REJECTED_CAPACITY"
+                                _LEGACY_RJ_bb_reason = f"capacidad llena trades={len(self.trades)}/{MAX_CONCURRENT_TRADES}"
+                            elif not _LEGACY_RJ_cooldown_ok:
+                                _LEGACY_RJ_bb_decision = "REJECTED_COOLDOWN"
+                                _LEGACY_RJ_bb_reason = "cooldown LEGACY-RJ activo"
                             else:
-                                _strat_c_bb_decision = "ACCEPTED"
-                                _strat_c_bb_reason = "scan_all accepted"
+                                _LEGACY_RJ_bb_decision = "ACCEPTED"
+                                _LEGACY_RJ_bb_reason = "scan_all accepted"
 
-                            _strat_c_black_box_id = 0
+                            _LEGACY_RJ_black_box_id = 0
                             try:
-                                if strat_c_black_box_scan_id == 0:
-                                    strat_c_black_box_scan_id = self.black_box.record_scan_start(
+                                if LEGACY_RJ_black_box_scan_id == 0:
+                                    LEGACY_RJ_black_box_scan_id = self.black_box.record_scan_start(
                                         "C",
                                         int(self.stats.get("scans", 0)),
                                         {
-                                            "market_state": "strat_c_scan",
+                                            "market_state": "LEGACY_RJ_scan",
                                             "volatility_atr": float(_c_detalle.get("atr", 0.0) or 0.0),
                                         },
                                     )
-                                _strat_c_black_box_id = self.black_box.record_candidate(
-                                    strat_c_black_box_scan_id,
+                                _LEGACY_RJ_black_box_id = self.black_box.record_candidate(
+                                    LEGACY_RJ_black_box_scan_id,
                                     "C",
                                     {
                                         "asset": sym,
@@ -4226,9 +4522,9 @@ class ConsolidationBot:
                                         "score": round(float(_c_score) / 17.0 * 100.0, 1),
                                         "confidence": round(float(_c_score) / 17.0, 4),
                                         "payout": payout,
-                                        "decision": _strat_c_bb_decision,
-                                        "decision_reason": _strat_c_bb_reason,
-                                        "reject_reason": "" if _strat_c_should_enter else _strat_c_bb_reason,
+                                        "decision": _LEGACY_RJ_bb_decision,
+                                        "decision_reason": _LEGACY_RJ_bb_reason,
+                                        "reject_reason": "" if _LEGACY_RJ_should_enter else _LEGACY_RJ_bb_reason,
                                         "strategy_details": {
                                             "source": "scan_all",
                                             "raw_score": float(_c_score),
@@ -4239,18 +4535,18 @@ class ConsolidationBot:
                                         "candles_1m": _c_candles_dict[-5:],
                                     },
                                 )
-                                strat_c_black_box_found += 1
-                                if _strat_c_should_enter:
-                                    strat_c_black_box_accepted += 1
+                                LEGACY_RJ_black_box_found += 1
+                                if _LEGACY_RJ_should_enter:
+                                    LEGACY_RJ_black_box_accepted += 1
                             except Exception as exc:
-                                log.debug("Black box STRAT-C scan error %s: %s", sym, exc)
+                                log.debug("Black box LEGACY-RJ scan error %s: %s", sym, exc)
 
                             if (
-                                _strat_c_should_enter
+                                _LEGACY_RJ_should_enter
                             ):
                                 _c_amount, _ = self._compute_initial_amount(payout)
                                 _c_strategy = self._strategy_snapshot()
-                                _c_strategy.update({"strategy_origin": "STRAT-C", "strat_c_score": float(_c_score)})
+                                _c_strategy.update({"strategy_origin": "LEGACY-RJ", "LEGACY_RJ_score": float(_c_score)})
                                 _c_outcome = "DRY_RUN" if self.dry_run else "PENDING"
                                 _c_cid = get_journal().log_candidate(
                                     _c_candidate,
@@ -4261,25 +4557,25 @@ class ConsolidationBot:
                                     strategy=_c_strategy,
                                 )
                                 setattr(_c_candidate, "_journal_cid", _c_cid)
-                                self._strat_c_last_entry[sym] = time.time()
+                                self._LEGACY_RJ_last_entry[sym] = time.time()
                                 await self._enter(
                                     sym,
                                     _c_direction_lower,
                                     _c_amount,
                                     _c_zone,
-                                    f"STRAT-C score={_c_score:.1f}/17 {_c_direction.upper()}",
+                                    f"LEGACY-RJ score={_c_score:.1f}/17 {_c_direction.upper()}",
                                     "initial",
                                     journal_cid=_c_cid,
                                     signal_ts=candles_1m[-1].ts if candles_1m else None,
-                                    strategy_origin="STRAT-C",
-                                    duration_sec=STRAT_C_DURATION_SEC,
+                                    strategy_origin="LEGACY-RJ",
+                                    duration_sec=LEGACY_RJ_DURATION_SEC,
                                     payout=payout,
                                     score_original=round(float(_c_score) / 17.0 * 100.0, 1),
-                                    black_box_candidate_id=_strat_c_black_box_id,
+                                    black_box_candidate_id=_LEGACY_RJ_black_box_id,
                                 )
                                 await sleep_with_inline_countdown(COOLDOWN_BETWEEN_ENTRIES, "⏳ Cooldown post-orden")
                     except Exception as _c_exc:
-                        log.debug("STRAT-C eval error en %s: %s", sym, _c_exc)
+                        log.debug("LEGACY-RJ eval error en %s: %s", sym, _c_exc)
 
                 strat_b_conf = float(strat_b_info.get("confidence", 0.0) or 0.0)
                 strat_b_signal_type = str(strat_b_info.get("signal_type") or "")
@@ -4730,6 +5026,7 @@ class ConsolidationBot:
                     "_force_execute",
                     bool(FORCE_EXECUTE_STRONG_BREAKOUT and stage == "breakout" and breakout_strength_ok),
                 )
+                self._populate_zone_memory(candidate)
                 score_candidate(candidate)
                 self.last_scan_strat_a.append(candidate)
 
@@ -4874,6 +5171,30 @@ class ConsolidationBot:
                         self.stats["skipped"] += 1
                         continue
 
+                    pattern_timing_mode = self._pattern_timing_mode(pattern_name)
+                    direct_pattern_trigger = self._is_direct_pattern_trigger(
+                        pattern_name=pattern_name,
+                        payout=int(payout),
+                        confirms=bool(confirms),
+                        strength=float(strength),
+                        required_strength=float(req_strength),
+                    )
+                    setattr(candidate, "_pattern_timing_mode", pattern_timing_mode)
+                    setattr(candidate, "_direct_pattern_trigger", direct_pattern_trigger)
+                    if direct_pattern_trigger:
+                        if pattern_timing_mode in {"immediate", "anticipatory"}:
+                            setattr(candidate, "_stage", "pattern_immediate")
+                        else:
+                            setattr(candidate, "_stage", "initial")
+                        log.info(
+                            "🎯 %s: trigger por patrón %s (timing=%s, payout=%d%%, fuerza=%.2f)",
+                            sym,
+                            pattern_name,
+                            pattern_timing_mode,
+                            int(payout),
+                            float(strength),
+                        )
+
                 if H1_CONFIRM_ENABLED:
                     h1_candles = await _fetch_h1_limited(sym)
                     h1_trend = infer_h1_trend(h1_candles)
@@ -4887,6 +5208,7 @@ class ConsolidationBot:
 
                 candidate.candles_h1 = h1_candles
 
+                self._populate_zone_memory(candidate)
                 score_candidate(candidate)
 
                 # Calcular body_ratio para log
@@ -4947,6 +5269,13 @@ class ConsolidationBot:
                     candidate.score = round(candidate.score + ma_points, 1)
                     candidate.score_breakdown["ma_filter"] = round(ma_points, 1)
                 setattr(candidate, "_ma_info", ma_info)
+
+                self._update_vip_library(
+                    candidate,
+                    candles_1m=candles_1m,
+                    candles_5m=candles,
+                    h1_candles=h1_candles,
+                )
 
                 log.info(
                     "[OB] %s tf=%s dir=%s ajuste=%+.1f | %s",
@@ -5176,11 +5505,35 @@ class ConsolidationBot:
                     len(added),
                 )
 
+        direct_pattern_candidates = [
+            c for c in candidates
+            if bool(getattr(c, "_direct_pattern_trigger", False))
+        ]
+        if direct_pattern_candidates:
+            existing = {id(c) for c in selected}
+            promoted: list[CandidateEntry] = []
+            for c in direct_pattern_candidates:
+                if id(c) in existing:
+                    continue
+                selected.append(c)
+                existing.add(id(c))
+                promoted.append(c)
+            if promoted:
+                rejected = [c for c in rejected if id(c) not in {id(x) for x in promoted}]
+                log.warning(
+                    "⚠ Pattern timing trigger: %d candidato(s) promovidos por patrón+zona+payout.",
+                    len(promoted),
+                )
+
         # Filtro final live: operar solo activos cerca del gatillo real.
         near_selected: list[CandidateEntry] = []
         moved_away: list[CandidateEntry] = []
         for c in selected:
-            if bool(getattr(c, "_force_execute", False)) or self._is_candidate_near_trigger(c):
+            if (
+                bool(getattr(c, "_force_execute", False))
+                or bool(getattr(c, "_direct_pattern_trigger", False))
+                or self._is_candidate_near_trigger(c)
+            ):
                 near_selected.append(c)
             else:
                 moved_away.append(c)
@@ -5275,16 +5628,16 @@ class ConsolidationBot:
                 )
             self.stats["skipped"] += len(selected)
             self._record_scan_acceptances(0)
-            if strat_c_black_box_scan_id:
+            if LEGACY_RJ_black_box_scan_id:
                 try:
                     self.black_box.update_scan_results(
-                        strat_c_black_box_scan_id,
-                        found=strat_c_black_box_found,
-                        accepted=strat_c_black_box_accepted,
-                        rejected=max(0, strat_c_black_box_found - strat_c_black_box_accepted),
+                        LEGACY_RJ_black_box_scan_id,
+                        found=LEGACY_RJ_black_box_found,
+                        accepted=LEGACY_RJ_black_box_accepted,
+                        rejected=max(0, LEGACY_RJ_black_box_found - LEGACY_RJ_black_box_accepted),
                     )
                 except Exception as exc:
-                    log.debug("Black box STRAT-C final update error: %s", exc)
+                    log.debug("Black box LEGACY-RJ final update error: %s", exc)
             self._record_hub_scan_cycle(total_assets_available)
             return
 
@@ -5349,16 +5702,16 @@ class ConsolidationBot:
 
         self.stats["skipped"] += len(rejected)
         self._record_scan_acceptances(accepted_this_scan)
-        if strat_c_black_box_scan_id:
+        if LEGACY_RJ_black_box_scan_id:
             try:
                 self.black_box.update_scan_results(
-                    strat_c_black_box_scan_id,
-                    found=strat_c_black_box_found,
-                    accepted=strat_c_black_box_accepted,
-                    rejected=max(0, strat_c_black_box_found - strat_c_black_box_accepted),
+                    LEGACY_RJ_black_box_scan_id,
+                    found=LEGACY_RJ_black_box_found,
+                    accepted=LEGACY_RJ_black_box_accepted,
+                    rejected=max(0, LEGACY_RJ_black_box_found - LEGACY_RJ_black_box_accepted),
                 )
             except Exception as exc:
-                log.debug("Black box STRAT-C final update error: %s", exc)
+                log.debug("Black box LEGACY-RJ final update error: %s", exc)
         self._record_hub_scan_cycle(total_assets_available)
 
     async def ensure_connection(self) -> bool:
@@ -5509,7 +5862,7 @@ class ConsolidationBot:
             try:
                 self.black_box.record_order_result(trade.black_box_order_key, outcome, profit)
             except Exception as exc:
-                log.debug("Black box STRAT-C resolve error %s: %s", sym, exc)
+                log.debug("Black box LEGACY-RJ resolve error %s: %s", sym, exc)
 
         pre_objectives, pre_ok, pre_note = self._build_pre_objectives_audit(trade)
         ticket_opened_at = datetime.fromtimestamp(trade.opened_at, tz=BROKER_TZ).isoformat(timespec="milliseconds")
@@ -6078,7 +6431,7 @@ class ConsolidationBot:
                         order_result="LIMIT_SKIPPED",
                     )
                 except Exception as exc:
-                    log.debug("Black box STRAT-C limit update error %s: %s", sym, exc)
+                    log.debug("Black box LEGACY-RJ limit update error %s: %s", sym, exc)
             return False
 
         can_enter_structure, structure_reason = self._can_enter_structure_now(sym, zone)
@@ -6106,7 +6459,7 @@ class ConsolidationBot:
                         order_result="STRUCTURE_SKIPPED",
                     )
                 except Exception as exc:
-                    log.debug("Black box STRAT-C structure update error %s: %s", sym, exc)
+                    log.debug("Black box LEGACY-RJ structure update error %s: %s", sym, exc)
             return False
 
         timing: Optional[EntryTimingInfo] = None
@@ -6126,7 +6479,7 @@ class ConsolidationBot:
                     timing_decision=timing.decision,
                 )
 
-        if stage in ("initial", "martin"):
+        if stage in ("initial", "martin", "pattern_immediate"):
             if not timing.ok:
                 if journal_cid:
                     reject_reason = f"timing 1m inválido: lag +{timing.lag_sec:.2f}s"
@@ -6150,9 +6503,9 @@ class ConsolidationBot:
                             order_result="TIMING_SKIPPED",
                         )
                     except Exception as exc:
-                        log.debug("Black box STRAT-C timing update error %s: %s", sym, exc)
+                        log.debug("Black box LEGACY-RJ timing update error %s: %s", sym, exc)
                 return False
-            # Respetar duraciones explícitas del caller (p.ej. STRAT-C=60s).
+            # Respetar duraciones explícitas del caller (p.ej. LEGACY-RJ=60s).
             # Solo reemplazar cuando el caller viene con el default global.
             if int(duration_sec) == int(DURATION_SEC):
                 duration_sec = timing.duration_sec
@@ -6184,7 +6537,7 @@ class ConsolidationBot:
                         order_result="PAYOUT_SKIPPED",
                     )
                 except Exception as exc:
-                    log.debug("Black box STRAT-C payout update error %s: %s", sym, exc)
+                    log.debug("Black box LEGACY-RJ payout update error %s: %s", sym, exc)
             return False
 
         payout = int(payout_now)
@@ -6225,7 +6578,7 @@ class ConsolidationBot:
                         order_result="BROKER_REJECTED",
                     )
                 except Exception as exc:
-                    log.debug("Black box STRAT-C broker reject update error %s: %s", sym, exc)
+                    log.debug("Black box LEGACY-RJ broker reject update error %s: %s", sym, exc)
             return False
 
         self._register_successful_entry_asset(sym, zone)
@@ -6255,6 +6608,18 @@ class ConsolidationBot:
                 duration_sec=int(duration_sec),
                 entry_price=open_price,
             )
+            # Actualizar chart ASCII del HUB con las velas de este activo.
+            _chart_candles = self._last_asset_candles.get(sym) or []
+            if _chart_candles:
+                self.hub.update_chart_candles(
+                    candles=_chart_candles,
+                    asset=sym,
+                    entry_price=open_price,
+                    direction=direction,
+                    zone_floor=zone.floor,
+                    zone_ceiling=zone.ceiling,
+                    live_price=None,  # durante trade usa masaniello.current_price
+                )
         except Exception as exc:
             log.debug("HUB: no se pudo registrar entrada activa %s: %s", sym, exc)
         self._track_task(asyncio.create_task(self._resolve_trade_after_expiry(sym, trade), name=f"resolve:{sym}:{stage}"))
@@ -6285,7 +6650,7 @@ class ConsolidationBot:
                     order_result="PENDING",
                 )
             except Exception as exc:
-                log.debug("Black box STRAT-C pending update error %s: %s", sym, exc)
+                log.debug("Black box LEGACY-RJ pending update error %s: %s", sym, exc)
 
         self.stats["entries"] += 1
         if strategy_origin == "STRAT-B":
@@ -6491,8 +6856,7 @@ async def main(
     on_bot_ready: Optional[Any] = None,
 ) -> Optional[ConsolidationBot]:
     if not EMAIL or not PASSWORD:
-        print("ERROR: Falta QUOTEX_EMAIL / QUOTEX_PASSWORD en el .env")
-        sys.exit(1)
+        raise RuntimeError("Falta QUOTEX_EMAIL / QUOTEX_PASSWORD en el .env")
 
     client = Quotex(email=EMAIL, password=PASSWORD)
 
@@ -6512,7 +6876,7 @@ async def main(
     
     if not check:
         log.critical("No se pudo conectar a Quotex: %s", reason)
-        sys.exit(1)
+        raise RuntimeError(f"No se pudo conectar a Quotex: {reason}")
 
     account_type = "REAL" if real_account else "PRACTICE"
     await client.change_account(account_type)
@@ -6546,10 +6910,10 @@ async def main(
     # Reconciliar pendientes históricos al arrancar para limpiar métricas.
     await bot.reconcile_pending_candidates()
 
-    # Ticker dedicado STRAT-C: evalúa la ventana s30-41 de forma independiente al scan principal.
-    # Se inicia siempre — el ticker verifica STRAT_C_CAN_TRADE internamente y es un no-op si False.
-    _strat_c_ticker_task = asyncio.create_task(
-        bot._strat_c_window_ticker(), name="strat_c_window_ticker"
+    # Ticker dedicado LEGACY-RJ: evalúa la ventana s30-41 de forma independiente al scan principal.
+    # Se inicia siempre — el ticker verifica LEGACY_RJ_CAN_TRADE internamente y es un no-op si False.
+    _LEGACY_RJ_ticker_task = asyncio.create_task(
+        bot._LEGACY_RJ_window_ticker(), name="LEGACY_RJ_window_ticker"
     )
 
     try:
@@ -6564,26 +6928,46 @@ async def main(
             await sleep_with_inline_countdown(first_wait, "Sincronizando primer escaneo")
             log.info("Sincronización completada. Iniciando escaneo.")
 
+        connection_ok = True
+        cycles_without_scan = 0
+        print("[DEBUG-MAIN] ★★★ ENTERING MAIN WHILE LOOP ★★★", flush=True)
         while True:
             cycle_start = time.time()
             broker_now = datetime.fromtimestamp(time.time(), tz=BROKER_TZ)
             log.info("── %s %s ──", broker_now.strftime("%H:%M:%S"), BROKER_TZ_LABEL)
 
             try:
-                if loop_forever and not await bot.ensure_connection():
-                    log.warning("⚠ Sin conexión estable, reintentando en 5s...")
-                    await asyncio.sleep(5.0)
-                    continue
+                print(f"[DEBUG-MAIN] Start of try block, cycles_without_scan={cycles_without_scan}", flush=True)
+                # Validar conexión, pero no frenar el PRIMER ciclo de escaneo.
+                if loop_forever and cycles_without_scan > 0:
+                    print(f"[DEBUG-CONN] Validando conexión (ciclo #{cycles_without_scan})...", flush=True)
+                    log.debug("⏳ Validando conexión (ciclo #%d)...", cycles_without_scan)
+                    connection_ok = await bot.ensure_connection()
+                    if not connection_ok:
+                        print(f"[DEBUG-CONN] Conexión fallida, durmiendo...", flush=True)
+                        log.warning("⚠ Sin conexión estable, reintentando en 5s...")
+                        await asyncio.sleep(5.0)
+                        continue
+                
+                print(f"[DEBUG-SCAN] Iniciando scan_all()...", flush=True)
+                log.debug("🔍 Iniciando scan_all()...")
                 await bot.scan_all()
+                print(f"[DEBUG-SCAN] scan_all() completó", flush=True)
+                log.debug("✅ scan_all() completó exitosamente")
+                cycles_without_scan = 0
                 await bot.reconcile_pending_candidates(max_age_minutes=PENDING_RECONCILE_AGE_MIN)
                 if bot.session_stop_hit:
-                    log.error("🛑 Bot detenido por stop-loss de sesión.")
-                    break
+                    if str(bot.account_type).upper() == "REAL" and bool(ENABLE_SESSION_STOP_LOSS):
+                        log.error("🛑 Bot detenido por stop-loss de sesión (REAL).")
+                        break
+                    log.warning("⚠ session_stop_hit ignorado en DEMO/PRACTICE; se continúa escaneando.")
+                    bot.session_stop_hit = False
             except asyncio.CancelledError:
                 log.info("Ciclo cancelado por interrupción del usuario.")
                 break
             except Exception as exc:
                 log.error("Error en ciclo: %s", exc, exc_info=True)
+                cycles_without_scan += 1
                 if looks_like_connection_issue(str(exc)):
                     log.warning("⚠ Error de conexión en ciclo; intentando reconectar inmediatamente...")
                     if not await bot.ensure_connection():
@@ -6627,9 +7011,9 @@ async def main(
     except KeyboardInterrupt:
         log.info("Detenido por el usuario (Ctrl+C).")
     finally:
-        _strat_c_ticker_task.cancel()
+        _LEGACY_RJ_ticker_task.cancel()
         try:
-            await asyncio.wait_for(asyncio.shield(_strat_c_ticker_task), timeout=1.0)
+            await asyncio.wait_for(asyncio.shield(_LEGACY_RJ_ticker_task), timeout=1.0)
         except Exception:
             pass
         try:
@@ -6700,3 +7084,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         # Evita traceback al interrumpir con Ctrl+C.
         raise SystemExit(0)
+

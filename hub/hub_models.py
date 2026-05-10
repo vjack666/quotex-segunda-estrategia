@@ -17,7 +17,6 @@ VALID_ENTRY_MODES = {
     "upthrust",
     "wyckoff_early_spring",
     "wyckoff_early_upthrust",
-    "rejection_30s",
     "none",
 }
 
@@ -137,10 +136,8 @@ class HubScanSnapshot:
     total_assets_scanned: int
     strat_a_candidates: List[CandidateData] = field(default_factory=list)
     strat_b_candidates: List[CandidateData] = field(default_factory=list)
-    strat_c_candidates: List[CandidateData] = field(default_factory=list)
     strat_a_entered: Optional[str] = None
     strat_b_entered: Optional[str] = None
-    strat_c_entered: Optional[str] = None
     balance: Optional[float] = None
     cycle_id: int = 0
     cycle_ops: int = 0
@@ -218,13 +215,58 @@ class MasanielloState:
 
 
 @dataclass
+class CandleSnapshot:
+    """Vela OHLC simplificada para renderizar en el chart ASCII del HUB."""
+    open:  float
+    high:  float
+    low:   float
+    close: float
+    ts:    float = 0.0   # Unix timestamp (opcional, solo para referencia)
+
+
+@dataclass
+class VipWindowData:
+    """Ventana VIP para candidatos casi listos para entrada."""
+    asset: str
+    direction: str
+    score: float
+    payout: int
+    entry_mode: str
+    zone_floor: float
+    zone_ceiling: float
+    zone_age_min: float
+    missing_conditions: int
+    total_conditions: int
+    ready_to_execute: bool
+    missing_labels: List[str] = field(default_factory=list)
+    conditions_ok: List[str] = field(default_factory=list)
+    candles_15m_count: int = 0
+    candles_5m_count: int = 0
+    candles_1m_count: int = 0
+    ma15_fast: Optional[float] = None
+    ma15_slow: Optional[float] = None
+    ma5_fast: Optional[float] = None
+    ma5_slow: Optional[float] = None
+    ma1_fast: Optional[float] = None
+    ma1_slow: Optional[float] = None
+    htf_trend: str = ""
+    h1_trend: str = ""
+    pattern: str = "none"
+    pattern_strength: float = 0.0
+    spike_clear: bool = True
+    zone_memory_ok: bool = True
+    order_block_ok: bool = True
+    notes: str = ""
+    updated_at: float = 0.0
+
+
+@dataclass
 class HubState:
     """Estado global del HUB en ejecución."""
 
     last_scan: Optional[HubScanSnapshot] = None
     strat_a_watching: List[CandidateData] = field(default_factory=list)
     strat_b_watching: List[CandidateData] = field(default_factory=list)
-    strat_c_watching: List[CandidateData] = field(default_factory=list)
     active_trade_asset: Optional[str] = None
     active_trade_direction: Optional[str] = None
     active_trade_time_remaining_sec: Optional[float] = None
@@ -241,14 +283,33 @@ class HubState:
     known_balance: float = 0.0  # último balance conocido
     masaniello: "MasanielloState" = field(default_factory=lambda: MasanielloState())  # estado del Masaniello
     gale: "GaleState" = field(default_factory=lambda: GaleState())  # [DEPRECATED] usar masaniello
+    # Chart ASCII: velas del último activo analizado/operado
+    chart_candles: List["CandleSnapshot"] = field(default_factory=list)
+    chart_asset: str = ""
+    chart_entry_price: Optional[float] = None  # precio de entrada marcado en el chart
+    chart_direction: str = ""                   # "call" | "put"
+    chart_zone_floor: Optional[float] = None    # nivel soporte de la zona
+    chart_zone_ceiling: Optional[float] = None  # nivel resistencia de la zona
+    chart_live_price: Optional[float] = None    # precio actual (candidato sin trade activo)
+    # HTF cache status: telemetría del scanner 15m en segundo plano
+    htf_asset: str = ""
+    htf_payout: int = 0
+    htf_candles: int = 0
+    htf_library_size: int = 0
+    htf_cache_age_sec: float = 0.0
+    htf_cache_ttl_sec: float = 0.0
+    htf_last_refresh_ts: float = 0.0
+    vip_windows: List[VipWindowData] = field(default_factory=list)
 
 
 __all__ = [
     "CandidateData",
+    "CandleSnapshot",
     "GaleState",
     "MasanielloState",
     "HubScanSnapshot",
     "HubState",
+    "VipWindowData",
     "VALID_DIRECTIONS",
     "VALID_ENTRY_MODES",
 ]

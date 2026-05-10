@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import Any, List, Mapping, Optional, Sequence
 import logging
 
-from .hub_models import CandidateData, GaleState, HubScanSnapshot, HubState
+from .hub_models import CandidateData, CandleSnapshot, GaleState, HubScanSnapshot, HubState, VipWindowData
 
 log = logging.getLogger("hub_scanner")
 
@@ -47,7 +47,6 @@ class HubScanner:
         total_assets: int,
         strat_a_candidates: Sequence[CandidateData | Mapping[str, Any]],
         strat_b_candidates: Sequence[CandidateData | Mapping[str, Any]],
-        strat_c_candidates: Sequence[CandidateData | Mapping[str, Any]] = (),
         balance: Optional[float] = None,
         cycle_id: int = 0,
         cycle_ops: int = 0,
@@ -62,7 +61,6 @@ class HubScanner:
         now = datetime.now(tz=timezone.utc)
 
         # Normaliza y conserva top candidatos por estrategia para el HUB.
-        # STRAT-C queda fuera de consideración por decisión operativa actual.
         normalized_a = self.normalize_candidates("STRAT-A", strat_a_candidates)
         normalized_b = self.normalize_candidates("STRAT-B", strat_b_candidates)
         strat_a_top5 = normalized_a[:5]
@@ -70,7 +68,6 @@ class HubScanner:
 
         self.state.strat_a_watching = strat_a_top5
         self.state.strat_b_watching = strat_b_top5
-        self.state.strat_c_watching = []
         self.state.total_scans += 1
         self.state.last_update = now
         if balance is not None:
@@ -83,7 +80,6 @@ class HubScanner:
             total_assets_scanned=total_assets,
             strat_a_candidates=strat_a_top5,
             strat_b_candidates=strat_b_top5,
-            strat_c_candidates=[],
             balance=balance,
             cycle_id=cycle_id,
             cycle_ops=cycle_ops,
@@ -244,6 +240,73 @@ class HubScanner:
         m.updated_at = time.time()
 
 
+    def update_chart_candles(
+        self,
+        candles: Sequence[Any],
+        asset: str,
+        entry_price: Optional[float] = None,
+        direction: str = "",
+        zone_floor: Optional[float] = None,
+        zone_ceiling: Optional[float] = None,
+        live_price: Optional[float] = None,
+        max_candles: int = 15,
+    ) -> None:
+        """
+        Almacena las últimas N velas OHLC del activo para renderizar el chart ASCII.
+
+        ``candles`` puede ser una lista de objetos con atributos open/high/low/close/ts
+        o dicts con esas claves. Solo se guardan las últimas ``max_candles``.
+        """
+        snapshots: list[CandleSnapshot] = []
+        for c in candles:
+            try:
+                if isinstance(c, dict):
+                    o, h, l, cl = float(c["open"]), float(c["high"]), float(c["low"]), float(c["close"])
+                    ts = float(c.get("ts", 0.0) or c.get("time", 0.0) or 0.0)
+                else:
+                    o, h, l, cl = float(c.open), float(c.high), float(c.low), float(c.close)
+                    ts = float(getattr(c, "ts", 0.0) or 0.0)
+                if h > 0:
+                    snapshots.append(CandleSnapshot(open=o, high=h, low=l, close=cl, ts=ts))
+            except Exception:
+                continue
+
+        self.state.chart_candles = snapshots[-max_candles:]
+        self.state.chart_asset = str(asset).upper()
+        self.state.chart_entry_price = float(entry_price) if entry_price is not None else None
+        self.state.chart_direction = str(direction).lower()
+        self.state.chart_zone_floor = float(zone_floor) if zone_floor is not None else None
+        self.state.chart_zone_ceiling = float(zone_ceiling) if zone_ceiling is not None else None
+        self.state.chart_live_price = float(live_price) if live_price is not None else None
+
+    def update_htf_status(
+        self,
+        *,
+        asset: str,
+        payout: int,
+        candles: int,
+        library_size: int = 0,
+        cache_age_sec: float,
+        cache_ttl_sec: float,
+        refreshed_at_ts: float,
+    ) -> None:
+        """Actualiza telemetría del cache HTF (15m) para mostrar en el HUB."""
+        self.state.htf_asset = str(asset).upper()
+        self.state.htf_payout = int(payout)
+        self.state.htf_candles = int(candles)
+        self.state.htf_library_size = max(0, int(library_size))
+        self.state.htf_cache_age_sec = max(0.0, float(cache_age_sec))
+        self.state.htf_cache_ttl_sec = max(0.0, float(cache_ttl_sec))
+        self.state.htf_last_refresh_ts = max(0.0, float(refreshed_at_ts))
+
+    def update_vip_windows(self, windows: Sequence[VipWindowData]) -> None:
+        """Publica la lista VIP actual en el HUB."""
+        items = sorted(
+            [w for w in windows if w is not None],
+            key=lambda w: (w.missing_conditions, -w.score, -w.payout),
+        )
+        self.state.vip_windows = list(items[:5])
+
     def get_state(self) -> HubState:
         """Devuelve el estado actual del HUB."""
         return self.state
@@ -254,7 +317,6 @@ class HubScanner:
         total_assets: int,
         strat_a_payload: Sequence[Mapping[str, Any]],
         strat_b_payload: Sequence[Mapping[str, Any]],
-        strat_c_payload: Sequence[Mapping[str, Any]] = (),
         balance: Optional[float] = None,
         cycle_id: int = 0,
         cycle_ops: int = 0,
@@ -266,7 +328,6 @@ class HubScanner:
             total_assets=total_assets,
             strat_a_candidates=strat_a_payload,
             strat_b_candidates=strat_b_payload,
-            strat_c_candidates=strat_c_payload,
             balance=balance,
             cycle_id=cycle_id,
             cycle_ops=cycle_ops,

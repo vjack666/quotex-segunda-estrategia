@@ -6,6 +6,7 @@ from statistics import mean
 from typing import List, Tuple
 
 from models import Candle, ConsolidationZone  # shared types — avoids circular import
+from zone_memory import HistoricalZone, score_zone_memory as _zm_score  # noqa: E402
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -81,6 +82,8 @@ class CandidateEntry:
     reversal_confirms: bool = False
     mode: SignalMode = SignalMode.REBOUND
     candles_h1: List[Candle] = field(default_factory=list)
+    # Zonas históricas cercanas (poblado externamente por el scan loop)
+    zone_memory: List[HistoricalZone] = field(default_factory=list)
 
     def __str__(self) -> str:
         bd = self.score_breakdown
@@ -300,6 +303,15 @@ def _score_historical_level(entry: CandidateEntry) -> float:
         return HIST_LEVEL_CALL_BONUS if entry.direction == "call" else -HIST_LEVEL_PENALTY
     return 0.0
 
+def _score_zone_memory_adj(entry: CandidateEntry) -> float:
+    """
+    Ajuste por acumulaciones históricas cercanas (zone_memory).
+    Retorna 0.0 si no hay zonas cargadas.
+    """
+    if not entry.zone_memory:
+        return 0.0
+    price = float(entry.candles[-1].close) if entry.candles else float(entry.zone.midpoint)
+    return _zm_score(entry.zone_memory, entry.direction, price)
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  FUNCIÓN PRINCIPAL DE SCORING
@@ -326,8 +338,9 @@ def score_candidate(
         s_payout   = _score_payout(entry.payout, w["payout"])
         age_adj    = _age_adjustment(entry.zone)
         hist_adj   = _score_historical_level(entry)
+        zm_adj     = _score_zone_memory_adj(entry)
 
-        total = s_comp + s_momentum + s_trend + s_payout + age_adj + hist_adj
+        total = s_comp + s_momentum + s_trend + s_payout + age_adj + hist_adj + zm_adj
         entry.score = round(total, 1)
         entry.score_breakdown = {
             "compression": s_comp,
@@ -340,6 +353,8 @@ def score_candidate(
         }
         if hist_adj != 0.0:
             entry.score_breakdown["hist_level"] = round(hist_adj, 1)
+        if zm_adj != 0.0:
+            entry.score_breakdown["zone_memory"] = round(zm_adj, 1)
     else:
         w = WEIGHTS_REBOUND
         s_comp    = _score_compression(entry.zone, w["compression"])
@@ -348,8 +363,9 @@ def score_candidate(
         s_payout  = _score_payout(entry.payout, w["payout"])
         age_adj   = _age_adjustment(entry.zone)
         hist_adj  = _score_historical_level(entry)
+        zm_adj    = _score_zone_memory_adj(entry)
 
-        total = s_comp + s_bounce + s_trend + s_payout + age_adj + hist_adj
+        total = s_comp + s_bounce + s_trend + s_payout + age_adj + hist_adj + zm_adj
         entry.score = round(total, 1)
         entry.score_breakdown = {
             "compression": s_comp,
@@ -360,6 +376,8 @@ def score_candidate(
         }
         if hist_adj != 0.0:
             entry.score_breakdown["hist_level"] = round(hist_adj, 1)
+        if zm_adj != 0.0:
+            entry.score_breakdown["zone_memory"] = round(zm_adj, 1)
 
     return entry.score
 
