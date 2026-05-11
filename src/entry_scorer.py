@@ -1,28 +1,23 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
 from statistics import mean
 from typing import List, Tuple
 
-from models import Candle, ConsolidationZone  # shared types — avoids circular import
-from zone_memory import HistoricalZone, score_zone_memory as _zm_score  # noqa: E402
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  MODO DE SEÑAL
-# ─────────────────────────────────────────────────────────────────────────────
-
-class SignalMode(Enum):
-    REBOUND = "rebound"    # rebote en extremo de zona
-    BREAKOUT = "breakout"  # ruptura de zona con fuerza
+from models import (
+    Candle,
+    ConsolidationZone,
+    CandidateEntry,
+    SignalMode,
+)
+from zone_memory import HistoricalZone, score_zone_memory as _zm_score
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  UMBRALES Y PESOS
 # ─────────────────────────────────────────────────────────────────────────────
 
-SCORE_THRESHOLD = 65
+SCORE_THRESHOLD = 73
 MAX_ENTRIES_CYCLE = 1
 
 # Pesos para cada modo (suman 100)
@@ -51,7 +46,7 @@ WICK_RATIO_MIN = 0.4
 TREND_EMA_FAST = 10
 TREND_EMA_SLOW = 20
 
-PAYOUT_MIN = 80
+PAYOUT_MIN = 84
 PAYOUT_MAX = 95
 
 # Contexto histórico: niveles swing en H1 (cubre ~3 días con 80 velas)
@@ -62,40 +57,6 @@ HIST_LEVEL_CALL_BONUS  = 12.0    # bonus CALL cuando precio choca con bajo hist�
 HIST_LEVEL_PENALTY     = 12.0    # penalización si operamos contra el nivel histórico
 
 # Ajuste por antigüedad de zona (minutos → puntos: negativos penalizan, positivos bonifican)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  ESTRUCTURA DE CANDIDATO
-# ─────────────────────────────────────────────────────────────────────────────
-
-@dataclass
-class CandidateEntry:
-    asset: str
-    payout: int
-    zone: ConsolidationZone
-    direction: str
-    candles: List[Candle]
-    score: float = 0.0
-    score_breakdown: dict = field(default_factory=dict)
-    reversal_pattern: str = "none"
-    reversal_strength: float = 0.0
-    reversal_confirms: bool = False
-    mode: SignalMode = SignalMode.REBOUND
-    candles_h1: List[Candle] = field(default_factory=list)
-    # Zonas históricas cercanas (poblado externamente por el scan loop)
-    zone_memory: List[HistoricalZone] = field(default_factory=list)
-
-    def __str__(self) -> str:
-        bd = self.score_breakdown
-        mode_label = self.mode.value
-        return (
-            f"{self.asset:20s} {self.direction.upper():4s} [{mode_label}] "
-            f"SCORE={self.score:.1f}/100 "
-            f"[compression={bd.get('compression', 0):.1f} "
-            f"bounce/momentum={bd.get('bounce', bd.get('momentum', 0)):.1f} "
-            f"trend={bd.get('trend', 0):.1f} "
-            f"payout={bd.get('payout', 0):.1f}]"
-        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

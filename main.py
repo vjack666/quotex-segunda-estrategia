@@ -5,7 +5,11 @@ import json
 import argparse
 import asyncio
 import logging
+import shutil
+import subprocess
 from pathlib import Path
+from datetime import datetime
+from uuid import uuid4
 
 # Forzar UTF-8 en stdout/stderr para evitar UnicodeEncodeError en Windows (CP1252).
 if hasattr(sys.stdout, "reconfigure"):
@@ -28,6 +32,7 @@ import time as _time
 _DATA_SUBDIRS = ("logs/bot", "logs/broker", "db")
 _RETENTION_DAYS = 31
 _HUB_RUNTIME_STATE_FILE = ROOT / "data" / "hub_runtime_state.json"
+_LAST_KNOWN_HUB_BALANCE = 0.0
 
 
 def _write_hub_runtime_snapshot(bot=None) -> None:
@@ -104,6 +109,248 @@ def _cleanup_old_data_files() -> None:
                     f.unlink()
                 except Exception:
                     pass
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = str(os.environ.get(name, "")).strip().lower()
+    if not raw:
+        return bool(default)
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _make_shadow_session_id() -> str:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{ts}_{uuid4().hex[:8]}"
+
+
+def _safe_write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _run_cmd(args: list[str], cwd: Path) -> dict:
+    try:
+        proc = subprocess.run(
+            args,
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        return {
+            "cmd": args,
+            "exit_code": int(proc.returncode),
+            "stdout": str(proc.stdout or ""),
+            "stderr": str(proc.stderr or ""),
+        }
+    except Exception as exc:
+        return {
+            "cmd": args,
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def _count_markers_in_file(path: Path) -> dict[str, int]:
+    markers = {
+        "SHADOW-FLAGS": 0,
+        "SHADOW-RUNTIME": 0,
+        "SHADOW-DATA": 0,
+        "ENTRY_LOCK": 0,
+        "SHADOW-LINK": 0,
+        "SHADOW-LINK-FAIL": 0,
+    }
+    if not path.exists():
+        return markers
+    text = path.read_text(encoding="utf-8", errors="replace")
+    for k in markers.keys():
+        markers[k] = int(text.count(k))
+    return markers
+
+
+def _build_runtime_config_snapshot(args: argparse.Namespace, cb, session_id: str) -> dict:
+    return {
+        "session_id": session_id,
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "account_real": bool(args.real),
+        "hub_readonly": bool(args.hub_readonly),
+        "once": bool(args.once),
+        "scan": {
+            "scan_lead_sec": float(getattr(cb, "SCAN_LEAD_SEC", args.scan_lead_sec)),
+            "scan_sleep_sec": float(getattr(cb, "LIVE_SCAN_SLEEP_SEC", args.scan_sleep_sec)),
+            "align_scan_to_candle": bool(getattr(cb, "ALIGN_SCAN_TO_CANDLE", False)),
+        },
+        "thresholds": {
+            "min_payout": int(getattr(cb, "MIN_PAYOUT", args.min_payout)),
+            "adaptive_base": int(getattr(cb, "ADAPTIVE_THRESHOLD_BASE", args.adaptive_threshold_base)),
+            "adaptive_low": int(getattr(cb, "ADAPTIVE_THRESHOLD_LOW", args.adaptive_threshold_low)),
+            "adaptive_high": int(getattr(cb, "ADAPTIVE_THRESHOLD_HIGH", args.adaptive_threshold_high)),
+        },
+        "strategy_flags": {
+            "strat_b_can_trade": bool(getattr(cb, "STRAT_B_CAN_TRADE", False)),
+        },
+        "shadow_flags": {
+            "mode": bool(getattr(cb, "SHADOW_MODE_ENABLED", False)),
+            "new_engine": bool(getattr(cb, "SHADOW_NEW_ENGINE_ENABLED", False)),
+            "persist": bool(getattr(cb, "SHADOW_PERSIST_ENABLED", False)),
+            "runtime_metrics": bool(getattr(cb, "SHADOW_RUNTIME_METRICS_ENABLED", False)),
+            "explain": bool(getattr(cb, "SHADOW_EXPLAIN_ENABLED", False)),
+            "audit_mode": bool(getattr(cb, "SHADOW_AUDIT_MODE", False)),
+            "audit_assert": bool(getattr(cb, "SHADOW_AUDIT_ASSERT_ENABLED", False)),
+            "watchdog_enabled": bool(getattr(cb, "SHADOW_DEAD_WATCHDOG_ENABLED", False)),
+            "watchdog_minutes": float(getattr(cb, "SHADOW_DEAD_WATCHDOG_MINUTES", 5.0)),
+        },
+    }
+
+
+def _run_shadow_postrun_exports(session_id: str, args: argparse.Namespace, cb) -> None:
+    if not _env_flag("SHADOW_POSTRUN_EXPORT_ENABLED", True):
+        return
+
+    exports_dir = ROOT / "data" / "exports" / f"session_{session_id}"
+    exports_dir.mkdir(parents=True, exist_ok=True)
+
+    bot_logs = sorted((ROOT / "data" / "logs" / "bot").glob("consolidation_bot-*.log"), key=lambda p: p.stat().st_mtime)
+    latest_log = bot_logs[-1] if bot_logs else None
+    if latest_log is not None and latest_log.exists():
+        shutil.copy2(latest_log, exports_dir / latest_log.name)
+
+    stdout_file = ROOT / "bot_stdout.txt"
+    if stdout_file.exists():
+        shutil.copy2(stdout_file, exports_dir / "bot_stdout.txt")
+
+    db_files = sorted((ROOT / "data" / "db").glob("trade_journal-*.db"), key=lambda p: p.stat().st_mtime)
+    latest_db = db_files[-1] if db_files else None
+    if latest_db is not None and latest_db.exists():
+        shutil.copy2(latest_db, exports_dir / latest_db.name)
+
+    snapshot = _build_runtime_config_snapshot(args, cb, session_id)
+    _safe_write_json(exports_dir / "runtime_config_snapshot.json", snapshot)
+
+    parser_json = exports_dir / "shadow_runtime_summary.json"
+    parser_csv = exports_dir / "shadow_runtime_summary.csv"
+    reconcile_json = exports_dir / "shadow_reconcile_report.json"
+    overhead_json = exports_dir / "shadow_overhead_report.json"
+
+    tool_runs = []
+    if latest_log is not None and latest_log.exists():
+        tool_runs.append(
+            _run_cmd(
+                [
+                    sys.executable,
+                    "src/lab/shadow_log_parser.py",
+                    "--log",
+                    str(latest_log),
+                    "--json-out",
+                    str(parser_json),
+                    "--csv-out",
+                    str(parser_csv),
+                ],
+                cwd=ROOT,
+            )
+        )
+
+    if latest_db is not None and latest_db.exists():
+        tool_runs.append(
+            _run_cmd(
+                [
+                    sys.executable,
+                    "src/lab/shadow_reconcile.py",
+                    "--db",
+                    str(latest_db),
+                    "--json-out",
+                    str(reconcile_json),
+                ],
+                cwd=ROOT,
+            )
+        )
+
+    if parser_json.exists() and latest_db is not None and latest_db.exists():
+        tool_runs.append(
+            _run_cmd(
+                [
+                    sys.executable,
+                    "src/lab/shadow_overhead_audit.py",
+                    "--parser-json",
+                    str(parser_json),
+                    "--db",
+                    str(latest_db),
+                    "--json-out",
+                    str(overhead_json),
+                ],
+                cwd=ROOT,
+            )
+        )
+
+    _safe_write_json(exports_dir / "tool_runs.json", {"runs": tool_runs})
+
+    parser_data = {}
+    reconcile_data = {}
+    overhead_data = {}
+    try:
+        if parser_json.exists():
+            parser_data = json.loads(parser_json.read_text(encoding="utf-8"))
+    except Exception:
+        parser_data = {}
+    try:
+        if reconcile_json.exists():
+            reconcile_data = json.loads(reconcile_json.read_text(encoding="utf-8"))
+    except Exception:
+        reconcile_data = {}
+    try:
+        if overhead_json.exists():
+            overhead_data = json.loads(overhead_json.read_text(encoding="utf-8"))
+    except Exception:
+        overhead_data = {}
+
+    marker_counts = _count_markers_in_file(latest_log) if latest_log is not None else _count_markers_in_file(Path("__missing__"))
+    counts = reconcile_data.get("counts", {}) if isinstance(reconcile_data, dict) else {}
+    parser_summary = parser_data.get("summary", {}) if isinstance(parser_data, dict) else {}
+
+    shadow_rows = int(counts.get("shadow_total_rows", overhead_data.get("shadow_rows", 0)) or 0)
+    with_candidate = int(counts.get("with_candidate", 0) or 0)
+    linked_outcome = int(counts.get("linked_outcome", 0) or 0)
+    linkage_pct = float(counts.get("linkage_pct", 0.0) or 0.0)
+    parser_cand_count = int((((parser_summary.get("cand", {}) or {}).get("count", 0)) or 0))
+
+    checks = {
+        "has_shadow_flags_marker": marker_counts.get("SHADOW-FLAGS", 0) > 0,
+        "has_shadow_runtime_marker": marker_counts.get("SHADOW-RUNTIME", 0) > 0,
+        "has_shadow_data_marker": marker_counts.get("SHADOW-DATA", 0) > 0,
+        "shadow_rows_gt_0": shadow_rows > 0,
+        "with_candidate_gt_0": with_candidate > 0,
+        "linked_outcome_gt_0": linked_outcome > 0,
+        "parser_cand_count_gt_0": parser_cand_count > 0,
+    }
+
+    failed_checks = [k for k, v in checks.items() if not bool(v)]
+    score = 100
+    score -= min(60, len(failed_checks) * 10)
+    if with_candidate > 0 and linkage_pct < 99.0:
+        score -= 20
+    score = max(0, score)
+
+    session_valid = len(failed_checks) == 0 and (with_candidate == 0 or linkage_pct >= 99.0)
+    validation = {
+        "session_id": session_id,
+        "session_valid": bool(session_valid),
+        "shadow_integrity_score": int(score),
+        "marker_counts": marker_counts,
+        "shadow_rows": shadow_rows,
+        "with_candidate": with_candidate,
+        "linked_outcome": linked_outcome,
+        "linkage_pct": linkage_pct,
+        "parser_cand_count": parser_cand_count,
+        "checks": checks,
+        "failed_checks": failed_checks,
+    }
+    _safe_write_json(exports_dir / "session_validation.json", validation)
+
+    status_txt = "SESSION VALID" if session_valid else "SESSION INVALID"
+    print(f"[SHADOW-SESSION] {status_txt} | sid={session_id} | score={score}/100 | exports={exports_dir}")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -331,13 +578,21 @@ async def _render_hub_once(bot=None) -> None:
     """Renderiza el panel HUB desde bot.hub (o estado vacío si bot aún no existe)."""
     from hub.hub_dashboard import HubDashboard
     from hub.hub_models import HubState
+    global _LAST_KNOWN_HUB_BALANCE
     try:
         if bot is not None and hasattr(bot, 'hub'):
             state = bot.hub.get_state()
-            balance = state.known_balance
+            balance = float(getattr(state, "known_balance", 0.0) or 0.0)
+            if balance > 0.0:
+                _LAST_KNOWN_HUB_BALANCE = balance
+            else:
+                # Evita mostrar 0.00 transitorio entre ciclos cuando ya hubo sesión conectada.
+                balance = float(_LAST_KNOWN_HUB_BALANCE)
+                state.known_balance = balance
         else:
             state = HubState()
-            balance = 0.0
+            balance = float(_LAST_KNOWN_HUB_BALANCE)
+            state.known_balance = balance
         HubDashboard.display(state, balance=balance)
         _write_hub_runtime_snapshot(bot)
     except Exception:
@@ -346,6 +601,8 @@ async def _render_hub_once(bot=None) -> None:
 
 def _configure_hub_console(cb) -> None:
     """Reduce el ruido del logger en consola para que el dashboard quede visible."""
+    debug_scan_enabled = bool(getattr(cb, "DEBUG_SCAN", False))
+
     # Desactivar contador inline para no mezclar texto con el render del HUB.
     if hasattr(cb, "INLINE_COUNTDOWN_STDOUT"):
         cb.INLINE_COUNTDOWN_STDOUT = False
@@ -355,19 +612,19 @@ def _configure_hub_console(cb) -> None:
     # Handler de consola definido en consolidation_bot.py
     stdout_handler = getattr(cb, "_stdout_handler", None)
     if stdout_handler is not None:
-        stdout_handler.setLevel(logging.ERROR)
+        stdout_handler.setLevel(logging.DEBUG if debug_scan_enabled else logging.ERROR)
 
     # Mantener logs de archivo en INFO para forensia/sentinel.
     bot_log = getattr(cb, "log", None)
     if bot_log is not None:
-        bot_log.setLevel(logging.INFO)
+        bot_log.setLevel(logging.DEBUG if debug_scan_enabled else logging.INFO)
 
     # Root logger y librerias ruidosas
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
+    root_logger.setLevel(logging.DEBUG if debug_scan_enabled else logging.INFO)
     for handler in root_logger.handlers:
         if isinstance(handler, logging.StreamHandler):
-            handler.setLevel(logging.ERROR)
+            handler.setLevel(logging.DEBUG if debug_scan_enabled else logging.ERROR)
     logging.getLogger("pyquotex").setLevel(logging.CRITICAL)
     logging.getLogger("websocket").setLevel(logging.CRITICAL)
 
@@ -389,6 +646,32 @@ async def _run_cycle_with_loading(cb, *, dry_run: bool, real_account: bool):
         await asyncio.sleep(1)
 
     return await task
+
+
+def _known_balance_from_bot(bot: object) -> float:
+    """Extrae el último balance conocido del bot/HUB."""
+    try:
+        hub = getattr(bot, "hub", None)
+        state = hub.get_state() if hub is not None and hasattr(hub, "get_state") else None
+        if state is not None:
+            return float(getattr(state, "known_balance", 0.0) or 0.0)
+    except Exception:
+        pass
+
+    try:
+        return float(getattr(bot, "current_balance", 0.0) or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _assert_hub_balance_available(bot: object) -> None:
+    """Falla rápido si no hay saldo; evita validar con sesión no conectada."""
+    known_balance = _known_balance_from_bot(bot)
+    if known_balance <= 0.0:
+        raise RuntimeError(
+            "HUB sin saldo disponible (known_balance <= 0). "
+            "Se considera sesión no conectada o balance no recuperado."
+        )
 
 
 _SILENT_RECONNECT_INTERVAL_SEC = 600  # reconexión preventiva cada 10 min
@@ -547,14 +830,15 @@ async def _run_forever_with_initial_loading(cb, *, dry_run: bool, real_account: 
             loop_forever=True,
             on_cycle_end=_on_cycle_end_with_event,
             on_bot_ready=_on_bot_ready,
-        )
+        ),
+        name="consolidation_main_loop",
     )
 
     # Render de carga hasta que termina el primer ciclo.
     # Ticker permanente: arranca de inmediato, independiente del primer ciclo.
     # Así el dashboard es visible desde el primer segundo, aunque el scan aún no termine.
-    ticker = asyncio.create_task(_hub_ticker(bot_ref, interval=_HUB_TICK_INTERVAL_SEC))
-    watchdog = asyncio.create_task(_silent_reconnect_watchdog(bot_ref))
+    ticker = asyncio.create_task(_hub_ticker(bot_ref, interval=_HUB_TICK_INTERVAL_SEC), name="hub_ticker")
+    watchdog = asyncio.create_task(_silent_reconnect_watchdog(bot_ref), name="watchdog_reconnect")
 
     # HTF Scanner: corre en background, refresca velas 15m cada ~15 min.
     # El scan loop las lee vía bot.htf_scanner.get_candles_15m(sym) sin bloquear.
@@ -592,6 +876,28 @@ async def _run_forever_with_initial_loading(cb, *, dry_run: bool, real_account: 
 
     htf_task = asyncio.create_task(_htf_runner(), name="htf_scanner_15m")
 
+    async def _pause_htf_scanner() -> None:
+        nonlocal htf_task
+        if htf_task.done():
+            return
+        htf_task.cancel()
+        await asyncio.gather(htf_task, return_exceptions=True)
+
+    def _resume_htf_scanner() -> None:
+        nonlocal htf_task
+        if htf_task.done():
+            htf_task = asyncio.create_task(_htf_runner(), name="htf_scanner_15m")
+
+    async def _register_lifecycle_hooks() -> None:
+        await bot_ready_event.wait()
+        bot = bot_ref[0]
+        if bot is None:
+            return
+        if hasattr(bot, "register_lifecycle_consumer"):
+            bot.register_lifecycle_consumer(_pause_htf_scanner, _resume_htf_scanner)
+
+    lifecycle_hook_task = asyncio.create_task(_register_lifecycle_hooks(), name="lifecycle_hook_register")
+
     try:
         # Render de carga hasta que termina el primer ciclo.
         while not first_cycle_done.is_set() and not task.done():
@@ -603,13 +909,22 @@ async def _run_forever_with_initial_loading(cb, *, dry_run: bool, real_account: 
     finally:
         ticker.cancel()
         watchdog.cancel()
+        lifecycle_hook_task.cancel()
         htf_task.cancel()
-        await asyncio.gather(ticker, watchdog, htf_task, return_exceptions=True)
+        await asyncio.gather(ticker, watchdog, lifecycle_hook_task, htf_task, return_exceptions=True)
 
 
 async def _run(args: argparse.Namespace) -> None:
     # Limpiar archivos de data/ anteriores a 31 días
     _cleanup_old_data_files()
+
+    # Sesión forense: ID único para trazabilidad end-to-end.
+    shadow_session_id = str(os.environ.get("SHADOW_SESSION_ID", "")).strip() or _make_shadow_session_id()
+    os.environ["SHADOW_SESSION_ID"] = shadow_session_id
+    os.environ.setdefault("SHADOW_AUDIT_MODE", "true")
+    os.environ.setdefault("SHADOW_DEAD_WATCHDOG_ENABLED", "true")
+    os.environ.setdefault("SHADOW_DEAD_WATCHDOG_MINUTES", "5")
+    os.environ.setdefault("SHADOW_POSTRUN_EXPORT_ENABLED", "true")
 
     # Crear directorio de logs del broker y cambiar CWD ANTES de importar
     # consolidation_bot (que a su vez importa pyquotex/api_quotex, la cual
@@ -622,6 +937,29 @@ async def _run(args: argparse.Namespace) -> None:
     os.chdir(_orig_cwd)
 
     _apply_runtime_config(args)
+
+    # Hard assert de shadow para sesiones de auditoría (opcional por env).
+    if bool(getattr(cb, "SHADOW_AUDIT_ASSERT_ENABLED", False)):
+        if not bool(getattr(cb, "SHADOW_MODE_ENABLED", False)):
+            raise RuntimeError("[SHADOW-ASSERT] SHADOW_MODE_ENABLED=False en sesión auditada")
+        if not bool(getattr(cb, "SHADOW_PERSIST_ENABLED", False)):
+            raise RuntimeError("[SHADOW-ASSERT] SHADOW_PERSIST_ENABLED=False en sesión auditada")
+        if not bool(getattr(cb, "SHADOW_RUNTIME_METRICS_ENABLED", False)):
+            raise RuntimeError("[SHADOW-ASSERT] SHADOW_RUNTIME_METRICS_ENABLED=False en sesión auditada")
+
+    if bool(getattr(cb, "SHADOW_MODE_ENABLED", False)):
+        cb.log.warning(
+            "[SHADOW-FLAGS] sid=%s mode=ON persist=%s runtime=%s explain=%s audit=%s assert=%s",
+            shadow_session_id,
+            "ON" if bool(getattr(cb, "SHADOW_PERSIST_ENABLED", False)) else "OFF",
+            "ON" if bool(getattr(cb, "SHADOW_RUNTIME_METRICS_ENABLED", False)) else "OFF",
+            "ON" if bool(getattr(cb, "SHADOW_EXPLAIN_ENABLED", False)) else "OFF",
+            "ON" if bool(getattr(cb, "SHADOW_AUDIT_MODE", False)) else "OFF",
+            "ON" if bool(getattr(cb, "SHADOW_AUDIT_ASSERT_ENABLED", False)) else "OFF",
+        )
+    else:
+        cb.log.error("[SHADOW DISABLED] sid=%s mode=OFF", shadow_session_id)
+
     hub_readonly = bool(args.hub_readonly)
     run_once = bool(args.once)
 
@@ -651,18 +989,19 @@ async def _run(args: argparse.Namespace) -> None:
                         dry_run=True,
                         real_account=bool(args.real),
                     )
+                    _assert_hub_balance_available(bot)
                 except SystemExit as exc:
                     code = exc.code if isinstance(exc.code, int) else 1
                     print(f"[HUB] Conexion no disponible (code={code}). Reintentando en 60s...")
                     await asyncio.sleep(60)
                     if run_once:
-                        return
+                        raise SystemExit(code)
                     continue
                 except RuntimeError as exc:
                     print(f"[HUB] Error recuperable: {exc}. Reintentando en 60s...")
                     await asyncio.sleep(60)
                     if run_once:
-                        return
+                        raise SystemExit(2)
                     continue
                 if run_once:
                     return
@@ -684,6 +1023,10 @@ async def _run(args: argparse.Namespace) -> None:
                     real_account=bool(args.real),
                 )
     finally:
+        try:
+            _run_shadow_postrun_exports(shadow_session_id, args, cb)
+        except Exception as exc:
+            print(f"[SHADOW-POSTRUN] sid={shadow_session_id} error={type(exc).__name__}: {exc}")
         try:
             if _HUB_RUNTIME_STATE_FILE.exists():
                 _HUB_RUNTIME_STATE_FILE.unlink()

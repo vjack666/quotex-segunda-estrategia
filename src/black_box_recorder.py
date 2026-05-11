@@ -15,10 +15,13 @@ Almacenamiento: SQLite + JSON exports
 import json
 import sqlite3
 import os
+import logging
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 from dataclasses import dataclass
+
+log = logging.getLogger("black_box_recorder")
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  CONFIGURACIÓN
@@ -202,14 +205,19 @@ class BlackBoxRecorder:
         except Exception as e:
             print(f"❌ Error inicializando DB: {e}")
     
-    def record_scan_start(self, strategy: str, scan_number: int, market_context: Dict[str, Any] = None) -> int:
+    def record_scan_start(
+        self,
+        strategy: str,
+        scan_number: int,
+        market_context: Optional[Dict[str, Any]] = None,
+    ) -> int:
         """Registra el inicio de un escaneo. Retorna scan_id."""
         ts = datetime.now(timezone.utc).timestamp()
         ts_iso = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-        
+
         market_state = market_context.get("market_state", "unknown") if market_context else "unknown"
         volatility = market_context.get("volatility_atr", 0.0) if market_context else 0.0
-        
+
         con = sqlite3.connect(self.db_path)
         cur = con.cursor()
         cur.execute('''
@@ -217,9 +225,9 @@ class BlackBoxRecorder:
             VALUES (?, ?, ?, ?, ?, ?)
         ''', (ts, ts_iso, strategy, scan_number, market_state, volatility))
         con.commit()
-        scan_id = cur.lastrowid
+        scan_id = int(cur.lastrowid or 0)
         con.close()
-        
+
         # Log a JSONL
         self._log_jsonl({
             "event": "scan_start",
@@ -230,7 +238,7 @@ class BlackBoxRecorder:
             "market_state": market_state,
             "volatility": volatility,
         })
-        
+
         return scan_id
     
     def record_candidate(self, scan_id: int, strategy: str, data: Dict[str, Any]) -> int:
@@ -367,11 +375,33 @@ class BlackBoxRecorder:
     
     def record_phase(self, strategy: str, phase: str, message: str = "", asset: str = "") -> None:
         """Registra una fase de procesamiento."""
-        ts = datetime.now(timezone.utc).timestamp()
-        ts_iso = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-        
-        con = sqlite3.connect(self.db_path)
-        cur = con.cursor()
+        try:
+            ts = datetime.now(timezone.utc).timestamp()
+            ts_iso = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+            con = sqlite3.connect(self.db_path)
+            cur = con.cursor()
+            cur.execute(
+                '''
+                INSERT INTO phase_log (ts, ts_iso, strategy, asset, phase, message)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ''',
+                (ts, ts_iso, str(strategy), str(asset or ""), str(phase), str(message or "")),
+            )
+            con.commit()
+            con.close()
+
+            self._log_jsonl({
+                "event": "phase",
+                "ts": ts,
+                "ts_iso": ts_iso,
+                "strategy": strategy,
+                "asset": asset,
+                "phase": phase,
+                "message": message,
+            })
+        except Exception as exc:
+            log.debug("Black box record_phase error: %s", exc)
 
     def record_maintenance_event(
         self,
@@ -383,38 +413,35 @@ class BlackBoxRecorder:
         payload: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Registra eventos de mantenimiento / salud del sistema en la caja negra."""
-        ts = datetime.now(timezone.utc).timestamp()
-        ts_iso = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-        payload_json = json.dumps(payload or {}, ensure_ascii=False)
+        try:
+            ts = datetime.now(timezone.utc).timestamp()
+            ts_iso = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+            payload_json = json.dumps(payload or {}, ensure_ascii=False)
 
-        con = sqlite3.connect(self.db_path)
-        cur = con.cursor()
-        cur.execute(
-            '''
-            INSERT INTO maintenance_log (ts, ts_iso, category, subtype, asset, severity, payload_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''',
-            (ts, ts_iso, str(category), str(subtype), str(asset or ""), str(severity or "INFO"), payload_json),
-        )
-        con.commit()
-        con.close()
+            con = sqlite3.connect(self.db_path)
+            cur = con.cursor()
+            cur.execute(
+                '''
+                INSERT INTO maintenance_log (ts, ts_iso, category, subtype, asset, severity, payload_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''',
+                (ts, ts_iso, str(category), str(subtype), str(asset or ""), str(severity or "INFO"), payload_json),
+            )
+            con.commit()
+            con.close()
 
-        self._log_jsonl({
-            "event": "maintenance",
-            "ts": ts,
-            "ts_iso": ts_iso,
-            "category": category,
-            "subtype": subtype,
-            "asset": asset,
-            "severity": severity,
-            "payload": payload or {},
-        })
-        cur.execute('''
-            INSERT INTO phase_log (ts, ts_iso, strategy, asset, phase, message)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (ts, ts_iso, strategy, asset, phase, message))
-        con.commit()
-        con.close()
+            self._log_jsonl({
+                "event": "maintenance",
+                "ts": ts,
+                "ts_iso": ts_iso,
+                "category": category,
+                "subtype": subtype,
+                "asset": asset,
+                "severity": severity,
+                "payload": payload or {},
+            })
+        except Exception as exc:
+            log.debug("Black box record_maintenance_event error: %s", exc)
     
     def update_scan_results(self, scan_id: int, found: int, accepted: int, rejected: int) -> None:
         """Actualiza conteo final del escaneo."""

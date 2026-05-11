@@ -43,6 +43,7 @@ REPORTE POR CONSOLA
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 from dataclasses import asdict
@@ -62,6 +63,7 @@ _DB_DIR.mkdir(parents=True, exist_ok=True)
 _DB_DATE = datetime.now().strftime("%Y-%m-%d")
 DB_PATH = _DB_DIR / f"trade_journal-{_DB_DATE}.db"
 BROKER_TZ = timezone(timedelta(hours=-3))
+log = logging.getLogger("consolidation_bot")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -140,10 +142,53 @@ CREATE TABLE IF NOT EXISTS scan_sessions (
     dry_run       INTEGER DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS shadow_decision_audit (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at          TEXT NOT NULL,
+    candidate_id        INTEGER,
+    asset               TEXT NOT NULL,
+    direction           TEXT NOT NULL,
+    strategy_origin     TEXT NOT NULL,
+    stage               TEXT NOT NULL,
+    cycle_id            INTEGER,
+    cycle_ops           INTEGER,
+    cycle_wins          INTEGER,
+    cycle_losses        INTEGER,
+    old_decision        TEXT NOT NULL,
+    old_reason          TEXT,
+    old_filter          TEXT,
+    new_decision        TEXT NOT NULL,
+    new_category        TEXT NOT NULL,
+    new_veto_count      INTEGER NOT NULL,
+    new_reason          TEXT,
+    new_explain         TEXT,
+    new_htf_aligned     INTEGER,
+    new_zone_memory_adj REAL,
+    score_original      REAL,
+    payout_original     INTEGER,
+    zone_age_min        REAL,
+    pattern_name        TEXT,
+    pattern_strength    REAL,
+    context_snapshot_ts TEXT NOT NULL,
+    context_hash        TEXT NOT NULL,
+    compare_status      TEXT NOT NULL,
+    trade_outcome       TEXT DEFAULT 'NO_TRADE',
+    trade_profit        REAL DEFAULT 0.0,
+    trade_closed_at     TEXT,
+    order_id            TEXT,
+    order_ref           INTEGER DEFAULT 0,
+    error_text          TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_candidates_asset    ON candidates(asset);
 CREATE INDEX IF NOT EXISTS idx_candidates_decision ON candidates(decision);
 CREATE INDEX IF NOT EXISTS idx_candidates_order_id ON candidates(order_id);
 CREATE INDEX IF NOT EXISTS idx_candidates_scanned  ON candidates(scanned_at);
+CREATE INDEX IF NOT EXISTS idx_shadow_candidate_id ON shadow_decision_audit(candidate_id);
+CREATE INDEX IF NOT EXISTS idx_shadow_asset_ts     ON shadow_decision_audit(asset, created_at);
+CREATE INDEX IF NOT EXISTS idx_shadow_compare      ON shadow_decision_audit(compare_status);
+CREATE INDEX IF NOT EXISTS idx_shadow_category     ON shadow_decision_audit(new_category);
+CREATE INDEX IF NOT EXISTS idx_shadow_outcome      ON shadow_decision_audit(trade_outcome);
 
 CREATE TABLE IF NOT EXISTS expired_zones (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -242,6 +287,50 @@ class Journal:
             ");"
             "CREATE INDEX IF NOT EXISTS idx_expired_zones_asset  ON expired_zones(asset);"
             "CREATE INDEX IF NOT EXISTS idx_expired_zones_reason ON expired_zones(expiry_reason);"
+        )
+        self._conn.executescript(
+            "CREATE TABLE IF NOT EXISTS shadow_decision_audit ("
+            "    id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "    created_at TEXT NOT NULL,"
+            "    candidate_id INTEGER,"
+            "    asset TEXT NOT NULL,"
+            "    direction TEXT NOT NULL,"
+            "    strategy_origin TEXT NOT NULL,"
+            "    stage TEXT NOT NULL,"
+            "    cycle_id INTEGER,"
+            "    cycle_ops INTEGER,"
+            "    cycle_wins INTEGER,"
+            "    cycle_losses INTEGER,"
+            "    old_decision TEXT NOT NULL,"
+            "    old_reason TEXT,"
+            "    old_filter TEXT,"
+            "    new_decision TEXT NOT NULL,"
+            "    new_category TEXT NOT NULL,"
+            "    new_veto_count INTEGER NOT NULL,"
+            "    new_reason TEXT,"
+            "    new_explain TEXT,"
+            "    new_htf_aligned INTEGER,"
+            "    new_zone_memory_adj REAL,"
+            "    score_original REAL,"
+            "    payout_original INTEGER,"
+            "    zone_age_min REAL,"
+            "    pattern_name TEXT,"
+            "    pattern_strength REAL,"
+            "    context_snapshot_ts TEXT NOT NULL,"
+            "    context_hash TEXT NOT NULL,"
+            "    compare_status TEXT NOT NULL,"
+            "    trade_outcome TEXT DEFAULT 'NO_TRADE',"
+            "    trade_profit REAL DEFAULT 0.0,"
+            "    trade_closed_at TEXT,"
+            "    order_id TEXT,"
+            "    order_ref INTEGER DEFAULT 0,"
+            "    error_text TEXT"
+            ");"
+            "CREATE INDEX IF NOT EXISTS idx_shadow_candidate_id ON shadow_decision_audit(candidate_id);"
+            "CREATE INDEX IF NOT EXISTS idx_shadow_asset_ts     ON shadow_decision_audit(asset, created_at);"
+            "CREATE INDEX IF NOT EXISTS idx_shadow_compare      ON shadow_decision_audit(compare_status);"
+            "CREATE INDEX IF NOT EXISTS idx_shadow_category     ON shadow_decision_audit(new_category);"
+            "CREATE INDEX IF NOT EXISTS idx_shadow_outcome      ON shadow_decision_audit(trade_outcome);"
         )
 
     def close(self) -> None:
@@ -482,6 +571,179 @@ class Journal:
                WHERE order_id=? AND outcome='PENDING'""",
             (outcome, profit, _now(), order_id),
         )
+        self._conn.commit()
+
+    def log_shadow_decision(
+        self,
+        *,
+        candidate_id: Optional[int],
+        asset: str,
+        direction: str,
+        strategy_origin: str,
+        stage: str,
+        cycle_id: int,
+        cycle_ops: int,
+        cycle_wins: int,
+        cycle_losses: int,
+        old_decision: str,
+        old_reason: str,
+        old_filter: str,
+        new_decision: str,
+        new_category: str,
+        new_veto_count: int,
+        new_reason: str,
+        new_explain: str,
+        new_htf_aligned: Optional[bool],
+        new_zone_memory_adj: Optional[float],
+        score_original: float,
+        payout_original: int,
+        zone_age_min: float,
+        pattern_name: str,
+        pattern_strength: float,
+        context_snapshot_ts: str,
+        context_hash: str,
+        compare_status: str,
+        error_text: str = "",
+    ) -> int:
+        cur = self._conn.execute(
+            """INSERT INTO shadow_decision_audit (
+                   created_at, candidate_id, asset, direction, strategy_origin, stage,
+                   cycle_id, cycle_ops, cycle_wins, cycle_losses,
+                   old_decision, old_reason, old_filter,
+                   new_decision, new_category, new_veto_count, new_reason, new_explain,
+                   new_htf_aligned, new_zone_memory_adj,
+                   score_original, payout_original, zone_age_min, pattern_name, pattern_strength,
+                   context_snapshot_ts, context_hash, compare_status, error_text
+               ) VALUES (
+                   ?, ?, ?, ?, ?, ?,
+                   ?, ?, ?, ?,
+                   ?, ?, ?,
+                   ?, ?, ?, ?, ?,
+                   ?, ?,
+                   ?, ?, ?, ?, ?,
+                   ?, ?, ?, ?
+               )""",
+            (
+                _now(),
+                int(candidate_id) if candidate_id is not None else None,
+                asset,
+                direction,
+                strategy_origin,
+                stage,
+                int(cycle_id),
+                int(cycle_ops),
+                int(cycle_wins),
+                int(cycle_losses),
+                old_decision,
+                old_reason,
+                old_filter,
+                new_decision,
+                new_category,
+                int(new_veto_count),
+                new_reason,
+                new_explain,
+                None if new_htf_aligned is None else int(bool(new_htf_aligned)),
+                new_zone_memory_adj,
+                float(score_original),
+                int(payout_original),
+                float(zone_age_min),
+                pattern_name,
+                float(pattern_strength),
+                context_snapshot_ts,
+                context_hash,
+                compare_status,
+                error_text,
+            ),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid or 0)
+
+    def update_shadow_outcome_by_candidate(
+        self,
+        *,
+        candidate_id: Optional[int],
+        outcome: str,
+        profit: float,
+        closed_at: str,
+        order_id: str = "",
+        order_ref: int = 0,
+    ) -> None:
+        cid = int(candidate_id or 0)
+        oid = str(order_id or "")
+        oref = int(order_ref or 0)
+        params = (
+            outcome,
+            float(profit),
+            closed_at,
+            oid,
+            oref,
+        )
+
+        updated = 0
+        if cid > 0:
+            cur = self._conn.execute(
+                """UPDATE shadow_decision_audit
+                   SET trade_outcome=?,
+                       trade_profit=?,
+                       trade_closed_at=?,
+                       order_id=COALESCE(NULLIF(?, ''), order_id),
+                       order_ref=COALESCE(NULLIF(?, 0), order_ref)
+                   WHERE candidate_id=?
+                     AND trade_outcome IN ('NO_TRADE', 'UNRESOLVED')""",
+                params + (cid,),
+            )
+            updated = int(cur.rowcount or 0)
+            if updated == 0:
+                cur = self._conn.execute(
+                    """UPDATE shadow_decision_audit
+                       SET trade_outcome=?,
+                           trade_profit=?,
+                           trade_closed_at=?,
+                           order_id=COALESCE(NULLIF(?, ''), order_id),
+                           order_ref=COALESCE(NULLIF(?, 0), order_ref)
+                       WHERE candidate_id=?""",
+                    params + (cid,),
+                )
+                updated = int(cur.rowcount or 0)
+
+        if updated == 0 and (oid or oref > 0):
+            cur = self._conn.execute(
+                """UPDATE shadow_decision_audit
+                   SET trade_outcome=?,
+                       trade_profit=?,
+                       trade_closed_at=?,
+                       order_id=COALESCE(NULLIF(?, ''), order_id),
+                       order_ref=COALESCE(NULLIF(?, 0), order_ref)
+                   WHERE (
+                        (? <> '' AND order_id = ?)
+                        OR (? > 0 AND order_ref = ?)
+                   )
+                     AND trade_outcome IN ('NO_TRADE', 'UNRESOLVED')""",
+                params + (oid, oid, oref, oref),
+            )
+            updated = int(cur.rowcount or 0)
+            if updated == 0:
+                cur = self._conn.execute(
+                    """UPDATE shadow_decision_audit
+                       SET trade_outcome=?,
+                           trade_profit=?,
+                           trade_closed_at=?,
+                           order_id=COALESCE(NULLIF(?, ''), order_id),
+                           order_ref=COALESCE(NULLIF(?, 0), order_ref)
+                       WHERE (? <> '' AND order_id = ?)
+                          OR (? > 0 AND order_ref = ?)""",
+                    params + (oid, oid, oref, oref),
+                )
+                updated = int(cur.rowcount or 0)
+
+        if updated > 1:
+            log.warning(
+                "[SHADOW-LINK] candidate_id duplicado o múltiple match (rows=%d cid=%s oid=%s ref=%s)",
+                updated,
+                cid if cid > 0 else "none",
+                oid or "none",
+                oref,
+            )
         self._conn.commit()
 
     def update_outcome_by_id(self, row_id: int, outcome: str, profit: float = 0.0) -> None:

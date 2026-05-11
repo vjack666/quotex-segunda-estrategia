@@ -10,19 +10,19 @@ martingala por contexto aislado, GaleWatcher en hilo dedicado y caja negra SQLit
 | ID | Nombre | Duración | Estado |
 |----|--------|----------|--------|
 | STRAT-A | Consolidación (techo/piso en 5 min) | 300 s | **Opera** |
-| STRAT-B | Spring / Upthrust (sweep de liquidez) | 300 s | Solo aviso (usar `--strat-b-live` para operar) |
+| STRAT-B | Spring / Upthrust (sweep de liquidez) | 300 s | Implementada, deshabilitada por configuración runtime de `main.py` |
 
 ### STRAT-A — Consolidación
-- Escanea todos los activos OTC con payout ≥ 80 %.
+- Escanea activos OTC y aplica filtros operativos del runtime.
 - Detecta consolidación en M5: mínimo 15 velas dentro del rango, ancho máximo 0.3 %.
 - Entra en techo (PUT) o piso (CALL) cuando el precio llega a la zona.
-- Umbral de score dinámico: base 50, rango bajo/alto 48–54 (configurable por CLI).
+- Usa pre-validación OLD (`_pre_validate_entry`) con vetos binarios antes de `_enter()`.
 - Bloqueo de re-entrada en la misma estructura: 180 min (configurable).
 
 ### STRAT-B — Spring / Upthrust
 - Detecta barridos de liquidez en zonas de estructura.
-- Por defecto solo registra en caja negra sin abrir órdenes.
-- Activar con `--strat-b-live` y confianza mínima `--strat-b-min-confidence 0.70`.
+- Tiene path de ejecución implementado en `consolidation_bot.py`.
+- En estado actual, `main.py` fuerza `STRAT_B_CAN_TRADE = False` en `_apply_runtime_config()`.
 
 ---
 
@@ -62,9 +62,9 @@ data/
   db/                        ← trade_journal-YYYY-MM-DD.db, black_box_strat-YYYY-MM-DD.db
   logs/bot/                  ← consolidation_bot-YYYY-MM-DD.log
   hub_runtime_state.json     ← Snapshot en vivo para los monitores A/B/C
-documentacion/               ← Documentación técnica detallada
+Documentos/                  ← Documentación técnica detallada y roadmap
 aprendizaje/                 ← Scripts de entrenamiento y archivo de sesión
-lab/                         ← Análisis offline y scripts de diagnóstico
+src/lab/                     ← Análisis offline y scripts de diagnóstico
 ```
 
 ### Detalles críticos de implementación
@@ -108,7 +108,6 @@ QUOTEX_PASSWORD=tupassword
 | `python main.py --once` | Un solo ciclo y salir |
 | `python main.py --real` | Loop en cuenta REAL ⚠️ |
 | `python main.py --hub-readonly` | Solo monitoreo, sin órdenes |
-| `python main.py --strat-b-live` | Activa STRAT-B para operar |
 | `python main.py --no-hub-multi-monitor` | Sin consolas de monitor A/B/C |
 
 ## Parámetros CLI principales
@@ -123,41 +122,36 @@ Gestión de capital
   --cycle-profit-pct 0.10        Take-profit por ciclo (fracción)
 
 Filtros operativos
-  --min-payout 80                Payout mínimo permitido
+  --min-payout 85                Payout mínimo que aplica `main.py` sobre runtime
   --scan-lead-sec 35.0           Anticipación del scan antes del open de vela
   --same-asset-cooldown-sec 65   Cooldown entre entradas al mismo activo
 
 STRAT-A
-  --adaptive-threshold-base 50   Umbral base de score
+  --adaptive-threshold-base 50   Umbral base aplicado por CLI en runtime
   --adaptive-threshold-low 48    Umbral bajo dinámico
   --adaptive-threshold-high 54   Umbral alto dinámico
   --structure-entry-lock-ttl-min 180
-
-STRAT-B
-  --strat-b-live                 Habilitar órdenes STRAT-B
-  --strat-b-min-confidence 0.70  Confianza mínima para entrar
 ```
+
+## Estado de Validación (actual)
+
+- OLD es autoridad única de ejecución.
+- NEW está integrado como observador shadow (sin autoridad live).
+- Existe instrumentación de shadow runtime y pack de observación en `src/lab/`.
+- La validación estadística formal NEW vs OLD todavía no es concluyente.
+- Antes de cualquier promoción de NEW, revisar `Documentos/files/ESTADO_REAL_SISTEMA.md`.
 
 ---
 
 ## Análisis y flujo de aprendizaje
 
 ```powershell
-# Revisar caja negra del día
-.venv\Scripts\python.exe lab\full_session_review.py
+# Parser de métricas runtime shadow
+.venv\Scripts\python.exe src\lab\shadow_log_parser.py --log bot_stdout.txt --json-out data\exports\shadow_runtime_summary.json --csv-out data\exports\shadow_runtime_summary.csv
 
-# Análisis STRAT-B
-.venv\Scripts\python.exe lab\black_box_stratb.py
+# Reconciliación de integridad shadow
+.venv\Scripts\python.exe src\lab\shadow_reconcile.py --db data\db\trade_journal-YYYY-MM-DD.db --json-out data\exports\shadow_reconcile_report.json
 
-# Exportar velas de candidatos
-.venv\Scripts\python.exe lab\dump_candidate_candles.py
-
-# Buscar orden por ID
-.venv\Scripts\python.exe buscar_orden.py <ORDER_ID>
-
-# Exportar métricas de aprendizaje
-.venv\Scripts\python.exe aprendizaje\scripts\exportar_metricas_aprendizaje.py
-
-# Archivar sesión
-powershell -ExecutionPolicy Bypass -File aprendizaje\scripts\cerrar_sesion_aprendizaje.ps1
+# Auditoría de overhead runtime
+.venv\Scripts\python.exe src\lab\shadow_overhead_audit.py --parser-json data\exports\shadow_runtime_summary.json --db data\db\trade_journal-YYYY-MM-DD.db --json-out data\exports\shadow_overhead_report.json
 ```

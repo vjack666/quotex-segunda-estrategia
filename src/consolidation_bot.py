@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -64,8 +65,8 @@ for _candidate in (Path(__file__).parent / ".env", Path(__file__).parent.parent 
         break
 
 from pyquotex.stable_api import Quotex  # type: ignore
+from quotex_connection import create_client, load_credentials_from_env
 from entry_scorer import (
-    CandidateEntry,
     score_candidate,
     select_best,
     explain_score,
@@ -74,8 +75,9 @@ from candle_patterns import (
     detect_reversal_pattern,
     explain_no_pattern_reason,
 )
-from spike_filter import sanitize_spike_candles
+from spike_filter import detect_spike_anomaly, sanitize_spike_candles
 from strategy_spring_sweep import detect_spring_or_upthrust
+from entry_decision_engine import EntryContext, evaluate_entry, explain_decision
 from trade_journal import get_journal
 from black_box_recorder import get_black_box
 from martingale_calculator import MartingaleCalculator
@@ -124,6 +126,21 @@ ROOT = Path(__file__).resolve().parent.parent
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 _stdout_handler = logging.StreamHandler(sys.stdout)
+
+
+def _task_name() -> str:
+    task = asyncio.current_task()
+    if task is None:
+        return "no-task"
+    try:
+        name = task.get_name()
+        return str(name) if name else "unnamed-task"
+    except Exception:
+        return "unknown-task"
+
+
+def _client_id(client: Any) -> str:
+    return hex(id(client))
 
 
 def _clear_quotex_session(client: Any) -> None:
@@ -191,7 +208,7 @@ MIN_CONSOLIDATION_BARS = 12      # mínimo de velas DENTRO del rango
 MAX_RANGE_PCT          = 0.003   # 0.3% — amplitud máxima del rango
 TOUCH_TOLERANCE_PCT    = 0.00035 # 0.035% — tolerancia para "tocar" techo/piso
 MAX_CONSOLIDATION_MIN  = 0       # 0 = sin límite de tiempo para descartar zona
-MIN_PAYOUT             = 85      # payout mínimo base de riesgo
+MIN_PAYOUT             = 84      # payout mínimo base de riesgo
 DURATION_SEC           = 300     # duración fija de cada opción binaria (5 min)
 SCAN_INTERVAL_SEC      = 60      # segundos entre escaneos completos
 CONNECT_RETRIES        = 3       # reintentos de conexión con delay
@@ -214,7 +231,7 @@ HUB_NEAR_ENTRY_TOLERANCE_PCT = 0.0010  # 0.10% alrededor de piso/techo de zona
 HUB_BREAKOUT_CHASE_MAX_PCT   = 0.0008  # 0.08% máximo permitido tras ruptura
 
 # Ciclo matemático de gestión (estilo Masaniello simplificado)
-CYCLE_MAX_OPERATIONS     = 6     # reinicio duro al completar 6 operaciones
+CYCLE_MAX_OPERATIONS     = 5     # reinicio duro al completar 5 operaciones
 CYCLE_TARGET_WINS        = 2     # objetivo mínimo de aciertos por ciclo
 CYCLE_TARGET_PROFIT_PCT  = 0.10  # reiniciar ciclo al lograr +10% sobre balance base
 
@@ -294,14 +311,14 @@ FORCE_EXECUTE_STRONG_BREAKOUT = True
 GREYLIST_ASSETS = {"USDDZD_otc"}
 PATTERN_PUT_BLACKLIST = {"bearish_engulfing"}
 STRICT_PATTERN_CHECK = True
-PATTERN_DIRECT_TRIGGER_MIN_PAYOUT = 85   # trigger directo si payout > 85%
+PATTERN_DIRECT_TRIGGER_MIN_PAYOUT = 84   # trigger directo si payout > 84%
 PATTERN_TIMING_IMMEDIATE = {"hammer", "shooting_star", "bullish_hammer", "bearish_inverted_hammer"}
 PATTERN_TIMING_NEXT_OPEN = {"bullish_engulfing", "bearish_engulfing"}
 PATTERN_TIMING_ANTICIPATORY = {"morning_star_simple", "evening_star_simple"}
 
-ADAPTIVE_THRESHOLD_BASE = 60
-ADAPTIVE_THRESHOLD_LOW = 58
-ADAPTIVE_THRESHOLD_HIGH = 64
+ADAPTIVE_THRESHOLD_BASE = 73
+ADAPTIVE_THRESHOLD_LOW = 73
+ADAPTIVE_THRESHOLD_HIGH = 75
 ADAPTIVE_THRESHOLD_WINDOW_SCANS = 10
 
 ASSET_LOSS_STREAK_LIMIT = 3
@@ -334,9 +351,22 @@ MIN_CANDLES_FOR_FULL_SCAN = MA_SLOW_PERIOD
 MAX_BREAKOUT_OVEREXTENSION_PCT = 0.0012  # 0.12%
 MA_FLAT_DELTA_PCT = 0.0005
 DRY_RUN_VERBOSE = True
+DEBUG_SCAN = os.environ.get("DEBUG_SCAN", "false").strip().lower() in {"1", "true", "yes", "on"}
+SHADOW_MODE_ENABLED = os.environ.get("SHADOW_MODE_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+SHADOW_NEW_ENGINE_ENABLED = os.environ.get("SHADOW_NEW_ENGINE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+SHADOW_PERSIST_ENABLED = os.environ.get("SHADOW_PERSIST_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+SHADOW_EXPLAIN_ENABLED = os.environ.get("SHADOW_EXPLAIN_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+SHADOW_EXPLAIN_MAX_CHARS = int(os.environ.get("SHADOW_EXPLAIN_MAX_CHARS", "2000") or 2000)
+SHADOW_RUNTIME_METRICS_ENABLED = os.environ.get("SHADOW_RUNTIME_METRICS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+SHADOW_AUDIT_MODE = os.environ.get("SHADOW_AUDIT_MODE", "true").strip().lower() in {"1", "true", "yes", "on"}
+SHADOW_AUDIT_ASSERT_ENABLED = os.environ.get("SHADOW_AUDIT_ASSERT_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+SHADOW_DEAD_WATCHDOG_ENABLED = os.environ.get("SHADOW_DEAD_WATCHDOG_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+SHADOW_DEAD_WATCHDOG_MINUTES = float(os.environ.get("SHADOW_DEAD_WATCHDOG_MINUTES", "5") or 5)
+SHADOW_SESSION_ID = str(os.environ.get("SHADOW_SESSION_ID", "session-unknown") or "session-unknown")
 
-EMAIL    = os.environ.get("QUOTEX_EMAIL", "")
-PASSWORD = os.environ.get("QUOTEX_PASSWORD", "")
+_CREDS = load_credentials_from_env()
+EMAIL = _CREDS.email
+PASSWORD = _CREDS.password
 
 # Zona horaria operativa del broker/gráfica
 BROKER_TZ = timezone(timedelta(hours=-3))
@@ -379,6 +409,7 @@ STRAT_B_LOG_TOP_N      = 3
 STRAT_B_PREVIEW_MIN_CONF = 0.45
 
 # LEGACY-RJ (Rechazo M1 en ventana de 30s)
+LEGACY_RJ_ENABLED        = False
 LEGACY_RJ_CAN_TRADE      = False
 LEGACY_RJ_DURATION_SEC   = 60
 LEGACY_RJ_MIN_SCORE      = 4.0
@@ -398,7 +429,11 @@ INLINE_COUNTDOWN_LOG_TICKS = True
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ESTRUCTURAS DE DATOS
 # ═══════════════════════════════════════════════════════════════════════════════
-from models import Candle, ConsolidationZone  # noqa: E402  (shared with entry_scorer)
+from models import (
+    Candle,
+    ConsolidationZone,
+    CandidateEntry,
+)  # noqa: E402  (shared types)
 
 
 @dataclass
@@ -720,7 +755,7 @@ async def fetch_candles_with_retry(
         Timeout duro para evitar cuelgues cuando una coroutine no coopera con cancelación.
         Usa asyncio.wait(timeout=...) en vez de wait_for para no bloquear esperando el cancel.
         """
-        task = asyncio.create_task(coro)
+        task: asyncio.Future[List[Candle]] = asyncio.ensure_future(coro)
         try:
             done, pending = await asyncio.wait({task}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
             if task in done:
@@ -1015,6 +1050,7 @@ async def place_order(
     amount: float, duration: int, dry_run: bool,
     account_type: str = "PRACTICE",
     now_ts_fn: Optional[Callable[[], float]] = None,
+    reconnect_fn: Optional[Callable[[str], Awaitable[bool]]] = None,
 ) -> Tuple[bool, str, float, int, str, float, str, float]:
     if dry_run:
         log.info("  [DRY-RUN] %s %s $%.2f %ds",
@@ -1035,59 +1071,13 @@ async def place_order(
         )
 
     async def _force_reconnect(step_label: str) -> Tuple[bool, str]:
-        log.info("🔌 Reconexión %s: %s %s $%.2f", step_label, asset, direction.upper(), amount)
-        last_reason = ""
-        for attempt in range(1, CONNECT_RETRIES + 1):
-            try:
-                await asyncio.wait_for(client.close(), timeout=3.0)
-            except asyncio.TimeoutError:
-                log.warning(
-                    "  Reconexión %s timeout en close() intento %d/%d",
-                    step_label,
-                    attempt,
-                    CONNECT_RETRIES,
-                )
-            except Exception:
-                pass
-
-            await asyncio.sleep(1.0)
-            try:
-                ok_conn, reason_conn = await asyncio.wait_for(
-                    client.connect(),
-                    timeout=RECONNECT_TIMEOUT_SEC,
-                )
-            except asyncio.TimeoutError:
-                last_reason = f"reconnect_timeout_connect_{RECONNECT_TIMEOUT_SEC:.0f}s"
-                log.warning("  Reconexión %s timeout en connect() intento %d/%d", step_label, attempt, CONNECT_RETRIES)
-                continue
-            except Exception as exc:
-                last_reason = f"reconnect_exception_connect:{exc}"
-                log.warning("  Reconexión %s excepción en connect() intento %d/%d: %s", step_label, attempt, CONNECT_RETRIES, exc)
-                continue
-
-            if not ok_conn:
-                last_reason = f"reconnect_failed:{reason_conn}"
-                log.warning("  Reconexión %s fallida intento %d/%d: %s", step_label, attempt, CONNECT_RETRIES, reason_conn)
-                continue
-
-            try:
-                await asyncio.wait_for(
-                    client.change_account(account_type),
-                    timeout=RECONNECT_TIMEOUT_SEC,
-                )
-            except asyncio.TimeoutError:
-                last_reason = f"reconnect_timeout_change_account_{RECONNECT_TIMEOUT_SEC:.0f}s"
-                log.warning("  Reconexión %s timeout en change_account() intento %d/%d", step_label, attempt, CONNECT_RETRIES)
-                continue
-            except Exception as exc:
-                last_reason = f"reconnect_exception_change_account:{exc}"
-                log.warning("  Reconexión %s excepción en change_account() intento %d/%d: %s", step_label, attempt, CONNECT_RETRIES, exc)
-                continue
-
-            await asyncio.sleep(0.6)
+        if reconnect_fn is None:
+            return False, "reconnect_owner_missing"
+        reconnect_reason = f"order:{step_label}:{asset}:{direction}:{amount:.2f}"
+        ok_conn = await reconnect_fn(reconnect_reason)
+        if ok_conn:
             return True, ""
-
-        return False, last_reason or "reconnect_failed_without_reason"
+        return False, f"reconnect_failed:{reconnect_reason}"
 
     async def _log_pre_buy() -> None:
         try:
@@ -1327,6 +1317,11 @@ class ConsolidationBot:
         self.client      = client
         self.dry_run     = dry_run
         self.account_type = account_type
+        self._conn_lock = asyncio.Lock()
+        self._entry_lock = asyncio.Lock()
+        self._reconnecting: bool = False
+        self._reconnect_counter: int = 0
+        self._lifecycle_consumers: list[tuple[Callable[[], Any], Callable[[], Any]]] = []
         try:
             self._main_loop: Optional[asyncio.AbstractEventLoop] = asyncio.get_running_loop()
         except RuntimeError:
@@ -1351,6 +1346,16 @@ class ConsolidationBot:
             "rejected_same_asset_limit": 0,
             "rejected_same_asset_cooldown": 0,
             "rejected_same_structure": 0,
+            "phase2_rejected_active_operation": 0,
+            "phase2_rejected_session_limit": 0,
+            "phase2_rejected_payout": 0,
+            "phase2_rejected_score": 0,
+            "phase2_rejected_spike_1m": 0,
+            "phase2_rejected_spike_5m": 0,
+            "phase2_rejected_htf_alignment": 0,
+            "phase2_rejected_candle_pattern": 0,
+            "phase2_rejected_zone_age": 0,
+            "phase2_rejected_zone_memory": 0,
         }
         # Estado de compensación: si la última operación cerró LOSS,
         # la próxima entrada usará monto dinámico de compensación para cubrir esa pérdida.
@@ -1430,6 +1435,51 @@ class ConsolidationBot:
         # Umbral adaptativo de score basado en aceptación reciente por scan.
         self.accepted_scans_window: Deque[int] = deque(maxlen=ADAPTIVE_THRESHOLD_WINDOW_SCANS)
         self.current_score_threshold: int = ADAPTIVE_THRESHOLD_BASE
+        self.shadow_mode_enabled: bool = bool(SHADOW_MODE_ENABLED)
+        self.shadow_new_engine_enabled: bool = bool(SHADOW_NEW_ENGINE_ENABLED)
+        self.shadow_persist_enabled: bool = bool(SHADOW_PERSIST_ENABLED)
+        self.shadow_explain_enabled: bool = bool(SHADOW_EXPLAIN_ENABLED)
+        self.shadow_runtime_metrics_enabled: bool = bool(SHADOW_RUNTIME_METRICS_ENABLED)
+        self.shadow_audit_mode: bool = bool(SHADOW_AUDIT_MODE)
+        self.shadow_audit_assert_enabled: bool = bool(SHADOW_AUDIT_ASSERT_ENABLED)
+        self.shadow_dead_watchdog_enabled: bool = bool(SHADOW_DEAD_WATCHDOG_ENABLED)
+        self.shadow_dead_watchdog_minutes: float = float(SHADOW_DEAD_WATCHDOG_MINUTES)
+        self.shadow_session_id: str = str(SHADOW_SESSION_ID)
+        self._shadow_dead_alerted: bool = False
+        self._shadow_metrics_started_at: float = time.perf_counter()
+        self._shadow_last_hash_by_asset: dict[str, str] = {}
+        self._shadow_metrics: dict[str, float] = {
+            "candidates": 0.0,
+            "candidate_id_missing": 0.0,
+            "link_updates": 0.0,
+            "resolved_updates": 0.0,
+            "scan_cycle_calls": 0.0,
+            "scan_cycle_ms_total": 0.0,
+            "scan_cycle_ms_max": 0.0,
+            "context_build_calls": 0.0,
+            "context_build_ms_total": 0.0,
+            "context_build_ms_max": 0.0,
+            "context_htf_reused": 0.0,
+            "context_htf_fetched": 0.0,
+            "context_c5_drift": 0.0,
+            "context_hash_changed": 0.0,
+            "context_hash_unchanged": 0.0,
+            "context_snapshot_missing": 0.0,
+            "eval_calls": 0.0,
+            "eval_ms_total": 0.0,
+            "eval_ms_max": 0.0,
+            "persist_calls": 0.0,
+            "persist_ok": 0.0,
+            "persist_ms_total": 0.0,
+            "persist_ms_max": 0.0,
+            "explain_calls": 0.0,
+            "explain_chars_total": 0.0,
+            "latency_calls": 0.0,
+            "latency_ms_total": 0.0,
+            "latency_ms_max": 0.0,
+            "errors_eval": 0.0,
+            "errors_persist": 0.0,
+        }
         # Control de repetición de activo para evitar sobre-exposición por momentum.
         self.last_entry_asset: Optional[str] = None
         self.last_entry_asset_streak: int = 0
@@ -3354,13 +3404,41 @@ class ConsolidationBot:
         for row in rows:
             rid = int(row[0])
             oid = str(row[1] or "").strip()
+            ref_id = 0
+
+            def _sync_shadow(outcome_txt: str, profit_val: float, closed_at_txt: str) -> None:
+                try:
+                    journal.update_shadow_outcome_by_candidate(
+                        candidate_id=rid,
+                        outcome=outcome_txt,
+                        profit=float(profit_val),
+                        closed_at=closed_at_txt,
+                        order_id=oid,
+                        order_ref=int(ref_id or 0),
+                    )
+                    if self.shadow_mode_enabled and self.shadow_runtime_metrics_enabled:
+                        self._shadow_metrics["resolved_updates"] += 1
+                        self._shadow_metrics["link_updates"] += 1
+                    if self.shadow_mode_enabled and self.shadow_audit_mode:
+                        log.info(
+                            "[SHADOW-LINK] sid=%s status=RECONCILE_LINKED candidate_id=%s order_id=%s order_ref=%s outcome=%s",
+                            self.shadow_session_id,
+                            rid,
+                            oid,
+                            int(ref_id or 0),
+                            outcome_txt,
+                        )
+                except Exception as exc:
+                    log.debug("Shadow reconcile update error rid=%s oid=%s: %s", rid, oid or "none", exc)
 
             # Sin identificador usable, no hay forma confiable de consultar resultado.
             if not oid or oid in {"BROKER_NO_ID"} or oid.startswith("DRY-"):
+                closed_at = datetime.now(tz=BROKER_TZ).isoformat()
                 journal._conn.execute(
                     "UPDATE candidates SET outcome='UNRESOLVED', closed_at=? WHERE id=? AND outcome='PENDING'",
-                    (datetime.now(tz=BROKER_TZ).isoformat(), rid),
+                    (closed_at, rid),
                 )
+                _sync_shadow("UNRESOLVED", 0.0, closed_at)
                 unresolved += 1
                 continue
 
@@ -3389,22 +3467,28 @@ class ConsolidationBot:
                             profit = float(payload.get("profitAmount", 0) or 0)
 
                 if outcome in {"WIN", "LOSS"}:
+                    closed_at = datetime.now(tz=BROKER_TZ).isoformat()
                     journal._conn.execute(
                         "UPDATE candidates SET outcome=?, profit=?, closed_at=? WHERE id=? AND outcome='PENDING'",
-                        (outcome, float(profit), datetime.now(tz=BROKER_TZ).isoformat(), rid),
+                        (outcome, float(profit), closed_at, rid),
                     )
+                    _sync_shadow(outcome, float(profit), closed_at)
                     resolved += 1
                 else:
+                    closed_at = datetime.now(tz=BROKER_TZ).isoformat()
                     journal._conn.execute(
                         "UPDATE candidates SET outcome='UNRESOLVED', closed_at=? WHERE id=? AND outcome='PENDING'",
-                        (datetime.now(tz=BROKER_TZ).isoformat(), rid),
+                        (closed_at, rid),
                     )
+                    _sync_shadow("UNRESOLVED", 0.0, closed_at)
                     unresolved += 1
             except Exception:
+                closed_at = datetime.now(tz=BROKER_TZ).isoformat()
                 journal._conn.execute(
                     "UPDATE candidates SET outcome='UNRESOLVED', closed_at=? WHERE id=? AND outcome='PENDING'",
-                    (datetime.now(tz=BROKER_TZ).isoformat(), rid),
+                    (closed_at, rid),
                 )
+                _sync_shadow("UNRESOLVED", 0.0, closed_at)
                 unresolved += 1
 
         journal._conn.commit()
@@ -4068,16 +4152,20 @@ class ConsolidationBot:
         matemático y opera SOLO el mejor (o los N mejores si MAX_ENTRIES_CYCLE > 1).
         Si ninguno supera el umbral dinámico de score, no opera ese ciclo.
         """
-        print("[DEBUG-SCAN] 1. Starting scan_all()", flush=True)
+        def debug_print(message: str) -> None:
+            if DEBUG_SCAN:
+                log.debug(message)
+
+        debug_print("[DEBUG-SCAN] 1. Starting scan_all()")
         if await self.refresh_balance_and_risk():
-            print("[DEBUG-SCAN] 2a. Stop-loss triggered in REAL account, returning", flush=True)
+            debug_print("[DEBUG-SCAN] 2a. Stop-loss triggered in REAL account, returning")
             if str(self.account_type).upper() == "REAL" and bool(ENABLE_SESSION_STOP_LOSS):
                 return
             # Defensa extra: en DEMO/PRACTICE nunca detener el escaneo por stop-loss.
             self.session_stop_hit = False
             log.warning("⚠ Stop-loss de sesión ignorado en DEMO/PRACTICE dentro de scan_all.")
 
-        print("[DEBUG-SCAN] 2b. After refresh_balance_and_risk", flush=True)
+        debug_print("[DEBUG-SCAN] 2b. After refresh_balance_and_risk")
 
         # Safety watchdog: liberar flag de gale si expiró el tiempo máximo posible
         _MAX_GALE_LIFETIME_SEC = float(DURATION_SEC) + float(GALE_BRIDGE_ORDER_TIMEOUT_SEC) + 30.0
@@ -4095,7 +4183,7 @@ class ConsolidationBot:
         assets: List[Tuple[str, int]] = []
         htf_scanner = getattr(self, "htf_scanner", None)
         htf_ready = False
-        print("[DEBUG-SCAN] 3. Getting assets, htf_scanner=%s" % (htf_scanner is not None), flush=True)
+        debug_print("[DEBUG-SCAN] 3. Getting assets, htf_scanner=%s" % (htf_scanner is not None))
         if htf_scanner is not None:
             try:
                 assets = list(htf_scanner.get_eligible_assets(max_age_sec=240.0))
@@ -4108,11 +4196,11 @@ class ConsolidationBot:
                 assets = []
 
         # Fallback mientras el HTF aún no haya publicado una biblioteca usable.
-        print("[DEBUG-SCAN] 4. Checking fallback, assets=%d" % len(assets), flush=True)
+        debug_print("[DEBUG-SCAN] 4. Checking fallback, assets=%d" % len(assets))
         if not assets:
-            print("[DEBUG-SCAN] 5. Calling get_open_assets()...", flush=True)
+            debug_print("[DEBUG-SCAN] 5. Calling get_open_assets()...")
             assets = await get_open_assets(self.client, MIN_PAYOUT)
-            print("[DEBUG-SCAN] 6. get_open_assets() returned %d assets" % len(assets), flush=True)
+            debug_print("[DEBUG-SCAN] 6. get_open_assets() returned %d assets" % len(assets))
             if assets:
                 if htf_scanner is None:
                     log.debug("📌 Fuente activos scan: get_open_assets fallback (%d)", len(assets))
@@ -4120,15 +4208,15 @@ class ConsolidationBot:
                     log.debug("📌 Fuente activos scan: fallback temporal a get_open_assets (%d)", len(assets))
 
         if not assets:
-            print("[DEBUG-SCAN] 7. No assets available, returning", flush=True)
+            debug_print("[DEBUG-SCAN] 7. No assets available, returning")
             log.warning("No se obtuvieron activos OTC disponibles.")
             return
 
-        print("[DEBUG-SCAN] 8. Got %d assets, continuing..." % len(assets), flush=True)
+        debug_print("[DEBUG-SCAN] 8. Got %d assets, continuing..." % len(assets))
 
         total_assets_available = len(assets)
         if SCAN_MAX_ASSETS_PER_CYCLE > 0 and len(assets) > SCAN_MAX_ASSETS_PER_CYCLE:
-            print("[DEBUG-SCAN] 9a. Limiting assets to %d" % SCAN_MAX_ASSETS_PER_CYCLE, flush=True)
+            debug_print("[DEBUG-SCAN] 9a. Limiting assets to %d" % SCAN_MAX_ASSETS_PER_CYCLE)
             assets = assets[:SCAN_MAX_ASSETS_PER_CYCLE]
             log.info(
                 "⚡ Aceleración scan: %d/%d activos (top payout)",
@@ -4136,40 +4224,40 @@ class ConsolidationBot:
                 total_assets_available,
             )
         else:
-            print("[DEBUG-SCAN] 9b. Not limiting assets", flush=True)
+            debug_print("[DEBUG-SCAN] 9b. Not limiting assets")
 
-        print("[DEBUG-SCAN] 10. About to increment stats and cleanup", flush=True)
+        debug_print("[DEBUG-SCAN] 10. About to increment stats and cleanup")
         self.stats["scans"] += 1
         # Reflejar progreso inmediato en el HUB aunque el ciclo aún no termine.
         try:
             self.hub.state.total_scans = int(self.stats["scans"])
         except Exception:
             pass
-        print("[DEBUG-SCAN] 11. Stats incremented, about to cleanup", flush=True)
+        debug_print("[DEBUG-SCAN] 11. Stats incremented, about to cleanup")
         accepted_this_scan = 0
         self._cleanup_asset_blacklist()
-        print("[DEBUG-SCAN] 12. Cleanup done, about to log", flush=True)
+        debug_print("[DEBUG-SCAN] 12. Cleanup done, about to log")
         log.info("═══ SCAN #%d | %d activos payout≥%d%% ═══",
                  self.stats["scans"], len(assets), MIN_PAYOUT)
-        print("[DEBUG-SCAN] 13. After log, about to check martingalas", flush=True)
+        debug_print("[DEBUG-SCAN] 13. After log, about to check martingalas")
 
         # 1) Revisar martingalas de trades abiertos
         # Snapshot de keys al inicio — evita KeyError si _resolve_trade elimina el trade
         # durante un await interno de _check_martin (race condition asyncio)
         _active_syms = list(self.trades.keys())
-        print("[DEBUG-SCAN] 14. Active syms: %d" % len(_active_syms), flush=True)
+        debug_print("[DEBUG-SCAN] 14. Active syms: %d" % len(_active_syms))
         for sym in _active_syms:
-            print("[DEBUG-SCAN] 15. Checking martin for %s" % sym, flush=True)
+            debug_print("[DEBUG-SCAN] 15. Checking martin for %s" % sym)
             if sym not in self.trades:
                 # Trade resuelto por task en background mientras iterábamos
                 continue
             entered = await self._check_martin(sym)
-            print("[DEBUG-SCAN] 16. Martin check done for %s, entered=%s" % (sym, entered), flush=True)
+            debug_print("[DEBUG-SCAN] 16. Martin check done for %s, entered=%s" % (sym, entered))
             if entered:
                 await sleep_with_inline_countdown(COOLDOWN_BETWEEN_ENTRIES, "⏳ Cooldown post-orden")
             await asyncio.sleep(0.2)
 
-        print("[DEBUG-SCAN] 17. After martingala checks", flush=True)
+        debug_print("[DEBUG-SCAN] 17. After martingala checks")
 
         # Si hay operaciones abiertas: seguir escaneando para vigilar oportunidades.
         # El bloque de ejecución (paso 5) impedirá abrir nuevas entradas si se alcanzó
@@ -4289,14 +4377,14 @@ class ConsolidationBot:
         # Solo pre-lanzamos los fetches 5m en paralelo (concurrencia limitada).
         # Los fetches 1m se hacen de forma SECUENCIAL en el loop para evitar
         # que las respuestas WebSocket se mezclen entre activos.
-        print("[DEBUG-SCAN] 18. Setting up prefetch tasks for %d assets" % len(assets), flush=True)
+        debug_print("[DEBUG-SCAN] 18. Setting up prefetch tasks for %d assets" % len(assets))
         candles_tasks: dict[str, asyncio.Task[List[Candle]]] = {}
         prefetch_window = max(1, min(SCAN_5M_PREFETCH_WINDOW, len(assets)))
-        print("[DEBUG-SCAN] 19. Prefetch window: %d" % prefetch_window, flush=True)
+        debug_print("[DEBUG-SCAN] 19. Prefetch window: %d" % prefetch_window)
         for sym, _ in assets[:prefetch_window]:
-            print("[DEBUG-SCAN] 20a. Pre-launching fetch for %s" % sym, flush=True)
+            debug_print("[DEBUG-SCAN] 20a. Pre-launching fetch for %s" % sym)
             candles_tasks[sym] = asyncio.create_task(_fetch_5m_limited(sym), name=f"fetch_5m:{sym}")
-        print("[DEBUG-SCAN] 20b. Prefetch tasks created", flush=True)
+        debug_print("[DEBUG-SCAN] 20b. Prefetch tasks created")
 
         try:
             # Decrementar contadores de activos en cooldown post-fallo.
@@ -4306,9 +4394,9 @@ class ConsolidationBot:
             for a in self.failed_assets:
                 self.failed_assets[a] -= 1
 
-            print("[DEBUG-SCAN] 21. Starting asset iteration loop for %d assets" % len(assets), flush=True)
+            debug_print("[DEBUG-SCAN] 21. Starting asset iteration loop for %d assets" % len(assets))
             for idx, (sym, payout) in enumerate(assets, start=1):
-                print("[DEBUG-SCAN] 22. Processing asset %d/%d: %s (payout=%d)" % (idx, len(assets), sym, payout), flush=True)
+                debug_print("[DEBUG-SCAN] 22. Processing asset %d/%d: %s (payout=%d)" % (idx, len(assets), sym, payout))
                 next_prefetch_idx = idx - 1 + prefetch_window
                 if next_prefetch_idx < len(assets):
                     next_sym, _ = assets[next_prefetch_idx]
@@ -4322,17 +4410,17 @@ class ConsolidationBot:
                     log.info("⏱ Progreso scan: %d/%d activos", idx, len(assets))
 
                 if sym in self.trades:
-                    print("[DEBUG-SCAN] 23a. %s has open trade, skipping" % sym, flush=True)
+                    debug_print("[DEBUG-SCAN] 23a. %s has open trade, skipping" % sym)
                     continue
 
                 if sym in self.greylist_assets:
-                    print("[DEBUG-SCAN] 23b. %s in greylist, skipping" % sym, flush=True)
+                    debug_print("[DEBUG-SCAN] 23b. %s in greylist, skipping" % sym)
                     log.info("⏭ %s: en lista gris — skip", sym)
                     self.stats["skipped"] += 1
                     continue
 
                 if self._is_asset_blacklisted(sym):
-                    print("[DEBUG-SCAN] 24. %s is blacklisted, skipping" % sym, flush=True)
+                    debug_print("[DEBUG-SCAN] 24. %s is blacklisted, skipping" % sym)
                     until_ts = self.asset_blacklist_until.get(sym, time.time())
                     remain_min = max(0.0, (until_ts - time.time()) / 60.0)
                     log.warning("⏭ %s: blacklist temporal activa (%.1f min restantes)", sym, remain_min)
@@ -4341,14 +4429,14 @@ class ConsolidationBot:
 
                 # Skip activos que fallaron recientemente en place_order().
                 if sym in self.failed_assets:
-                    print("[DEBUG-SCAN] 25. %s failed recently, skipping" % sym, flush=True)
+                    debug_print("[DEBUG-SCAN] 25. %s failed recently, skipping" % sym)
                     log.info("⏭ %s skipped — falló en ciclo anterior (%d ciclos restantes)",
                              sym, self.failed_assets[sym])
                     continue
 
-                print("[DEBUG-SCAN] 26. About to pop candles for %s" % sym, flush=True)
+                debug_print("[DEBUG-SCAN] 26. About to pop candles for %s" % sym)
                 candles = await candles_tasks.pop(sym)
-                print("[DEBUG-SCAN] 27. Got %d candles for %s" % (len(candles) if candles else 0, sym), flush=True)
+                debug_print("[DEBUG-SCAN] 27. Got %d candles for %s" % (len(candles) if candles else 0, sym))
                 # Cachear para el chart ASCII del HUB (últimas 20 velas).
                 if candles:
                     self._last_asset_candles[sym] = candles[-20:]
@@ -4356,20 +4444,20 @@ class ConsolidationBot:
                 # STRAT-B (Spring Sweep): fetch 1m SECUENCIAL para este activo.
                 # Un pequeño sleep antes del request 1m deja que el WebSocket
                 # liquide la respuesta 5m antes de enviar el nuevo request.
-                print("[DEBUG-SCAN] 28. About to sleep and fetch 1m for %s" % sym, flush=True)
+                debug_print("[DEBUG-SCAN] 28. About to sleep and fetch 1m for %s" % sym)
                 await asyncio.sleep(0.25)
                 strat_b_total += 1
-                print("[DEBUG-SCAN] 29. Fetching 1m for %s" % sym, flush=True)
+                debug_print("[DEBUG-SCAN] 29. Fetching 1m for %s" % sym)
                 candles_1m = await _fetch_1m_limited(sym)
-                print("[DEBUG-SCAN] 30. Got %d 1m candles for %s" % (len(candles_1m) if candles_1m else 0, sym), flush=True)
+                debug_print("[DEBUG-SCAN] 30. Got %d 1m candles for %s" % (len(candles_1m) if candles_1m else 0, sym))
                 candles_1m_collected[sym] = candles_1m
                 # Calibrar reloj local contra timestamps del servidor Quotex.
                 if candles_1m:
                     self._update_clock_offset(candles_1m, TF_1M)
-                print("[DEBUG-SCAN] 31. After clock update", flush=True)
+                debug_print("[DEBUG-SCAN] 31. After clock update")
                 if len(candles_1m_collected) > SCAN_CANDLES_BUFFER_MAX:
                     candles_1m_collected.pop(next(iter(candles_1m_collected)), None)
-                print("[DEBUG-SCAN] 32. After buffer cleanup, candles_1m len=%d" % len(candles_1m), flush=True)
+                debug_print("[DEBUG-SCAN] 32. After buffer cleanup, candles_1m len=%d" % len(candles_1m))
                 strat_b_signal = False
                 strat_b_info = {
                     "confidence": 0.0,
@@ -4377,9 +4465,9 @@ class ConsolidationBot:
                     "signal_type": None,
                     "direction": None,
                 }
-                print("[DEBUG-SCAN] 33. About to check if candles_1m >= 20: %d" % len(candles_1m), flush=True)
+                debug_print("[DEBUG-SCAN] 33. About to check if candles_1m >= 20: %d" % len(candles_1m))
                 if len(candles_1m) >= 20:
-                    print("[DEBUG-SCAN] 34a. Creating DataFrame for %s" % sym, flush=True)
+                    debug_print("[DEBUG-SCAN] 34a. Creating DataFrame for %s" % sym)
                     spring_df = pd.DataFrame(
                         {
                             "open": [c.open for c in candles_1m],
@@ -4388,12 +4476,12 @@ class ConsolidationBot:
                             "close": [c.close for c in candles_1m],
                         }
                     )
-                    print("[DEBUG-SCAN] 34b. DataFrame created, calling detect_spring_or_upthrust", flush=True)
+                    debug_print("[DEBUG-SCAN] 34b. DataFrame created, calling detect_spring_or_upthrust")
                     strat_b_signal, strat_b_info = detect_spring_or_upthrust(
                         spring_df,
                         allow_early=STRAT_B_ALLOW_WYCKOFF_EARLY,
                     )
-                    print("[DEBUG-SCAN] 34c. After detect_spring_or_upthrust, signal=%s" % strat_b_signal, flush=True)
+                    debug_print("[DEBUG-SCAN] 34c. After detect_spring_or_upthrust, signal=%s" % strat_b_signal)
                 elif len(candles_1m) == 0:
                     strat_b_timeout += 1
                 else:
@@ -4756,6 +4844,8 @@ class ConsolidationBot:
                         duration_sec=STRAT_B_DURATION_SEC,
                         payout=payout,
                         score_original=round(strat_b_conf * 100.0, 1),
+                        candidate=b_candidate,
+                        phase2_prevalidated=True,
                     )
                     if b_entered:
                         setattr(_b_candidate, "_pipeline_stage", "entered")
@@ -5657,6 +5747,20 @@ class ConsolidationBot:
             log.info(explain_score(winner, threshold=session_threshold))
             amount = getattr(winner, "_amount", 0.0)
             stage = getattr(winner, "_stage", "initial")
+            phase2_context = {
+                "stage": stage,
+                "amount": amount,
+                "payout": winner.payout,
+                "score_threshold": session_threshold,
+                "phase2_profile": "strict",
+                "candles_1m": list(candles_1m_collected.get(winner.asset, []) or []),
+                "candles_5m": list(winner.candles or []),
+                "strategy_origin": "STRAT-A",
+            }
+            phase2_context = self._build_shadow_context(winner, phase2_context)
+            if not await self._pre_validate_entry(winner, phase2_context):
+                setattr(winner, "_pipeline_stage", "phase2_rejected")
+                continue
             # Si hay compensación pendiente por LOSS anterior, escalar el monto
             if self.compensation_pending and stage == "initial":
                 amount, exp_profit = self._compute_compensation_amount(winner.payout, self.last_closed_amount)
@@ -5678,6 +5782,15 @@ class ConsolidationBot:
                 outcome=outcome,
                 strategy=self._strategy_snapshot(),
             )
+            self._run_shadow_observation(
+                winner,
+                phase2_context,
+                old_decision="ACCEPTED",
+                old_reason="phase2_pass",
+                old_filter="",
+                candidate_id=int(cid),
+                strategy_origin="STRAT-A",
+            )
             accepted_this_scan += 1
             winner._journal_cid = cid  # type: ignore[attr-defined]
             entered = await self._enter(
@@ -5692,6 +5805,10 @@ class ConsolidationBot:
                 duration_sec=DURATION_SEC,
                 payout=winner.payout,
                 score_original=winner.score,
+                candidate=winner,
+                candles_1m=phase2_context["candles_1m"],
+                candles_5m=phase2_context["candles_5m"],
+                phase2_prevalidated=True,
             )
             if entered:
                 setattr(winner, "_pipeline_stage", "entered")
@@ -5716,51 +5833,208 @@ class ConsolidationBot:
 
     async def ensure_connection(self) -> bool:
         """Valida websocket activa y reintenta reconectar sin tumbar el loop 24/7."""
+        log.info(
+            "[CONN:health] task=%s client=%s begin",
+            _task_name(),
+            _client_id(self.client),
+        )
         try:
             if await asyncio.wait_for(self.client.check_connect(), timeout=3.0):
+                log.info(
+                    "[CONN:health] task=%s client=%s check_connect=alive",
+                    _task_name(),
+                    _client_id(self.client),
+                )
                 return True
         except Exception:
             pass
+        return await self.reconnect_client(reason="healthcheck:socket_not_alive")
 
-        for attempt in range(1, HEALTHCHECK_RECONNECT_RETRIES + 1):
+    def register_lifecycle_consumer(
+        self,
+        pause_fn: Callable[[], Any],
+        resume_fn: Callable[[], Any],
+    ) -> None:
+        self._lifecycle_consumers.append((pause_fn, resume_fn))
+
+    async def _run_maybe_async(self, fn: Callable[[], Any]) -> None:
+        result = fn()
+        if asyncio.iscoroutine(result):
+            await cast(Awaitable[Any], result)
+
+    async def _pause_lifecycle_consumers(self) -> None:
+        for pause_fn, _ in self._lifecycle_consumers:
             try:
-                try:
-                    await asyncio.wait_for(self.client.close(), timeout=2.0)
-                except Exception:
-                    pass
+                await self._run_maybe_async(pause_fn)
+            except Exception as exc:
+                log.debug("[LIFECYCLE] pause consumer error: %s", exc)
 
-                ok, reason = await asyncio.wait_for(
-                    self.client.connect(),
+    async def _resume_lifecycle_consumers(self) -> None:
+        for _, resume_fn in self._lifecycle_consumers:
+            try:
+                await self._run_maybe_async(resume_fn)
+            except Exception as exc:
+                log.debug("[LIFECYCLE] resume consumer error: %s", exc)
+
+    async def reconnect_client(self, reason: str) -> bool:
+        if self._reconnecting:
+            log.info(
+                "[CONN:lifecycle] task=%s id(client)=%s state=reconnecting reason=%s action=skip_parallel",
+                _task_name(),
+                _client_id(self.client),
+                reason,
+            )
+            return False
+
+        async with self._conn_lock:
+            if self._reconnecting:
+                log.info(
+                    "[CONN:lifecycle] task=%s id(client)=%s state=reconnecting reason=%s action=skip_parallel_locked",
+                    _task_name(),
+                    _client_id(self.client),
+                    reason,
+                )
+                return False
+
+            self._reconnecting = True
+            self._reconnect_counter += 1
+            reconnect_n = self._reconnect_counter
+            caller_task = _task_name()
+            old_client = self.client
+            old_id = _client_id(old_client)
+
+            log.warning(
+                "[CONN:lifecycle] task=%s id(client)=%s state=reconnecting reason=%s reconnect_n=%d phase=start",
+                caller_task,
+                old_id,
+                reason,
+                reconnect_n,
+            )
+
+            try:
+                await self._pause_lifecycle_consumers()
+
+                try:
+                    await self.shutdown_background_tasks()
+                except Exception as exc:
+                    log.debug("[CONN:lifecycle] reconnect_n=%d background shutdown error: %s", reconnect_n, exc)
+
+                try:
+                    await asyncio.wait_for(old_client.close(), timeout=3.0)
+                except Exception as exc:
+                    log.debug("[CONN:lifecycle] reconnect_n=%d close old client error: %s", reconnect_n, exc)
+
+                await asyncio.sleep(0.3)
+                new_client = create_client()
+                self.client = new_client
+
+                ok = False
+                reason_msg = ""
+                elapsed_connect = 0.0
+                for attempt in range(1, HEALTHCHECK_RECONNECT_RETRIES + 1):
+                    try:
+                        t0_connect = time.perf_counter()
+                        ok, reason_msg = await asyncio.wait_for(
+                            new_client.connect(),
+                            timeout=RECONNECT_TIMEOUT_SEC,
+                        )
+                        elapsed_connect = time.perf_counter() - t0_connect
+                        log.info(
+                            "[CONN:lifecycle] task=%s id(client)=%s state=reconnecting reason=%s reconnect_n=%d attempt=%d/%d phase=connect ok=%s duration=%.3fs",
+                            caller_task,
+                            _client_id(new_client),
+                            reason,
+                            reconnect_n,
+                            attempt,
+                            HEALTHCHECK_RECONNECT_RETRIES,
+                            ok,
+                            elapsed_connect,
+                        )
+                    except asyncio.TimeoutError:
+                        reason_msg = f"connect_timeout_{RECONNECT_TIMEOUT_SEC:.0f}s"
+                        ok = False
+                        log.warning(
+                            "[CONN:lifecycle] task=%s id(client)=%s state=reconnecting reason=%s reconnect_n=%d attempt=%d/%d phase=connect_timeout",
+                            caller_task,
+                            _client_id(new_client),
+                            reason,
+                            reconnect_n,
+                            attempt,
+                            HEALTHCHECK_RECONNECT_RETRIES,
+                        )
+                    except Exception as exc:
+                        reason_msg = f"connect_exception:{exc}"
+                        ok = False
+                        log.warning(
+                            "[CONN:lifecycle] task=%s id(client)=%s state=reconnecting reason=%s reconnect_n=%d attempt=%d/%d phase=connect_exception error=%s",
+                            caller_task,
+                            _client_id(new_client),
+                            reason,
+                            reconnect_n,
+                            attempt,
+                            HEALTHCHECK_RECONNECT_RETRIES,
+                            exc,
+                        )
+
+                    if ok:
+                        break
+
+                    reason_low = str(reason_msg).lower()
+                    if (
+                        "403" in str(reason_msg)
+                        or "cloudflare" in reason_low
+                        or "cf-mitigated" in reason_low
+                        or "websocket connection rejected" in reason_low
+                    ):
+                        _clear_quotex_session(new_client)
+                        await asyncio.sleep(CF_403_BACKOFF_SEC)
+                    else:
+                        await asyncio.sleep(1.0)
+
+                if not ok:
+                    log.error(
+                        "[CONN:lifecycle] task=%s id(client)=%s state=failed reason=%s reconnect_n=%d connect_reason=%s",
+                        caller_task,
+                        _client_id(new_client),
+                        reason,
+                        reconnect_n,
+                        reason_msg,
+                    )
+                    return False
+
+                t0_change = time.perf_counter()
+                await asyncio.wait_for(
+                    new_client.change_account(self.account_type),
                     timeout=RECONNECT_TIMEOUT_SEC,
                 )
-                if ok:
-                    await asyncio.wait_for(
-                        self.client.change_account(self.account_type),
-                        timeout=RECONNECT_TIMEOUT_SEC,
-                    )
-                    log.warning("🔌 Reconexión exitosa durante loop 24/7")
-                    return True
-                reason_txt = str(reason)
-                if "403" in reason_txt or "cloudflare" in reason_txt.lower() or "cf-mitigated" in reason_txt.lower():
-                    log.warning(
-                        "☁️ Challenge 403 detectado en reconexión (%d/%d). Reintentando...",
-                        attempt,
-                        HEALTHCHECK_RECONNECT_RETRIES,
-                    )
-                    _clear_quotex_session(self.client)
-                    await asyncio.sleep(CF_403_BACKOFF_SEC)
-                    continue
-                log.warning("Reconexión fallida (%d/%d): %s", attempt, HEALTHCHECK_RECONNECT_RETRIES, reason)
-            except asyncio.TimeoutError:
+                elapsed_change = time.perf_counter() - t0_change
                 log.warning(
-                    "Reconexión timeout (%d/%d) en ensure_connection",
-                    attempt,
-                    HEALTHCHECK_RECONNECT_RETRIES,
+                    "[CONN:lifecycle] task=%s id(client)=%s state=ready reason=%s reconnect_n=%d connect_duration=%.3fs change_account_duration=%.3fs",
+                    caller_task,
+                    _client_id(new_client),
+                    reason,
+                    reconnect_n,
+                    elapsed_connect,
+                    elapsed_change,
                 )
-            except Exception as exc:
-                log.warning("Excepción en reconexión: %s", exc)
-            await asyncio.sleep(2.0)
-        return False
+                return True
+            finally:
+                self._reconnecting = False
+                await self._resume_lifecycle_consumers()
+
+    async def close_client(self, reason: str) -> None:
+        async with self._conn_lock:
+            log.info(
+                "[CONN:lifecycle] task=%s id(client)=%s state=closing reason=%s reconnect_n=%d",
+                _task_name(),
+                _client_id(self.client),
+                reason,
+                self._reconnect_counter,
+            )
+            try:
+                await asyncio.wait_for(self.client.close(), timeout=3.0)
+            except Exception:
+                pass
 
 
     async def _resolve_trade(self, trade: "TradeState", sym: str) -> None:
@@ -5886,6 +6160,30 @@ class ConsolidationBot:
             pre_objectives_ok=pre_ok,
             pre_objectives_note=pre_note,
         )
+        try:
+            journal.update_shadow_outcome_by_candidate(
+                candidate_id=int(trade.journal_id) if trade.journal_id else None,
+                outcome=outcome,
+                profit=float(profit),
+                closed_at=ticket_closed_at,
+                order_id=str(trade.order_id or ""),
+                order_ref=int(trade.order_ref or 0),
+            )
+            if self.shadow_mode_enabled and self.shadow_runtime_metrics_enabled:
+                self._shadow_metrics["resolved_updates"] += 1
+                if trade.journal_id:
+                    self._shadow_metrics["link_updates"] += 1
+            if self.shadow_mode_enabled and self.shadow_audit_mode:
+                log.info(
+                    "[SHADOW-LINK] sid=%s status=OUTCOME_LINKED candidate_id=%s order_id=%s order_ref=%s outcome=%s",
+                    self.shadow_session_id,
+                    int(trade.journal_id or 0),
+                    str(trade.order_id or ""),
+                    int(trade.order_ref or 0),
+                    outcome,
+                )
+        except Exception as exc:
+            log.debug("Shadow outcome update error %s: %s", sym, exc)
         await self.refresh_balance_and_risk()
         balance_now = self.current_balance if self.current_balance is not None else 0.0
         log.info("🏁 %s %s $%.2f | saldo: $%.2f", sym, outcome, profit, balance_now)
@@ -6368,6 +6666,7 @@ class ConsolidationBot:
             self.dry_run,
             account_type=account_type,
             now_ts_fn=self._broker_now_ts,
+            reconnect_fn=self.reconnect_client,
         )
         if ok:
             # Marcar que hay una orden de gale activa en el broker.
@@ -6388,6 +6687,525 @@ class ConsolidationBot:
         except Exception:
             return 0.0
 
+    def _phase2_reject_stat_key(self, filter_name: str) -> str:
+        return f"phase2_rejected_{filter_name}"
+
+    def _build_shadow_context(
+        self,
+        candidate: CandidateEntry,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        metrics_enabled = bool(self.shadow_runtime_metrics_enabled)
+        t0 = time.perf_counter() if metrics_enabled else 0.0
+        ctx = dict(context or {})
+        candles_5m = list(ctx.get("candles_5m") or candidate.candles or self._last_asset_candles.get(candidate.asset) or [])
+        candles_1m = list(ctx.get("candles_1m") or [])
+        candles_15m = list(ctx.get("candles_15m") or [])
+        had_15m_in_context = bool(candles_15m)
+        if not candles_15m:
+            htf_scanner = getattr(self, "htf_scanner", None)
+            if htf_scanner is not None:
+                candles_15m = list(htf_scanner.get_candles_15m(candidate.asset) or [])
+
+        snapshot_ts = str(
+            ctx.get("context_snapshot_ts")
+            or datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        )
+        payload = {
+            "asset": str(candidate.asset),
+            "direction": str(candidate.direction),
+            "payout": int(ctx.get("payout", getattr(candidate, "payout", 0)) or 0),
+            "score": float(getattr(candidate, "score", 0.0) or 0.0),
+            "zone_floor": float(getattr(candidate.zone, "floor", 0.0)),
+            "zone_ceiling": float(getattr(candidate.zone, "ceiling", 0.0)),
+            "pattern_name": str(getattr(candidate, "_reversal_pattern", getattr(candidate, "reversal_pattern", "none")) or "none"),
+            "pattern_strength": float(getattr(candidate, "_reversal_strength", getattr(candidate, "reversal_strength", 0.0)) or 0.0),
+            "c1_count": int(len(candles_1m)),
+            "c5_count": int(len(candles_5m)),
+            "c15_count": int(len(candles_15m)),
+            "c1_last_ts": int(candles_1m[-1].ts if candles_1m else 0),
+            "c5_last_ts": int(candles_5m[-1].ts if candles_5m else 0),
+            "c15_last_ts": int(candles_15m[-1].ts if candles_15m else 0),
+            "snapshot_ts": snapshot_ts,
+        }
+        payload_json = json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+        ctx["candles_1m"] = candles_1m
+        ctx["candles_5m"] = candles_5m
+        ctx["candles_15m"] = candles_15m
+        ctx["context_snapshot_ts"] = snapshot_ts
+        ctx["context_hash"] = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+        if metrics_enabled:
+            m = self._shadow_metrics
+            m["context_build_calls"] += 1
+            build_ms = (time.perf_counter() - t0) * 1000.0
+            m["context_build_ms_total"] += build_ms
+            m["context_build_ms_max"] = max(m["context_build_ms_max"], build_ms)
+            if had_15m_in_context:
+                m["context_htf_reused"] += 1
+            else:
+                m["context_htf_fetched"] += 1
+            try:
+                candidate_last_ts = int(candidate.candles[-1].ts) if getattr(candidate, "candles", None) else 0
+                context_last_ts = int(candles_5m[-1].ts) if candles_5m else 0
+                if candidate_last_ts and context_last_ts and candidate_last_ts != context_last_ts:
+                    m["context_c5_drift"] += 1
+            except Exception:
+                pass
+            if not str(snapshot_ts):
+                m["context_snapshot_missing"] += 1
+            asset = str(candidate.asset)
+            prev_hash = self._shadow_last_hash_by_asset.get(asset)
+            curr_hash = str(ctx["context_hash"])
+            if prev_hash is not None:
+                if prev_hash == curr_hash:
+                    m["context_hash_unchanged"] += 1
+                else:
+                    m["context_hash_changed"] += 1
+            self._shadow_last_hash_by_asset[asset] = curr_hash
+        return ctx
+
+    def _run_shadow_observation(
+        self,
+        candidate: CandidateEntry,
+        context: dict[str, Any],
+        *,
+        old_decision: str,
+        old_reason: str,
+        old_filter: str = "",
+        candidate_id: Optional[int] = None,
+        strategy_origin: str = "STRAT-A",
+    ) -> None:
+        if not self.shadow_mode_enabled:
+            return
+        metrics_enabled = bool(self.shadow_runtime_metrics_enabled)
+        total_t0 = time.perf_counter() if metrics_enabled else 0.0
+        if metrics_enabled:
+            self._shadow_metrics["candidates"] += 1
+            if candidate_id is None:
+                self._shadow_metrics["candidate_id_missing"] += 1
+
+        ctx = self._build_shadow_context(candidate, context)
+        stage = str(ctx.get("stage", getattr(candidate, "_stage", "initial")))
+        if not candidate.zone_memory:
+            self._populate_zone_memory(candidate)
+
+        new_decision_txt = "DISABLED"
+        new_category = "DISABLED"
+        new_veto_count = 0
+        new_reason = ""
+        new_explain = ""
+        new_htf_aligned: Optional[bool] = None
+        new_zone_memory_adj: Optional[float] = None
+        compare_status = "AGREE_REJECT"
+        error_text = ""
+
+        try:
+            if not self.shadow_new_engine_enabled:
+                compare_status = "NEW_DISABLED"
+            else:
+                phase2_profile = str(ctx.get("phase2_profile", "strict" if stage != "martin" else "recovery"))
+                eval_t0 = time.perf_counter() if metrics_enabled else 0.0
+                new_eval = evaluate_entry(
+                    candidate,
+                    ctx,
+                    active_trades=len(self.trades),
+                    gale_active=bool(self._gale_order_active),
+                    cycle_ops=int(self.cycle_ops),
+                    max_cycle_ops=int(CYCLE_MAX_OPERATIONS),
+                    min_payout=int(MIN_PAYOUT),
+                    score_threshold=int(self.current_score_threshold),
+                    enforce_quality=phase2_profile != "recovery",
+                    helper_infer_h1_trend=infer_h1_trend,
+                )
+                if metrics_enabled:
+                    eval_ms = (time.perf_counter() - eval_t0) * 1000.0
+                    self._shadow_metrics["eval_calls"] += 1
+                    self._shadow_metrics["eval_ms_total"] += eval_ms
+                    self._shadow_metrics["eval_ms_max"] = max(self._shadow_metrics["eval_ms_max"], eval_ms)
+                new_decision_txt = "ACCEPTED" if bool(new_eval.approved) else "REJECTED"
+                new_category = str(getattr(new_eval.category, "value", "REJECT") or "REJECT")
+                new_veto_count = int(len(new_eval.vetos))
+                new_reason = str(new_eval.reason or "")
+                new_htf_aligned = bool(new_eval.htf_aligned)
+                new_zone_memory_adj = float(new_eval.zone_memory_adj)
+                if self.shadow_explain_enabled:
+                    raw_explain = explain_decision(new_eval)
+                    new_explain = raw_explain[:SHADOW_EXPLAIN_MAX_CHARS]
+                    if metrics_enabled:
+                        self._shadow_metrics["explain_calls"] += 1
+                        self._shadow_metrics["explain_chars_total"] += float(len(new_explain))
+
+                old_accept = old_decision == "ACCEPTED"
+                new_accept = bool(new_eval.approved)
+                if old_accept and new_accept:
+                    compare_status = "AGREE_ACCEPT"
+                elif (not old_accept) and (not new_accept):
+                    compare_status = "BOTH_REJECT_DIFF_REASON" if old_reason and new_reason and old_reason != new_reason else "AGREE_REJECT"
+                elif old_accept and (not new_accept):
+                    compare_status = "OLD_ACCEPT_NEW_REJECT"
+                else:
+                    compare_status = "OLD_REJECT_NEW_ACCEPT"
+        except Exception as exc:
+            error_text = str(exc)
+            compare_status = "NEW_ERROR"
+            new_decision_txt = "ERROR"
+            new_category = "ERROR"
+            new_reason = error_text[:300]
+            if metrics_enabled:
+                self._shadow_metrics["errors_eval"] += 1
+
+        if not self.shadow_persist_enabled:
+            if metrics_enabled:
+                total_ms = (time.perf_counter() - total_t0) * 1000.0
+                self._shadow_metrics["latency_calls"] += 1
+                self._shadow_metrics["latency_ms_total"] += total_ms
+                self._shadow_metrics["latency_ms_max"] = max(self._shadow_metrics["latency_ms_max"], total_ms)
+            return
+
+        try:
+            persist_t0 = time.perf_counter() if metrics_enabled else 0.0
+            get_journal().log_shadow_decision(
+                candidate_id=int(candidate_id) if candidate_id is not None else None,
+                asset=str(candidate.asset),
+                direction=str(candidate.direction),
+                strategy_origin=str(strategy_origin),
+                stage=stage,
+                cycle_id=int(self.cycle_id),
+                cycle_ops=int(self.cycle_ops),
+                cycle_wins=int(self.cycle_wins),
+                cycle_losses=int(self.cycle_losses),
+                old_decision=old_decision,
+                old_reason=old_reason,
+                old_filter=old_filter,
+                new_decision=new_decision_txt,
+                new_category=new_category,
+                new_veto_count=new_veto_count,
+                new_reason=new_reason,
+                new_explain=new_explain,
+                new_htf_aligned=new_htf_aligned,
+                new_zone_memory_adj=new_zone_memory_adj,
+                score_original=float(getattr(candidate, "score", 0.0) or 0.0),
+                payout_original=int(ctx.get("payout", getattr(candidate, "payout", 0)) or 0),
+                zone_age_min=float(getattr(candidate.zone, "age_minutes", 0.0) or 0.0),
+                pattern_name=str(getattr(candidate, "_reversal_pattern", getattr(candidate, "reversal_pattern", "none")) or "none"),
+                pattern_strength=float(getattr(candidate, "_reversal_strength", getattr(candidate, "reversal_strength", 0.0)) or 0.0),
+                context_snapshot_ts=str(ctx.get("context_snapshot_ts", "")),
+                context_hash=str(ctx.get("context_hash", "")),
+                compare_status=compare_status,
+                error_text=error_text[:500],
+            )
+            if metrics_enabled:
+                persist_ms = (time.perf_counter() - persist_t0) * 1000.0
+                self._shadow_metrics["persist_calls"] += 1
+                self._shadow_metrics["persist_ok"] += 1
+                self._shadow_metrics["persist_ms_total"] += persist_ms
+                self._shadow_metrics["persist_ms_max"] = max(self._shadow_metrics["persist_ms_max"], persist_ms)
+                if candidate_id is not None and int(candidate_id) > 0:
+                    self._shadow_metrics["link_updates"] += 1
+            if candidate_id is None:
+                log.warning(
+                    "[SHADOW-LINK-FAIL] sid=%s status=MISSING_CID asset=%s stage=%s old=%s new=%s compare=%s",
+                    self.shadow_session_id,
+                    str(candidate.asset),
+                    stage,
+                    old_decision,
+                    new_decision_txt,
+                    compare_status,
+                )
+            elif self.shadow_audit_mode:
+                log.info(
+                    "[SHADOW-LINK] sid=%s status=LINKED candidate_id=%s asset=%s stage=%s old=%s new=%s compare=%s",
+                    self.shadow_session_id,
+                    int(candidate_id),
+                    str(candidate.asset),
+                    stage,
+                    old_decision,
+                    new_decision_txt,
+                    compare_status,
+                )
+        except Exception as exc:
+            log.error(
+                "[SHADOW-LINK-FAIL] sid=%s status=PERSIST_ERROR asset=%s stage=%s error=%s",
+                self.shadow_session_id,
+                str(candidate.asset),
+                stage,
+                exc,
+            )
+            if metrics_enabled:
+                self._shadow_metrics["persist_calls"] += 1
+                self._shadow_metrics["errors_persist"] += 1
+        finally:
+            if metrics_enabled:
+                total_ms = (time.perf_counter() - total_t0) * 1000.0
+                self._shadow_metrics["latency_calls"] += 1
+                self._shadow_metrics["latency_ms_total"] += total_ms
+                self._shadow_metrics["latency_ms_max"] = max(self._shadow_metrics["latency_ms_max"], total_ms)
+
+    def _journal_phase2_rejection(
+        self,
+        candidate: CandidateEntry,
+        *,
+        filter_name: str,
+        reason: str,
+        context: dict[str, Any],
+    ) -> int:
+        decision = "REJECTED_SCORE"
+        if filter_name in {"active_operation", "session_limit"}:
+            decision = "REJECTED_LIMIT"
+        elif filter_name == "payout":
+            decision = "REJECTED_PAYOUT"
+
+        stage = str(context.get("stage", getattr(candidate, "_stage", "initial")))
+        amount = float(context.get("amount", getattr(candidate, "_amount", 0.0)) or 0.0)
+        strategy_payload = dict(context.get("strategy") or {})
+        strategy_payload["phase2_gate"] = {
+            "filter_name": filter_name,
+            "reason": reason,
+            "stage": stage,
+            "profile": str(context.get("phase2_profile", "strict")),
+            "score": float(getattr(candidate, "score", 0.0) or 0.0),
+            "payout": int(getattr(candidate, "payout", 0) or 0),
+            "direction": str(getattr(candidate, "direction", "")).lower(),
+            "asset": str(getattr(candidate, "asset", "")),
+        }
+
+        cid = 0
+        try:
+            journal = get_journal()
+            cid = int(journal.log_candidate(
+                candidate,
+                decision=decision,
+                reject_reason=f"{filter_name}: {reason}",
+                amount=amount,
+                stage=stage,
+                outcome="REJECTED",
+                strategy=strategy_payload,
+            ) or 0)
+            setattr(candidate, "_journal_cid", cid)
+            self._run_shadow_observation(
+                candidate,
+                context,
+                old_decision=decision,
+                old_reason=f"{filter_name}: {reason}",
+                old_filter=filter_name,
+                candidate_id=cid,
+                strategy_origin=str(context.get("strategy_origin", "STRAT-A")),
+            )
+        except Exception as exc:
+            log.debug("No se pudo registrar veto phase2 %s: %s", filter_name, exc)
+
+        self.stats[self._phase2_reject_stat_key(filter_name)] = self.stats.get(self._phase2_reject_stat_key(filter_name), 0) + 1
+        self.stats["skipped"] += 1
+        return cid
+
+    def _shadow_failfast_watchdog(self, elapsed_min: float) -> None:
+        if not self.shadow_mode_enabled:
+            return
+        if not self.shadow_dead_watchdog_enabled:
+            return
+        if self._shadow_dead_alerted:
+            return
+        if elapsed_min < max(0.1, float(self.shadow_dead_watchdog_minutes)):
+            return
+
+        journal = get_journal()
+        if journal._conn is None:
+            return
+
+        try:
+            row = journal._conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='shadow_decision_audit'"
+            ).fetchone()
+            table_exists = int(row[0] if row else 0)
+            shadow_rows = 0
+            if table_exists > 0:
+                row2 = journal._conn.execute("SELECT COUNT(*) FROM shadow_decision_audit").fetchone()
+                shadow_rows = int(row2[0] if row2 else 0)
+
+            if table_exists == 0 or shadow_rows <= 0:
+                self._shadow_dead_alerted = True
+                log.critical(
+                    "[SHADOW-DEAD] sid=%s elapsed_min=%.1f table_exists=%d shadow_rows=%d persist_ok=%d eval_calls=%d",
+                    self.shadow_session_id,
+                    elapsed_min,
+                    table_exists,
+                    shadow_rows,
+                    int(self._shadow_metrics.get("persist_ok", 0.0)),
+                    int(self._shadow_metrics.get("eval_calls", 0.0)),
+                )
+                if self.shadow_audit_assert_enabled:
+                    raise RuntimeError(
+                        f"[SHADOW-DEAD] sid={self.shadow_session_id} sin filas en shadow_decision_audit tras {elapsed_min:.1f} min"
+                    )
+        except Exception as exc:
+            log.error("[SHADOW-WATCHDOG-ERROR] sid=%s error=%s", self.shadow_session_id, exc)
+
+    async def _pre_validate_entry(self, candidate: CandidateEntry, context: dict[str, Any]) -> bool:
+        stage = str(context.get("stage", getattr(candidate, "_stage", "initial")))
+        phase2_profile = str(context.get("phase2_profile", "strict" if stage != "martin" else "recovery"))
+        enforce_quality = phase2_profile != "recovery"
+
+        if not getattr(candidate, "candles", None):
+            extra_candles = list(context.get("candles_5m") or self._last_asset_candles.get(candidate.asset) or [])
+            candidate.candles = extra_candles
+
+        candles_5m = list(context.get("candles_5m") or candidate.candles or self._last_asset_candles.get(candidate.asset) or [])
+        candles_1m = list(context.get("candles_1m") or [])
+        if not candidate.zone_memory:
+            self._populate_zone_memory(candidate)
+
+        if not candles_5m:
+            self._journal_phase2_rejection(
+                candidate,
+                filter_name="score",
+                reason="sin velas 5m para validar entrada",
+                context=context,
+            )
+            return False
+
+        if len(self.trades) > 0 or self._gale_order_active:
+            reason = "gale activo" if self._gale_order_active else f"trades abiertos={len(self.trades)}/{MAX_CONCURRENT_TRADES}"
+            self._journal_phase2_rejection(candidate, filter_name="active_operation", reason=reason, context=context)
+            return False
+
+        if int(self.cycle_ops) >= int(CYCLE_MAX_OPERATIONS):
+            self._journal_phase2_rejection(
+                candidate,
+                filter_name="session_limit",
+                reason=f"ciclo={int(self.cycle_ops)}/{CYCLE_MAX_OPERATIONS}",
+                context=context,
+            )
+            return False
+
+        payout_now = int(context.get("payout", getattr(candidate, "payout", 0)) or 0)
+        if payout_now < MIN_PAYOUT:
+            self._journal_phase2_rejection(
+                candidate,
+                filter_name="payout",
+                reason=f"payout={payout_now}% < mínimo {MIN_PAYOUT}%",
+                context=context,
+            )
+            return False
+
+        if enforce_quality:
+            score_threshold = max(int(self.current_score_threshold), int(ADAPTIVE_THRESHOLD_BASE), int(context.get("score_threshold", 0) or 0))
+            if float(getattr(candidate, "score", 0.0) or 0.0) < float(score_threshold):
+                self._journal_phase2_rejection(
+                    candidate,
+                    filter_name="score",
+                    reason=f"score={getattr(candidate, 'score', 0.0):.1f} < umbral {score_threshold}",
+                    context=context,
+                )
+                return False
+
+            if not candles_1m:
+                self._journal_phase2_rejection(
+                    candidate,
+                    filter_name="spike_1m",
+                    reason="velas 1m no disponibles para validar spike",
+                    context=context,
+                )
+                return False
+
+            spike_1m = detect_spike_anomaly(candles_1m or candidate.candles)
+            if spike_1m.is_anomalous and spike_1m.event is not None:
+                self._journal_phase2_rejection(
+                    candidate,
+                    filter_name="spike_1m",
+                    reason=(
+                        f"gap={spike_1m.event.gap_pct*100:.2f}% body_mult={spike_1m.event.body_mult:.2f} "
+                        f"ts={spike_1m.event.ts}"
+                    ),
+                    context=context,
+                )
+                return False
+
+            spike_5m = detect_spike_anomaly(candles_5m)
+            if spike_5m.is_anomalous and spike_5m.event is not None:
+                self._journal_phase2_rejection(
+                    candidate,
+                    filter_name="spike_5m",
+                    reason=(
+                        f"gap={spike_5m.event.gap_pct*100:.2f}% body_mult={spike_5m.event.body_mult:.2f} "
+                        f"ts={spike_5m.event.ts}"
+                    ),
+                    context=context,
+                )
+                return False
+
+            htf_scanner = getattr(self, "htf_scanner", None)
+            candles_15m: Sequence[Candle] = list(context.get("candles_15m") or [])
+            if not candles_15m and htf_scanner is not None:
+                candles_15m = htf_scanner.get_candles_15m(candidate.asset) or ()
+            if len(candles_15m) < 10:
+                self._journal_phase2_rejection(
+                    candidate,
+                    filter_name="htf_alignment",
+                    reason="HTF 15m no disponible o insuficiente",
+                    context=context,
+                )
+                return False
+
+            htf_trend = infer_h1_trend(list(candles_15m))
+            direction = str(candidate.direction).lower()
+            if (direction == "call" and htf_trend == "bearish") or (direction == "put" and htf_trend == "bullish") or htf_trend == "flat":
+                self._journal_phase2_rejection(
+                    candidate,
+                    filter_name="htf_alignment",
+                    reason=f"HTF {htf_trend} contra {direction.upper()}",
+                    context=context,
+                )
+                return False
+
+            pattern_name = str(getattr(candidate, "_reversal_pattern", getattr(candidate, "reversal_pattern", "none")) or "none")
+            pattern_confirms = bool(getattr(candidate, "_reversal_confirms", getattr(candidate, "reversal_confirms", False)))
+            if pattern_name == "none" or not pattern_confirms:
+                self._journal_phase2_rejection(
+                    candidate,
+                    filter_name="candle_pattern",
+                    reason=f"patrón no confirmado ({pattern_name}, confirms={pattern_confirms})",
+                    context=context,
+                )
+                return False
+
+            pattern_strength = float(getattr(candidate, "_reversal_strength", getattr(candidate, "reversal_strength", 0.0)) or 0.0)
+            if pattern_strength < 0.55:
+                self._journal_phase2_rejection(
+                    candidate,
+                    filter_name="candle_pattern",
+                    reason=f"fortaleza de patrón={pattern_strength:.2f} < mínimo 0.55",
+                    context=context,
+                )
+                return False
+
+            if float(candidate.zone.age_minutes) < 20.0:
+                self._journal_phase2_rejection(
+                    candidate,
+                    filter_name="zone_age",
+                    reason=f"zona={candidate.zone.age_minutes:.1f}min < 20min",
+                    context=context,
+                )
+                return False
+
+            try:
+                from zone_memory import score_zone_memory
+
+                current_price = float(candles_5m[-1].close if candles_5m else candidate.zone.midpoint)
+                zone_adj = score_zone_memory(candidate.zone_memory, candidate.direction, current_price)
+            except Exception:
+                zone_adj = 0.0
+
+            if zone_adj <= -10.0:
+                self._journal_phase2_rejection(
+                    candidate,
+                    filter_name="zone_memory",
+                    reason=f"memoria de zona bloquea entrada (ajuste={zone_adj:.1f})",
+                    context=context,
+                )
+                return False
+
+        return True
+
     async def _enter(
         self, sym: str, direction: str, amount: float,
         zone: ConsolidationZone, reason: str, stage: str,
@@ -6398,208 +7216,316 @@ class ConsolidationBot:
         duration_sec: int = DURATION_SEC,
         payout: int = MIN_PAYOUT,
         score_original: float = 0.0,
+        candidate: Optional[CandidateEntry] = None,
+        candles_1m: Optional[Sequence[Candle]] = None,
+        candles_5m: Optional[Sequence[Candle]] = None,
+        phase2_prevalidated: bool = False,
     ) -> bool:
+        phase2_candidate = candidate or CandidateEntry(
+            asset=sym,
+            payout=int(payout),
+            zone=zone,
+            direction=direction,
+            candles=list(candles_5m or self._last_asset_candles.get(sym) or []),
+            score=float(score_original or 0.0),
+        )
+        if not getattr(phase2_candidate, "_entry_mode", None):
+            setattr(phase2_candidate, "_entry_mode", stage)
+        if not getattr(phase2_candidate, "_stage", None):
+            setattr(phase2_candidate, "_stage", stage)
+        setattr(phase2_candidate, "_amount", amount)
+        setattr(phase2_candidate, "_signal_ts_1m", signal_ts)
+        setattr(phase2_candidate, "_pipeline_stage", getattr(phase2_candidate, "_pipeline_stage", "pre_enter"))
+        journal_cid = int(journal_cid or getattr(phase2_candidate, "_journal_cid", 0) or 0)
+
+        # Garantiza linkage candidate->shadow->trade incluso en rutas martin/recuperación.
+        if journal_cid <= 0 and (self.shadow_mode_enabled or stage == "martin"):
+            try:
+                journal_cid = int(
+                    get_journal().log_candidate(
+                        phase2_candidate,
+                        decision="ACCEPTED",
+                        amount=float(amount),
+                        stage=str(stage),
+                        outcome="DRY_RUN" if self.dry_run else "PENDING",
+                        strategy={
+                            **self._strategy_snapshot(),
+                            "strategy_origin": str(strategy_origin),
+                            "autolog_source": "enter_fallback",
+                        },
+                    )
+                    or 0
+                )
+                if journal_cid > 0:
+                    setattr(phase2_candidate, "_journal_cid", journal_cid)
+                    log.info(
+                        "[SHADOW-LINK] autolog candidate_id=%d sym=%s stage=%s strategy=%s",
+                        journal_cid,
+                        sym,
+                        stage,
+                        strategy_origin,
+                    )
+            except Exception as exc:
+                log.debug("[SHADOW-LINK] autolog fallback failed %s stage=%s: %s", sym, stage, exc)
+
+        if not phase2_prevalidated:
+            phase2_context = {
+                "stage": stage,
+                "amount": amount,
+                "payout": payout,
+                "score_threshold": self.current_score_threshold,
+                "phase2_profile": "recovery" if stage == "martin" else "strict",
+                "candles_1m": list(candles_1m or []),
+                "candles_5m": list(candles_5m or phase2_candidate.candles or []),
+                "strategy_origin": strategy_origin,
+            }
+            phase2_context = self._build_shadow_context(phase2_candidate, phase2_context)
+            ok = await self._pre_validate_entry(phase2_candidate, phase2_context)
+            if not ok:
+                return False
+            self._run_shadow_observation(
+                phase2_candidate,
+                phase2_context,
+                old_decision="ACCEPTED",
+                old_reason="phase2_pass",
+                old_filter="",
+                candidate_id=int(journal_cid) if int(journal_cid or 0) > 0 else None,
+                strategy_origin=strategy_origin,
+            )
+
         if stage == "martin":
             if not self._martin_session_available():
                 return False
             self.stats["martin_attempts_session"] += 1
 
-        can_enter_asset, same_asset_reason = self._can_enter_asset_now(sym, stage)
-        if not can_enter_asset:
-            self.stats["rejected_same_asset_limit"] += 1
-            if "cooldown mismo activo" in same_asset_reason:
-                self.stats["rejected_same_asset_cooldown"] += 1
-            log.info("⏭ %s: entrada bloqueada — %s", sym, same_asset_reason)
-            if journal_cid:
-                _j = get_journal()
-                if _j._conn is not None:
-                    _j._conn.execute(
-                        """UPDATE candidates
-                           SET decision='REJECTED_LIMIT',
-                               reject_reason=?,
-                               outcome='LIMIT_SKIPPED'
-                           WHERE id=?""",
-                        (same_asset_reason, journal_cid),
-                    )
-                    _j._conn.commit()
-            if black_box_candidate_id:
-                try:
-                    self.black_box.update_candidate(
-                        black_box_candidate_id,
-                        decision="REJECTED_LIMIT",
-                        reject_reason=same_asset_reason,
-                        order_result="LIMIT_SKIPPED",
-                    )
-                except Exception as exc:
-                    log.debug("Black box LEGACY-RJ limit update error %s: %s", sym, exc)
-            return False
-
-        can_enter_structure, structure_reason = self._can_enter_structure_now(sym, zone)
-        if not can_enter_structure:
-            self.stats["rejected_same_structure"] += 1
-            log.info("⏭ %s: entrada bloqueada — %s", sym, structure_reason)
-            if journal_cid:
-                _j = get_journal()
-                if _j._conn is not None:
-                    _j._conn.execute(
-                        """UPDATE candidates
-                           SET decision='REJECTED_STRUCTURE',
-                               reject_reason=?,
-                               outcome='STRUCTURE_SKIPPED'
-                           WHERE id=?""",
-                        (structure_reason, journal_cid),
-                    )
-                    _j._conn.commit()
-            if black_box_candidate_id:
-                try:
-                    self.black_box.update_candidate(
-                        black_box_candidate_id,
-                        decision="REJECTED_STRUCTURE",
-                        reject_reason=structure_reason,
-                        order_result="STRUCTURE_SKIPPED",
-                    )
-                except Exception as exc:
-                    log.debug("Black box LEGACY-RJ structure update error %s: %s", sym, exc)
-            return False
-
-        timing: Optional[EntryTimingInfo] = None
-        if stage in ("initial", "martin"):
-            timing = await self._sync_to_next_candle_open(signal_ts, asset=sym)
-        else:
-            timing = self._snapshot_current_candle_timing(asset=sym)
-
-        if journal_cid and timing is not None:
-            _j = get_journal()
-            if _j._conn is not None:
-                _j.log_entry_timing(
-                    candidate_id=journal_cid,
-                    time_since_open=timing.time_since_open_sec,
-                    secs_to_close=timing.secs_to_close_sec,
-                    duration_sec=timing.duration_sec,
-                    timing_decision=timing.decision,
+        lock_wait_started = time.perf_counter()
+        lock_hold_started: Optional[float] = None
+        if self._entry_lock.locked():
+            log.info(
+                "[ENTRY_LOCK] waiting sym=%s stage=%s strategy=%s",
+                sym,
+                stage,
+                strategy_origin,
+            )
+        try:
+            async with self._entry_lock:
+                lock_wait_ms = (time.perf_counter() - lock_wait_started) * 1000.0
+                lock_hold_started = time.perf_counter()
+                log.info(
+                    "[ENTRY_LOCK] acquired sym=%s stage=%s strategy=%s wait_ms=%.1f",
+                    sym,
+                    stage,
+                    strategy_origin,
+                    lock_wait_ms,
                 )
 
-        if stage in ("initial", "martin", "pattern_immediate"):
-            if not timing.ok:
-                if journal_cid:
-                    reject_reason = f"timing 1m inválido: lag +{timing.lag_sec:.2f}s"
+                can_enter_asset, same_asset_reason = self._can_enter_asset_now(sym, stage)
+                if not can_enter_asset:
+                    self.stats["rejected_same_asset_limit"] += 1
+                    if "cooldown mismo activo" in same_asset_reason:
+                        self.stats["rejected_same_asset_cooldown"] += 1
+                    log.info("⏭ %s: entrada bloqueada — %s", sym, same_asset_reason)
+                    if journal_cid:
+                        _j = get_journal()
+                        if _j._conn is not None:
+                            _j._conn.execute(
+                                """UPDATE candidates
+                                   SET decision='REJECTED_LIMIT',
+                                       reject_reason=?,
+                                       outcome='LIMIT_SKIPPED'
+                                   WHERE id=?""",
+                                (same_asset_reason, journal_cid),
+                            )
+                            _j._conn.commit()
+                    if black_box_candidate_id:
+                        try:
+                            self.black_box.update_candidate(
+                                black_box_candidate_id,
+                                decision="REJECTED_LIMIT",
+                                reject_reason=same_asset_reason,
+                                order_result="LIMIT_SKIPPED",
+                            )
+                        except Exception as exc:
+                            log.debug("Black box LEGACY-RJ limit update error %s: %s", sym, exc)
+                    return False
+
+                can_enter_structure, structure_reason = self._can_enter_structure_now(sym, zone)
+                if not can_enter_structure:
+                    self.stats["rejected_same_structure"] += 1
+                    log.info("⏭ %s: entrada bloqueada — %s", sym, structure_reason)
+                    if journal_cid:
+                        _j = get_journal()
+                        if _j._conn is not None:
+                            _j._conn.execute(
+                                """UPDATE candidates
+                                   SET decision='REJECTED_STRUCTURE',
+                                       reject_reason=?,
+                                       outcome='STRUCTURE_SKIPPED'
+                                   WHERE id=?""",
+                                (structure_reason, journal_cid),
+                            )
+                            _j._conn.commit()
+                    if black_box_candidate_id:
+                        try:
+                            self.black_box.update_candidate(
+                                black_box_candidate_id,
+                                decision="REJECTED_STRUCTURE",
+                                reject_reason=structure_reason,
+                                order_result="STRUCTURE_SKIPPED",
+                            )
+                        except Exception as exc:
+                            log.debug("Black box LEGACY-RJ structure update error %s: %s", sym, exc)
+                    return False
+
+                timing: Optional[EntryTimingInfo] = None
+                if stage in ("initial", "martin"):
+                    timing = await self._sync_to_next_candle_open(signal_ts, asset=sym)
+                else:
+                    timing = self._snapshot_current_candle_timing(asset=sym)
+
+                if journal_cid and timing is not None:
                     _j = get_journal()
                     if _j._conn is not None:
-                        _j._conn.execute(
-                            """UPDATE candidates
-                               SET decision='REJECTED_TIMING',
-                                   reject_reason=?,
-                                   outcome='TIMING_SKIPPED'
-                               WHERE id=?""",
-                            (reject_reason, journal_cid),
+                        _j.log_entry_timing(
+                            candidate_id=journal_cid,
+                            time_since_open=timing.time_since_open_sec,
+                            secs_to_close=timing.secs_to_close_sec,
+                            duration_sec=timing.duration_sec,
+                            timing_decision=timing.decision,
                         )
-                        _j._conn.commit()
-                if black_box_candidate_id:
-                    try:
-                        self.black_box.update_candidate(
-                            black_box_candidate_id,
-                            decision="REJECTED_TIMING",
-                            reject_reason=f"timing 1m inválido: lag +{timing.lag_sec:.2f}s",
-                            order_result="TIMING_SKIPPED",
-                        )
-                    except Exception as exc:
-                        log.debug("Black box LEGACY-RJ timing update error %s: %s", sym, exc)
-                return False
-            # Respetar duraciones explícitas del caller (p.ej. LEGACY-RJ=60s).
-            # Solo reemplazar cuando el caller viene con el default global.
-            if int(duration_sec) == int(DURATION_SEC):
-                duration_sec = timing.duration_sec
 
-        payout_now = await self._get_asset_payout(sym, payout)
-        if payout_now < MIN_PAYOUT:
-            reject_reason = (
-                f"payout actual insuficiente: {payout_now}% < mínimo {MIN_PAYOUT}%"
-            )
-            log.warning("⏭ %s: orden bloqueada — %s", sym, reject_reason)
-            if journal_cid:
-                _j = get_journal()
-                if _j._conn is not None:
-                    _j._conn.execute(
-                        """UPDATE candidates
-                           SET decision='REJECTED_PAYOUT',
-                               reject_reason=?,
-                               outcome='PAYOUT_SKIPPED'
-                           WHERE id=?""",
-                        (reject_reason, journal_cid),
+                if stage in ("initial", "martin", "pattern_immediate"):
+                    if not timing.ok:
+                        if journal_cid:
+                            reject_reason = f"timing 1m inválido: lag +{timing.lag_sec:.2f}s"
+                            _j = get_journal()
+                            if _j._conn is not None:
+                                _j._conn.execute(
+                                    """UPDATE candidates
+                                       SET decision='REJECTED_TIMING',
+                                           reject_reason=?,
+                                           outcome='TIMING_SKIPPED'
+                                       WHERE id=?""",
+                                    (reject_reason, journal_cid),
+                                )
+                                _j._conn.commit()
+                        if black_box_candidate_id:
+                            try:
+                                self.black_box.update_candidate(
+                                    black_box_candidate_id,
+                                    decision="REJECTED_TIMING",
+                                    reject_reason=f"timing 1m inválido: lag +{timing.lag_sec:.2f}s",
+                                    order_result="TIMING_SKIPPED",
+                                )
+                            except Exception as exc:
+                                log.debug("Black box LEGACY-RJ timing update error %s: %s", sym, exc)
+                        return False
+                    # Respetar duraciones explícitas del caller (p.ej. LEGACY-RJ=60s).
+                    # Solo reemplazar cuando el caller viene con el default global.
+                    if int(duration_sec) == int(DURATION_SEC):
+                        duration_sec = timing.duration_sec
+
+                payout_now = await self._get_asset_payout(sym, payout)
+                if payout_now < MIN_PAYOUT:
+                    reject_reason = (
+                        f"payout actual insuficiente: {payout_now}% < mínimo {MIN_PAYOUT}%"
                     )
-                    _j._conn.commit()
-            if black_box_candidate_id:
-                try:
-                    self.black_box.update_candidate(
-                        black_box_candidate_id,
-                        decision="REJECTED_PAYOUT",
-                        reject_reason=reject_reason,
-                        order_result="PAYOUT_SKIPPED",
-                    )
-                except Exception as exc:
-                    log.debug("Black box LEGACY-RJ payout update error %s: %s", sym, exc)
-            return False
+                    log.warning("⏭ %s: orden bloqueada — %s", sym, reject_reason)
+                    if journal_cid:
+                        _j = get_journal()
+                        if _j._conn is not None:
+                            _j._conn.execute(
+                                """UPDATE candidates
+                                   SET decision='REJECTED_PAYOUT',
+                                       reject_reason=?,
+                                       outcome='PAYOUT_SKIPPED'
+                                   WHERE id=?""",
+                                (reject_reason, journal_cid),
+                            )
+                            _j._conn.commit()
+                    if black_box_candidate_id:
+                        try:
+                            self.black_box.update_candidate(
+                                black_box_candidate_id,
+                                decision="REJECTED_PAYOUT",
+                                reject_reason=reject_reason,
+                                order_result="PAYOUT_SKIPPED",
+                            )
+                        except Exception as exc:
+                            log.debug("Black box LEGACY-RJ payout update error %s: %s", sym, exc)
+                    return False
 
-        payout = int(payout_now)
+                payout = int(payout_now)
 
-        icon = "🟢" if direction == "call" else "🔴"
-        log.info("[%s] %s ENTRADA[%s] %s  %s  $%.2f  %ds  | %s",
-                 strategy_origin, icon, stage, direction.upper(), sym, amount, duration_sec, reason)
+                icon = "🟢" if direction == "call" else "🔴"
+                log.info("[%s] %s ENTRADA[%s] %s  %s  $%.2f  %ds  | %s",
+                         strategy_origin, icon, stage, direction.upper(), sym, amount, duration_sec, reason)
 
-        ok, oid, open_price, order_ref, reject_reason, ticket_opened_at_ts, ticket_opened_at_source, ticket_close_ts = await place_order(
-            self.client,
-            sym,
-            direction,
-            amount,
-            duration_sec,
-            self.dry_run,
-            account_type=self.account_type,
-            now_ts_fn=self._broker_now_ts,
-        )
-        if not ok:
-            log.error("  ✗ Fallo al colocar orden en %s | reason=%s", sym, reject_reason)
-            # Marcar activo para skip durante 2 ciclos consecutivos.
-            self.failed_assets[sym] = 2
-            # Marcar en el journal que la orden fue rechazada por el broker
-            if journal_cid:
-                _j = get_journal()
-                if _j._conn is not None:
-                    _j._conn.execute(
-                        "UPDATE candidates SET outcome='BROKER_REJECTED', reject_reason=? WHERE id=?",
-                        (reject_reason[:500] if reject_reason else "broker_rejected", journal_cid)
-                    )
-                    _j._conn.commit()
-            if black_box_candidate_id:
-                try:
-                    self.black_box.update_candidate(
-                        black_box_candidate_id,
-                        decision="REJECTED_BROKER",
-                        reject_reason=reject_reason[:500] if reject_reason else "broker_rejected",
-                        order_result="BROKER_REJECTED",
-                    )
-                except Exception as exc:
-                    log.debug("Black box LEGACY-RJ broker reject update error %s: %s", sym, exc)
-            return False
+                ok, oid, open_price, order_ref, reject_reason, ticket_opened_at_ts, ticket_opened_at_source, ticket_close_ts = await place_order(
+                    self.client,
+                    sym,
+                    direction,
+                    amount,
+                    duration_sec,
+                    self.dry_run,
+                    account_type=self.account_type,
+                    now_ts_fn=self._broker_now_ts,
+                    reconnect_fn=self.reconnect_client,
+                )
+                if not ok:
+                    log.error("  ✗ Fallo al colocar orden en %s | reason=%s", sym, reject_reason)
+                    # Marcar activo para skip durante 2 ciclos consecutivos.
+                    self.failed_assets[sym] = 2
+                    # Marcar en el journal que la orden fue rechazada por el broker
+                    if journal_cid:
+                        _j = get_journal()
+                        if _j._conn is not None:
+                            _j._conn.execute(
+                                "UPDATE candidates SET outcome='BROKER_REJECTED', reject_reason=? WHERE id=?",
+                                (reject_reason[:500] if reject_reason else "broker_rejected", journal_cid)
+                            )
+                            _j._conn.commit()
+                    if black_box_candidate_id:
+                        try:
+                            self.black_box.update_candidate(
+                                black_box_candidate_id,
+                                decision="REJECTED_BROKER",
+                                reject_reason=reject_reason[:500] if reject_reason else "broker_rejected",
+                                order_result="BROKER_REJECTED",
+                            )
+                        except Exception as exc:
+                            log.debug("Black box LEGACY-RJ broker reject update error %s: %s", sym, exc)
+                    return False
 
-        self._register_successful_entry_asset(sym, zone)
+                self._register_successful_entry_asset(sym, zone)
 
-        black_box_order_key = oid if oid else f"REF-{order_ref}" if order_ref else "BROKER_NO_ID"
-        self.trades[sym] = TradeState(
-            asset=sym, direction=direction, amount=amount,
-            entry_price=open_price, ceiling=zone.ceiling, floor=zone.floor,
-            order_id=oid, order_ref=order_ref, stage=stage,
-            journal_id=journal_cid,
-            strategy_origin=strategy_origin,
-            duration_sec=int(duration_sec),
-            payout=int(payout),
-            score_original=float(score_original),
-            opened_at=float(ticket_opened_at_ts or time.time()),
-            opened_at_source=str(ticket_opened_at_source or "fallback:local_clock"),
-            close_ts=float(ticket_close_ts or 0.0),
-            black_box_candidate_id=int(black_box_candidate_id or 0),
-            black_box_order_key=black_box_order_key,
-        )
-        trade = self.trades[sym]
+                black_box_order_key = oid if oid else f"REF-{order_ref}" if order_ref else "BROKER_NO_ID"
+                self.trades[sym] = TradeState(
+                    asset=sym, direction=direction, amount=amount,
+                    entry_price=open_price, ceiling=zone.ceiling, floor=zone.floor,
+                    order_id=oid, order_ref=order_ref, stage=stage,
+                    journal_id=journal_cid,
+                    strategy_origin=strategy_origin,
+                    duration_sec=int(duration_sec),
+                    payout=int(payout),
+                    score_original=float(score_original),
+                    opened_at=float(ticket_opened_at_ts or time.time()),
+                    opened_at_source=str(ticket_opened_at_source or "fallback:local_clock"),
+                    close_ts=float(ticket_close_ts or 0.0),
+                    black_box_candidate_id=int(black_box_candidate_id or 0),
+                    black_box_order_key=black_box_order_key,
+                )
+                trade = self.trades[sym]
+        finally:
+            if lock_hold_started is not None:
+                lock_held_ms = (time.perf_counter() - lock_hold_started) * 1000.0
+                log.info(
+                    "[ENTRY_LOCK] released sym=%s stage=%s strategy=%s held_ms=%.1f",
+                    sym,
+                    stage,
+                    strategy_origin,
+                    lock_held_ms,
+                )
         try:
             self.hub.record_entry(
                 strategy=strategy_origin,
@@ -6752,6 +7678,66 @@ class ConsolidationBot:
                 ZONE_MIN_AGE_MIN,
                 rej_young,
             )
+        phase2_keys = [
+            ("active_operation", "activa"),
+            ("session_limit", "sesión"),
+            ("payout", "payout"),
+            ("score", "score"),
+            ("spike_1m", "spike1m"),
+            ("spike_5m", "spike5m"),
+            ("htf_alignment", "htf"),
+            ("candle_pattern", "patrón"),
+            ("zone_age", "edad_zona"),
+            ("zone_memory", "memoria"),
+        ]
+        phase2_counts = [f"{label}:{self.stats.get(f'phase2_rejected_{key}', 0)}" for key, label in phase2_keys]
+        if any(count != f"{label}:0" for (key, label), count in zip(phase2_keys, phase2_counts)):
+            log.info("📊 FASE2 | %s", "  ".join(phase2_counts))
+        if self.shadow_mode_enabled and self.shadow_runtime_metrics_enabled:
+            m = self._shadow_metrics
+            elapsed_min = max((time.perf_counter() - self._shadow_metrics_started_at) / 60.0, 1e-6)
+            self._shadow_failfast_watchdog(elapsed_min)
+            scan_avg = (m["scan_cycle_ms_total"] / m["scan_cycle_calls"]) if m["scan_cycle_calls"] > 0 else 0.0
+            eval_avg = (m["eval_ms_total"] / m["eval_calls"]) if m["eval_calls"] > 0 else 0.0
+            persist_avg = (m["persist_ms_total"] / m["persist_ok"]) if m["persist_ok"] > 0 else 0.0
+            explain_avg = (m["explain_chars_total"] / m["explain_calls"]) if m["explain_calls"] > 0 else 0.0
+            latency_avg = (m["latency_ms_total"] / m["latency_calls"]) if m["latency_calls"] > 0 else 0.0
+            rows_per_min = m["persist_ok"] / elapsed_min
+            htf_total = m["context_htf_reused"] + m["context_htf_fetched"]
+            htf_fetch_ratio = (m["context_htf_fetched"] / htf_total * 100.0) if htf_total > 0 else 0.0
+            log.info(
+                "📊 SHADOW-RUNTIME | cand:%d  scan_ms(avg/max):%.1f/%.1f  eval_ms(avg/max):%.3f/%.3f  persist_ms(avg/max):%.3f/%.3f  extra_ms(avg/max):%.3f/%.3f",
+                int(m["candidates"]),
+                scan_avg,
+                m["scan_cycle_ms_max"],
+                eval_avg,
+                m["eval_ms_max"],
+                persist_avg,
+                m["persist_ms_max"],
+                latency_avg,
+                m["latency_ms_max"],
+            )
+            log.info(
+                "📊 SHADOW-DATA | rows/min:%.2f  explain_chars(avg):%.1f  htf_fetch_ratio:%.1f%%  c5_drift:%d  cid_missing:%d  eval_err:%d  persist_err:%d  hashΔ:%d hash=: %d",
+                rows_per_min,
+                explain_avg,
+                htf_fetch_ratio,
+                int(m["context_c5_drift"]),
+                int(m["candidate_id_missing"]),
+                int(m["errors_eval"]),
+                int(m["errors_persist"]),
+                int(m["context_hash_changed"]),
+                int(m["context_hash_unchanged"]),
+            )
+            log.info(
+                "📊 SHADOW-COUNTERS | sid=%s evaluated=%d persisted=%d linked=%d resolved=%d cid_missing=%d",
+                self.shadow_session_id,
+                int(m["candidates"]),
+                int(m["persist_ok"]),
+                int(m["link_updates"]),
+                int(m["resolved_updates"]),
+                int(m["candidate_id_missing"]),
+            )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -6824,29 +7810,6 @@ def seconds_until_next_scan(
     return max(5.0, SCAN_INTERVAL_SEC)
 
 
-async def connect_with_retry(client: Quotex) -> Tuple[bool, str]:
-    """Conecta con backoff especial para bloqueos transitorios 403/Cloudflare."""
-    reason = ""
-    for attempt in range(1, CONNECT_RETRIES + 1):
-        ok, reason = await client.connect()
-        if ok:
-            return True, ""
-
-        reason_txt = str(reason)
-        if "403" in reason_txt or "cloudflare" in reason_txt.lower() or "cf-mitigated" in reason_txt.lower():
-            log.warning(
-                "☁️ Challenge 403 detectado (%d/%d). Esperando %.1fs antes de reintentar.",
-                attempt,
-                CONNECT_RETRIES,
-                CF_403_BACKOFF_SEC,
-            )
-            _clear_quotex_session(client)
-            await asyncio.sleep(CF_403_BACKOFF_SEC)
-        else:
-            await asyncio.sleep(1.5)
-    return False, str(reason)
-
-
 async def main(
     dry_run: bool,
     real_account: bool,
@@ -6858,7 +7821,13 @@ async def main(
     if not EMAIL or not PASSWORD:
         raise RuntimeError("Falta QUOTEX_EMAIL / QUOTEX_PASSWORD en el .env")
 
-    client = Quotex(email=EMAIL, password=PASSWORD)
+    account_type = "REAL" if real_account else "PRACTICE"
+    bot = ConsolidationBot(
+        client=create_client(),
+        dry_run=dry_run,
+        account_type=account_type,
+        greylist_assets=greylist_assets,
+    )
 
     log.info("╔══════════════════════════════════════════════╗")
     log.info("║      CONSOLIDATION BOT — Quotex              ║")
@@ -6870,31 +7839,40 @@ async def main(
     log.info("║  Payout  : %d%%  |  Vol filtro: %.1fx avg body ║",
              MIN_PAYOUT, VOLUME_MULTIPLIER)
     log.info("╚══════════════════════════════════════════════╝")
+    log.info(
+        "[SHADOW-FLAGS] sid=%s mode=%s new_engine=%s persist=%s explain=%s runtime_metrics=%s audit_mode=%s watchdog=%s assert=%s",
+        bot.shadow_session_id,
+        "ON" if bot.shadow_mode_enabled else "OFF",
+        "ON" if bot.shadow_new_engine_enabled else "OFF",
+        "ON" if bot.shadow_persist_enabled else "OFF",
+        "ON" if bot.shadow_explain_enabled else "OFF",
+        "ON" if bot.shadow_runtime_metrics_enabled else "OFF",
+        "ON" if bot.shadow_audit_mode else "OFF",
+        f"ON({bot.shadow_dead_watchdog_minutes:.1f}m)" if bot.shadow_dead_watchdog_enabled else "OFF",
+        "ON" if bot.shadow_audit_assert_enabled else "OFF",
+    )
+    if bot.shadow_mode_enabled:
+        log.warning(
+            "[SHADOW-FLAGS] sid=%s mode=ON persist=%s runtime=%s explain=%s",
+            bot.shadow_session_id,
+            "ON" if bot.shadow_persist_enabled else "OFF",
+            "ON" if bot.shadow_runtime_metrics_enabled else "OFF",
+            "ON" if bot.shadow_explain_enabled else "OFF",
+        )
+    else:
+        log.error("[SHADOW DISABLED] sid=%s mode=OFF", bot.shadow_session_id)
 
-    # Conexión con reintentos + backoff especial para Cloudflare 403.
-    check, reason = await connect_with_retry(client)
-    
-    if not check:
-        log.critical("No se pudo conectar a Quotex: %s", reason)
-        raise RuntimeError(f"No se pudo conectar a Quotex: {reason}")
-
-    account_type = "REAL" if real_account else "PRACTICE"
-    await client.change_account(account_type)
+    if not await bot.reconnect_client(reason="startup"):
+        log.critical("No se pudo conectar a Quotex en startup")
+        raise RuntimeError("No se pudo conectar a Quotex en startup")
 
     start_balance: Optional[float] = None
     try:
-        bal = await client.get_balance()
+        bal = await bot.client.get_balance()
         start_balance = float(bal)
         log.info("✅ Conectado | Balance %s: %.2f USD", account_type, bal)
     except Exception as exc:
         log.warning("No se pudo leer balance: %s", exc)
-
-    bot = ConsolidationBot(
-        client=client,
-        dry_run=dry_run,
-        account_type=account_type,
-        greylist_assets=greylist_assets,
-    )
     if start_balance is not None:
         bot.set_session_start_balance(start_balance)
 
@@ -6910,11 +7888,30 @@ async def main(
     # Reconciliar pendientes históricos al arrancar para limpiar métricas.
     await bot.reconcile_pending_candidates()
 
-    # Ticker dedicado LEGACY-RJ: evalúa la ventana s30-41 de forma independiente al scan principal.
-    # Se inicia siempre — el ticker verifica LEGACY_RJ_CAN_TRADE internamente y es un no-op si False.
-    _LEGACY_RJ_ticker_task = asyncio.create_task(
-        bot._LEGACY_RJ_window_ticker(), name="LEGACY_RJ_window_ticker"
-    )
+    # Ticker dedicado LEGACY-RJ: solo se crea si la estrategia está habilitada.
+    _LEGACY_RJ_ticker_task: Optional[asyncio.Task[Any]] = None
+    if LEGACY_RJ_ENABLED:
+        _LEGACY_RJ_ticker_task = asyncio.create_task(
+            bot._LEGACY_RJ_window_ticker(), name="LEGACY_RJ_window_ticker"
+        )
+
+    async def _pause_legacy_rj_ticker() -> None:
+        nonlocal _LEGACY_RJ_ticker_task
+        if _LEGACY_RJ_ticker_task is None or _LEGACY_RJ_ticker_task.done():
+            return
+        _LEGACY_RJ_ticker_task.cancel()
+        await asyncio.gather(_LEGACY_RJ_ticker_task, return_exceptions=True)
+
+    def _resume_legacy_rj_ticker() -> None:
+        nonlocal _LEGACY_RJ_ticker_task
+        if not LEGACY_RJ_ENABLED:
+            return
+        if _LEGACY_RJ_ticker_task is None or _LEGACY_RJ_ticker_task.done():
+            _LEGACY_RJ_ticker_task = asyncio.create_task(
+                bot._LEGACY_RJ_window_ticker(), name="LEGACY_RJ_window_ticker"
+            )
+
+    bot.register_lifecycle_consumer(_pause_legacy_rj_ticker, _resume_legacy_rj_ticker)
 
     try:
         # Alinear también el PRIMER escaneo al reloj de vela para evitar señales
@@ -6930,29 +7927,39 @@ async def main(
 
         connection_ok = True
         cycles_without_scan = 0
-        print("[DEBUG-MAIN] ★★★ ENTERING MAIN WHILE LOOP ★★★", flush=True)
+        def runtime_debug(message: str, *args: object) -> None:
+            if DEBUG_SCAN:
+                log.debug(message, *args)
+
+        runtime_debug("[DEBUG-MAIN] ★★★ ENTERING MAIN WHILE LOOP ★★★")
         while True:
             cycle_start = time.time()
             broker_now = datetime.fromtimestamp(time.time(), tz=BROKER_TZ)
             log.info("── %s %s ──", broker_now.strftime("%H:%M:%S"), BROKER_TZ_LABEL)
 
             try:
-                print(f"[DEBUG-MAIN] Start of try block, cycles_without_scan={cycles_without_scan}", flush=True)
+                runtime_debug("[DEBUG-MAIN] Start of try block, cycles_without_scan=%d", cycles_without_scan)
                 # Validar conexión, pero no frenar el PRIMER ciclo de escaneo.
                 if loop_forever and cycles_without_scan > 0:
-                    print(f"[DEBUG-CONN] Validando conexión (ciclo #{cycles_without_scan})...", flush=True)
+                    runtime_debug("[DEBUG-CONN] Validando conexión (ciclo #%d)...", cycles_without_scan)
                     log.debug("⏳ Validando conexión (ciclo #%d)...", cycles_without_scan)
                     connection_ok = await bot.ensure_connection()
                     if not connection_ok:
-                        print(f"[DEBUG-CONN] Conexión fallida, durmiendo...", flush=True)
+                        runtime_debug("[DEBUG-CONN] Conexión fallida, durmiendo...")
                         log.warning("⚠ Sin conexión estable, reintentando en 5s...")
                         await asyncio.sleep(5.0)
                         continue
                 
-                print(f"[DEBUG-SCAN] Iniciando scan_all()...", flush=True)
+                runtime_debug("[DEBUG-SCAN] Iniciando scan_all()...")
                 log.debug("🔍 Iniciando scan_all()...")
+                scan_t0 = time.perf_counter()
                 await bot.scan_all()
-                print(f"[DEBUG-SCAN] scan_all() completó", flush=True)
+                if bot.shadow_mode_enabled and bot.shadow_runtime_metrics_enabled:
+                    scan_ms = (time.perf_counter() - scan_t0) * 1000.0
+                    bot._shadow_metrics["scan_cycle_calls"] += 1
+                    bot._shadow_metrics["scan_cycle_ms_total"] += scan_ms
+                    bot._shadow_metrics["scan_cycle_ms_max"] = max(bot._shadow_metrics["scan_cycle_ms_max"], scan_ms)
+                runtime_debug("[DEBUG-SCAN] scan_all() completó")
                 log.debug("✅ scan_all() completó exitosamente")
                 cycles_without_scan = 0
                 await bot.reconcile_pending_candidates(max_age_minutes=PENDING_RECONCILE_AGE_MIN)
@@ -6970,7 +7977,7 @@ async def main(
                 cycles_without_scan += 1
                 if looks_like_connection_issue(str(exc)):
                     log.warning("⚠ Error de conexión en ciclo; intentando reconectar inmediatamente...")
-                    if not await bot.ensure_connection():
+                    if not await bot.reconnect_client(reason=f"loop_exception:{type(exc).__name__}"):
                         log.warning("⚠ Reconexión inmediata fallida; se reintentará en el siguiente ciclo.")
 
             bot.log_stats()
@@ -7011,19 +8018,17 @@ async def main(
     except KeyboardInterrupt:
         log.info("Detenido por el usuario (Ctrl+C).")
     finally:
-        _LEGACY_RJ_ticker_task.cancel()
-        try:
-            await asyncio.wait_for(asyncio.shield(_LEGACY_RJ_ticker_task), timeout=1.0)
-        except Exception:
-            pass
+        if _LEGACY_RJ_ticker_task is not None:
+            _LEGACY_RJ_ticker_task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(_LEGACY_RJ_ticker_task), timeout=1.0)
+            except Exception:
+                pass
         try:
             await asyncio.wait_for(bot.shutdown_background_tasks(), timeout=3.0)
         except Exception:
             pass
-        try:
-            await asyncio.wait_for(client.close(), timeout=3.0)
-        except Exception:
-            pass
+        await bot.close_client(reason="main:finally")
         log.info("Bot detenido.")
         return bot
 
