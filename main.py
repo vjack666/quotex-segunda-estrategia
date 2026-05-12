@@ -118,6 +118,102 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = str(os.environ.get(name, "")).strip()
+    if not raw:
+        return int(default)
+    try:
+        return int(raw)
+    except Exception:
+        return int(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = str(os.environ.get(name, "")).strip()
+    if not raw:
+        return float(default)
+    try:
+        return float(raw)
+    except Exception:
+        return float(default)
+
+
+def _apply_shadow_relaxed_validation(cb) -> dict:
+    """Aplica relajación temporal para validar pipeline, no edge."""
+    ultra_enabled = _env_flag("SHADOW_ULTRA_RELAXED_VALIDATION", False)
+    enabled = _env_flag("SHADOW_RELAXED_VALIDATION", False) or ultra_enabled
+    mode = "ultra" if ultra_enabled else "relaxed"
+    profile = {
+        "enabled": bool(enabled),
+        "mode": mode,
+        "min_payout": None,
+        "adaptive_base": None,
+        "adaptive_low": None,
+        "adaptive_high": None,
+        "rebound_min_strength_call": None,
+        "rebound_min_strength_put": None,
+        "pattern_direct_trigger_min_payout": None,
+        "cooldown_between_entries": None,
+        "same_asset_reentry_cooldown_sec": None,
+        "rejection_entry_window_enabled": None,
+        "near_entry_tolerance_pct": None,
+        "breakout_chase_max_pct": None,
+    }
+    if not enabled:
+        return profile
+
+    min_payout = max(60, min(95, _env_int("SHADOW_RELAXED_MIN_PAYOUT", 75)))
+    default_base = 25 if ultra_enabled else 45
+    default_low = 20 if ultra_enabled else 43
+    default_high = 30 if ultra_enabled else 48
+    adaptive_base = max(10, min(90, _env_int("SHADOW_RELAXED_ADAPTIVE_BASE", default_base)))
+    adaptive_low = max(10, min(90, _env_int("SHADOW_RELAXED_ADAPTIVE_LOW", default_low)))
+    adaptive_high = max(10, min(90, _env_int("SHADOW_RELAXED_ADAPTIVE_HIGH", default_high)))
+    strength_call = max(0.0, min(1.0, _env_float("SHADOW_RELAXED_REBOUND_MIN_STRENGTH_CALL", 0.35)))
+    strength_put = max(0.0, min(1.0, _env_float("SHADOW_RELAXED_REBOUND_MIN_STRENGTH_PUT", 0.40)))
+    pattern_min_payout = max(60, min(95, _env_int("SHADOW_RELAXED_PATTERN_MIN_PAYOUT", 70)))
+    cooldown_entries = max(0.0, min(60.0, _env_float("SHADOW_RELAXED_COOLDOWN_BETWEEN_ENTRIES", 3.0)))
+    same_asset_cd = max(0.0, min(300.0, _env_float("SHADOW_RELAXED_SAME_ASSET_CD_SEC", 5.0)))
+    rejection_window_enabled = _env_flag("SHADOW_RELAXED_REJECTION_WINDOW_ENABLED", False)
+    near_default = 0.0030 if ultra_enabled else 0.0025
+    breakout_default = 0.0025 if ultra_enabled else 0.0012
+    near_entry_tolerance = max(0.0001, min(0.02, _env_float("SHADOW_RELAXED_HUB_NEAR_ENTRY_TOLERANCE_PCT", near_default)))
+    breakout_chase_max = max(0.0001, min(0.02, _env_float("SHADOW_RELAXED_HUB_BREAKOUT_CHASE_MAX_PCT", breakout_default)))
+
+    cb.MIN_PAYOUT = int(min_payout)
+    cb.ADAPTIVE_THRESHOLD_BASE = int(adaptive_base)
+    cb.ADAPTIVE_THRESHOLD_LOW = int(adaptive_low)
+    cb.ADAPTIVE_THRESHOLD_HIGH = int(adaptive_high)
+    cb.current_score_threshold = int(adaptive_base)
+    cb.REBOUND_MIN_STRENGTH_CALL = float(strength_call)
+    cb.REBOUND_MIN_STRENGTH_PUT = float(strength_put)
+    cb.PATTERN_DIRECT_TRIGGER_MIN_PAYOUT = int(pattern_min_payout)
+    cb.COOLDOWN_BETWEEN_ENTRIES = float(cooldown_entries)
+    cb.SAME_ASSET_REENTRY_COOLDOWN_SEC = float(same_asset_cd)
+    cb.REJECTION_ENTRY_WINDOW_ENABLED = bool(rejection_window_enabled)
+    cb.HUB_NEAR_ENTRY_TOLERANCE_PCT = float(near_entry_tolerance)
+    cb.HUB_BREAKOUT_CHASE_MAX_PCT = float(breakout_chase_max)
+
+    profile.update(
+        {
+            "mode": mode,
+            "min_payout": int(min_payout),
+            "adaptive_base": int(adaptive_base),
+            "adaptive_low": int(adaptive_low),
+            "adaptive_high": int(adaptive_high),
+            "rebound_min_strength_call": float(strength_call),
+            "rebound_min_strength_put": float(strength_put),
+            "pattern_direct_trigger_min_payout": int(pattern_min_payout),
+            "cooldown_between_entries": float(cooldown_entries),
+            "same_asset_reentry_cooldown_sec": float(same_asset_cd),
+            "rejection_entry_window_enabled": bool(rejection_window_enabled),
+            "near_entry_tolerance_pct": float(near_entry_tolerance),
+            "breakout_chase_max_pct": float(breakout_chase_max),
+        }
+    )
+    return profile
+
+
 def _make_shadow_session_id() -> str:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     return f"{ts}_{uuid4().hex[:8]}"
@@ -203,6 +299,7 @@ def _build_runtime_config_snapshot(args: argparse.Namespace, cb, session_id: str
             "watchdog_enabled": bool(getattr(cb, "SHADOW_DEAD_WATCHDOG_ENABLED", False)),
             "watchdog_minutes": float(getattr(cb, "SHADOW_DEAD_WATCHDOG_MINUTES", 5.0)),
         },
+        "shadow_relaxed_validation": dict(getattr(cb, "SHADOW_RELAXED_PROFILE", {"enabled": False})),
     }
 
 
@@ -937,6 +1034,7 @@ async def _run(args: argparse.Namespace) -> None:
     os.chdir(_orig_cwd)
 
     _apply_runtime_config(args)
+    setattr(cb, "SHADOW_RELAXED_PROFILE", _apply_shadow_relaxed_validation(cb))
 
     # Hard assert de shadow para sesiones de auditoría (opcional por env).
     if bool(getattr(cb, "SHADOW_AUDIT_ASSERT_ENABLED", False)):
@@ -957,6 +1055,25 @@ async def _run(args: argparse.Namespace) -> None:
             "ON" if bool(getattr(cb, "SHADOW_AUDIT_MODE", False)) else "OFF",
             "ON" if bool(getattr(cb, "SHADOW_AUDIT_ASSERT_ENABLED", False)) else "OFF",
         )
+        if bool(getattr(cb, "SHADOW_RELAXED_PROFILE", {}).get("enabled", False)):
+            rp = dict(getattr(cb, "SHADOW_RELAXED_PROFILE", {}))
+            cb.log.warning(
+                "[SHADOW-RELAXED] sid=%s mode=%s min_payout=%s thr=%s/%s/%s strength_call=%.2f strength_put=%.2f pattern_min_payout=%s cooldown=%.1fs same_asset_cd=%.1fs near=%.4f%% breakout_chase=%.4f%% rejection_window=%s",
+                shadow_session_id,
+                rp.get("mode", "relaxed"),
+                rp.get("min_payout"),
+                rp.get("adaptive_base"),
+                rp.get("adaptive_low"),
+                rp.get("adaptive_high"),
+                float(rp.get("rebound_min_strength_call") or 0.0),
+                float(rp.get("rebound_min_strength_put") or 0.0),
+                rp.get("pattern_direct_trigger_min_payout"),
+                float(rp.get("cooldown_between_entries") or 0.0),
+                float(rp.get("same_asset_reentry_cooldown_sec") or 0.0),
+                100.0 * float(rp.get("near_entry_tolerance_pct") or 0.0),
+                100.0 * float(rp.get("breakout_chase_max_pct") or 0.0),
+                "ON" if bool(rp.get("rejection_entry_window_enabled", False)) else "OFF",
+            )
     else:
         cb.log.error("[SHADOW DISABLED] sid=%s mode=OFF", shadow_session_id)
 

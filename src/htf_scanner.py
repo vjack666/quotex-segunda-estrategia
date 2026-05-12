@@ -236,7 +236,7 @@ class HTFScanner:
             except (IndexError, TypeError, ValueError):
                 continue
 
-            if sym.endswith("_otc") and is_open and payout > self._min_payout:
+            if sym.lower().endswith("_otc") and is_open and payout > self._min_payout:
                 result.append((sym, payout))
 
         result.sort(key=lambda x: -x[1])

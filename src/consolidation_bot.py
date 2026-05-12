@@ -83,6 +83,7 @@ from black_box_recorder import get_black_box
 from martingale_calculator import MartingaleCalculator
 from src.masaniello_engine import MasanielloEngine, MasanielloConfig
 from src.vip_library import VipLibraryManager
+from src.candle_fetcher_observable import ObservableCandleFetcher
 from hub.hub_scanner import HubScanner
 from hub.hub_models import CandidateData
 
@@ -227,7 +228,7 @@ MAX_LOSS_SESSION         = 0.20  # detener sesión si drawdown alcanza 20%
 ENABLE_SESSION_STOP_LOSS = False  # entrenamiento: no frenar por drawdown
 
 # Filtro "cerca de disparo" para HUB/ejecución.
-HUB_NEAR_ENTRY_TOLERANCE_PCT = 0.0010  # 0.10% alrededor de piso/techo de zona
+HUB_NEAR_ENTRY_TOLERANCE_PCT = 0.0010  # 0.10% máximo para rebotes (perfil relaxed puede sobrescribir en runtime)
 HUB_BREAKOUT_CHASE_MAX_PCT   = 0.0008  # 0.08% máximo permitido tras ruptura
 
 # Ciclo matemático de gestión (estilo Masaniello simplificado)
@@ -352,6 +353,15 @@ MAX_BREAKOUT_OVEREXTENSION_PCT = 0.0012  # 0.12%
 MA_FLAT_DELTA_PCT = 0.0005
 DRY_RUN_VERBOSE = True
 DEBUG_SCAN = os.environ.get("DEBUG_SCAN", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+# ── MODO PIPELINE VALIDATOR ──────────────────────────────────────────────────
+# Desactiva TODOS los filtros de calidad para validar el ciclo completo:
+#   SCAN → CANDIDATO → SCORE → SIGNAL → EXECUTE → RESULT → LOG → CLOSE
+# NO es para trading real. Úsalo para comprobar que el pipeline funciona.
+# Activar: $env:PIPELINE_VALIDATOR='true'
+PIPELINE_VALIDATOR = os.environ.get("PIPELINE_VALIDATOR", "false").strip().lower() in {"1", "true", "yes", "on"}
+PV_ASSETS = ["EURUSD_otc", "GBPUSD_otc", "USDJPY_otc"]  # activos fijos para PV mode
+PV_AMOUNT = 1.01  # monto mínimo para PV ($1.01 > mínimo broker)
 SHADOW_MODE_ENABLED = os.environ.get("SHADOW_MODE_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 SHADOW_NEW_ENGINE_ENABLED = os.environ.get("SHADOW_NEW_ENGINE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 SHADOW_PERSIST_ENABLED = os.environ.get("SHADOW_PERSIST_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
@@ -887,7 +897,7 @@ async def get_open_assets(client: Quotex, min_payout: int = MIN_PAYOUT) -> List[
         except (IndexError, TypeError, ValueError):
             continue
         # Escaneo conservador: solo activos con payout estrictamente mayor al mínimo.
-        if sym.endswith("_otc") and is_open and payout > min_payout:
+        if sym.lower().endswith("_otc") and is_open and payout > min_payout:
             result.append((sym, payout))
 
     result.sort(key=lambda x: -x[1])
@@ -1070,6 +1080,228 @@ async def place_order(
             "aunque aparezca como open.", asset,
         )
 
+    BUY_TIMEOUT_SEC = 8.0
+    BUY_RETRY_SLEEP_SEC = 1.2
+
+    def _reset_ws_mutex_flags() -> None:
+        try:
+            _api = client.api
+            if _api is not None:
+                _api.state.ssl_Mutual_exclusion = False
+                _api.state.ssl_Mutual_exclusion_write = False
+        except Exception:
+            pass
+
+    def _extract_from_payload(payload: Any) -> Tuple[str, int, float, bool]:
+        oid = ""
+        order_ref = 0
+        open_price = 0.0
+        has_identifier = False
+
+        if isinstance(payload, dict):
+            for key in ("id", "order_id", "deal_id", "position_id", "ticket", "openOrderId"):
+                raw = payload.get(key)
+                if raw is not None:
+                    txt = str(raw).strip()
+                    if txt:
+                        oid = txt
+                        has_identifier = True
+                        break
+
+            if not has_identifier:
+                for key in ("id_number", "idNumber", "openOrderId", "ticket"):
+                    raw = payload.get(key)
+                    try:
+                        if raw is not None:
+                            order_ref = int(raw)
+                            has_identifier = order_ref > 0
+                            if has_identifier:
+                                break
+                    except (TypeError, ValueError):
+                        continue
+
+            for key in ("openPrice", "open_price", "price", "entry_price"):
+                raw_price = payload.get(key)
+                if raw_price is not None:
+                    try:
+                        open_price = float(raw_price)
+                        break
+                    except (TypeError, ValueError):
+                        continue
+
+            open_flag = payload.get("open")
+            if isinstance(open_flag, bool) and open_flag:
+                has_identifier = True
+
+        elif isinstance(payload, (int, float)):
+            order_ref = int(payload)
+            has_identifier = order_ref > 0
+        elif isinstance(payload, str):
+            txt = payload.strip()
+            if txt:
+                oid = txt
+                has_identifier = True
+
+        return oid, order_ref, open_price, has_identifier
+
+    def _split_buy_result(raw_result: Any) -> Tuple[Any, Any]:
+        if isinstance(raw_result, tuple):
+            if len(raw_result) >= 2:
+                return raw_result[0], raw_result[1]
+            if len(raw_result) == 1:
+                return raw_result[0], {}
+            return False, {}
+        return raw_result, raw_result
+
+    async def _connection_snapshot() -> Tuple[bool, str]:
+        try:
+            ws_alive = await asyncio.wait_for(client.check_connect(), timeout=2.5)
+        except Exception:
+            ws_alive = False
+
+        state_label = "unknown"
+        try:
+            api = getattr(client, "api", None)
+            state = getattr(api, "state", None)
+            for attr in ("connect_status", "connection_state", "status", "ready"):
+                if hasattr(state, attr):
+                    raw = getattr(state, attr)
+                    state_label = str(raw).lower()
+                    break
+            if state_label == "unknown":
+                ws_client = getattr(api, "websocket_client", None)
+                wss = getattr(ws_client, "wss", None)
+                if wss is not None:
+                    state_val = getattr(wss, "state", None)
+                    if state_val is not None:
+                        state_label = str(state_val).lower()
+        except Exception:
+            pass
+
+        return bool(ws_alive), state_label
+
+    async def _ensure_buy_ready(step_label: str) -> Tuple[bool, str]:
+        ws_alive, state_label = await _connection_snapshot()
+        if PIPELINE_VALIDATOR:
+            log.warning(
+                "[PV-BUY-CONNECTION-CHECK] step=%s ws_alive=%s state=%s",
+                step_label,
+                ws_alive,
+                state_label,
+            )
+
+        state_closed = any(k in state_label for k in ("closed", "closing", "false", "0"))
+        if ws_alive and not state_closed:
+            if PIPELINE_VALIDATOR:
+                log.warning("[PV-BUY-READY] step=%s ws_alive=%s state=%s", step_label, ws_alive, state_label)
+            return True, ""
+
+        if PIPELINE_VALIDATOR:
+            log.warning("[PV-BUY-RECONNECT] step=%s reason=socket_not_ready", step_label)
+        ok_reconnect, reconnect_reason = await _force_reconnect(step_label)
+        if not ok_reconnect:
+            return False, reconnect_reason
+
+        await asyncio.sleep(0.35)
+        ws_alive_2, state_label_2 = await _connection_snapshot()
+        if PIPELINE_VALIDATOR:
+            log.warning(
+                "[PV-BUY-READY] step=%s ws_alive=%s state=%s",
+                step_label,
+                ws_alive_2,
+                state_label_2,
+            )
+        if not ws_alive_2:
+            return False, f"not_ready_after_reconnect:{state_label_2}"
+        return True, ""
+
+    async def _attempt_buy(step_label: str) -> Tuple[bool, str, float, int, str, float, str, float]:
+        ready, ready_reason = await _ensure_buy_ready(step_label)
+        if not ready:
+            return False, "", 0.0, 0, ready_reason, 0.0, "", 0.0
+
+        await _log_pre_buy()
+        t0 = time.time()
+        try:
+            raw_result = await asyncio.wait_for(
+                client.buy(
+                    amount=amount,
+                    asset=asset,
+                    direction=direction,
+                    duration=duration,
+                ),
+                timeout=BUY_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            elapsed = time.time() - t0
+            _reset_ws_mutex_flags()
+            if PIPELINE_VALIDATOR:
+                log.warning("[PV-BUY-TIMEOUT] step=%s timeout=%.1fs elapsed=%.2fs", step_label, BUY_TIMEOUT_SEC, elapsed)
+            return False, "", 0.0, 0, f"buy_timeout_{int(BUY_TIMEOUT_SEC)}s", 0.0, "", 0.0
+        except Exception as exc:
+            elapsed = time.time() - t0
+            _reset_ws_mutex_flags()
+            reason = f"buy_exception:{exc}"
+            log.error("  Excepción en buy() elapsed=%.2fs: %s", elapsed, exc)
+            return False, "", 0.0, 0, reason, 0.0, "", 0.0
+
+        elapsed = time.time() - t0
+        status, info = _split_buy_result(raw_result)
+        if PIPELINE_VALIDATOR:
+            log.warning(
+                "[PV-BUY-RAW-RESULT] step=%s elapsed=%.2fs type=%s repr=%s",
+                step_label,
+                elapsed,
+                type(raw_result).__name__,
+                repr(raw_result),
+            )
+
+        try:
+            ticket_now = float(now_ts_fn()) if now_ts_fn is not None else time.time()
+        except Exception:
+            ticket_now = time.time()
+
+        oid, order_ref, open_price, has_identifier = _extract_from_payload(info)
+        if not has_identifier:
+            alt_oid, alt_ref, alt_open, alt_has = _extract_from_payload(status)
+            if alt_has:
+                oid, order_ref, open_price, has_identifier = alt_oid, alt_ref, alt_open, alt_has
+
+        is_positive_status = bool(status)
+        if isinstance(status, str):
+            is_positive_status = status.lower() in ("ok", "success", "win", "opened", "true")
+
+        if is_positive_status and (has_identifier or isinstance(info, dict)):
+            opened_at_ts, opened_at_source = _extract_ticket_opened_at_with_source(info if isinstance(info, dict) else {}, ticket_now)
+            close_ts, close_ts_source = _extract_ticket_close_ts_with_source(info if isinstance(info, dict) else {}, opened_at_ts, duration)
+            _offset = opened_at_ts - ticket_now
+            log.info(
+                "  ⏱ Ticket: open=%s  close=%s  offset_vs_local=%+.3fs  (src_open=%s  src_close=%s)",
+                datetime.fromtimestamp(opened_at_ts, tz=timezone.utc).strftime("%H:%M:%S.%f")[:-3],
+                datetime.fromtimestamp(close_ts, tz=timezone.utc).strftime("%H:%M:%S.%f")[:-3],
+                _offset, opened_at_source, close_ts_source,
+            )
+            return True, str(oid or ""), float(open_price or 0.0), int(order_ref or 0), "", opened_at_ts, opened_at_source, close_ts
+
+        if has_identifier:
+            opened_at_ts = float(ticket_now)
+            close_ts = opened_at_ts + float(duration)
+            return True, str(oid or ""), float(open_price or 0.0), int(order_ref or 0), "", opened_at_ts, "fallback:identifier_only", close_ts
+
+        reject_reason = "broker_rejected"
+        payload = info if info is not None else status
+        if isinstance(payload, dict):
+            reject_reason = str(
+                payload.get("message")
+                or payload.get("reason")
+                or payload.get("error")
+                or reject_reason
+            )
+        elif payload is not None:
+            reject_reason = str(payload)
+
+        return False, "", 0.0, 0, reject_reason, 0.0, "", 0.0
+
     async def _force_reconnect(step_label: str) -> Tuple[bool, str]:
         if reconnect_fn is None:
             return False, "reconnect_owner_missing"
@@ -1091,213 +1323,30 @@ async def place_order(
             asset, direction.upper(), amount, ws_alive, account_type,
         )
 
-    # ── RECONEXIÓN AGRESIVA — siempre antes de buy() ──────────────────────────
-    # No confiamos en check_connect(): aunque el socket parezca vivo,
-    # el estado de sesión con Quotex puede estar degradado.
-    ok_reconnect, reconnect_reason = await _force_reconnect("pre-orden")
-    if not ok_reconnect:
-        log.error("  Reconexión pre-orden fallida: %s", reconnect_reason)
-        return False, "", 0.0, 0, reconnect_reason, 0.0, "", 0.0
+    ok, oid, open_price, order_ref, reject_reason, ticket_opened_at_ts, ticket_opened_at_source, ticket_close_ts = await _attempt_buy("pre-orden")
+    if ok:
+        return ok, oid, open_price, order_ref, reject_reason, ticket_opened_at_ts, ticket_opened_at_source, ticket_close_ts
 
-    await _log_pre_buy()
+    if looks_like_connection_issue(reject_reason) or "timeout" in reject_reason.lower():
+        if PIPELINE_VALIDATOR:
+            log.warning("[PV-BUY-RETRY] reason=%s", reject_reason)
 
-    # ── UN SOLO INTENTO CON TIMEOUT LOCAL DE 30s ───────────────────────────────
-    t0 = time.time()
-    try:
-        status, info = await asyncio.wait_for(
-            client.buy(
-                amount=amount,
-                asset=asset,
-                direction=direction,
-                duration=duration,
-            ),
-            timeout=30.0,
-        )
-    except asyncio.TimeoutError:
-        elapsed = time.time() - t0
-        log.warning(
-            "  ⏱ buy() sin respuesta en 30s (elapsed=%.1fs) — orden posiblemente "
-            "abierta en broker. Verificar manualmente.",
-            elapsed,
-        )
-        # Pyquotex usa un busy-wait sobre ssl_Mutual_exclusion_write.
-        # Si buy() fue cancelado a mitad del websocket.send(), el flag queda
-        # en True para siempre y el próximo send congela el event loop entero.
-        # Resetear aquí garantiza que _force_reconnect() posterior pueda enviar.
-        try:
-            _api = client.api
-            if _api is not None:
-                _api.state.ssl_Mutual_exclusion = False
-                _api.state.ssl_Mutual_exclusion_write = False
-        except Exception:
-            pass
-        return False, "", 0.0, 0, "buy_timeout_30s", 0.0, "", 0.0
-    except Exception as exc:
-        elapsed = time.time() - t0
-        first_reason = f"buy_exception:{exc}"
-        log.error("  Excepción en buy() elapsed=%.2fs: %s", elapsed, exc)
-        if not looks_like_connection_issue(first_reason):
-            return False, "", 0.0, 0, first_reason, 0.0, "", 0.0
-
-        log.warning("  ↻ Falla de conexión detectada en buy(); reintentando una vez...")
-        ok_reconnect, reconnect_reason = await _force_reconnect("reintento")
+        ok_reconnect, reconnect_reason = await _force_reconnect("buy-retry")
         if not ok_reconnect:
-            log.error("  Reconexión de reintento fallida: %s", reconnect_reason)
-            return False, "", 0.0, 0, f"{first_reason} | {reconnect_reason}", 0.0, "", 0.0
-        await _log_pre_buy()
-        t0_retry = time.time()
-        try:
-            status, info = await asyncio.wait_for(
-                client.buy(
-                    amount=amount,
-                    asset=asset,
-                    direction=direction,
-                    duration=duration,
-                ),
-                timeout=30.0,
-            )
-            elapsed = time.time() - t0_retry
-        except asyncio.TimeoutError:
-            elapsed_retry = time.time() - t0_retry
-            log.warning(
-                "  ⏱ buy() reintento sin respuesta en 30s (elapsed=%.1fs)",
-                elapsed_retry,
-            )
-            try:
-                _api = client.api
-                if _api is not None:
-                    _api.state.ssl_Mutual_exclusion = False
-                    _api.state.ssl_Mutual_exclusion_write = False
-            except Exception:
-                pass
-            return False, "", 0.0, 0, "buy_timeout_30s_retry", 0.0, "", 0.0
-        except Exception as retry_exc:
-            elapsed_retry = time.time() - t0_retry
-            retry_reason = f"buy_exception_retry:{retry_exc}"
-            log.error("  Excepción en buy() reintento elapsed=%.2fs: %s", elapsed_retry, retry_exc)
-            return False, "", 0.0, 0, retry_reason, 0.0, "", 0.0
+            if PIPELINE_VALIDATOR:
+                log.warning("[PV-BUY-RETRY-FAILED] reconnect_reason=%s", reconnect_reason)
+            return False, "", 0.0, 0, reconnect_reason, 0.0, "", 0.0
 
-    elapsed = time.time() - t0
+        await asyncio.sleep(BUY_RETRY_SLEEP_SEC)
+        ok2, oid2, open_price2, order_ref2, reject_reason2, opened2, source2, close2 = await _attempt_buy("retry")
+        if ok2:
+            if PIPELINE_VALIDATOR:
+                log.warning("[PV-BUY-RETRY-SUCCESS] order_id=%s order_ref=%s", oid2, order_ref2)
+            return ok2, oid2, open_price2, order_ref2, reject_reason2, opened2, source2, close2
 
-    try:
-        _ticket_now = float(now_ts_fn()) if now_ts_fn is not None else time.time()
-    except Exception:
-        _ticket_now = time.time()
-
-    if status and isinstance(info, dict):
-        log.debug("  Respuesta broker (%.2fs): %s", elapsed, info)
-        opened_at_ts, opened_at_source = _extract_ticket_opened_at_with_source(info, _ticket_now)
-        close_ts, close_ts_source = _extract_ticket_close_ts_with_source(info, opened_at_ts, duration)
-        _offset = opened_at_ts - _ticket_now
-        log.info(
-            "  ⏱ Ticket: open=%s  close=%s  offset_vs_local=%+.3fs  (src_open=%s  src_close=%s)",
-            datetime.fromtimestamp(opened_at_ts, tz=timezone.utc).strftime("%H:%M:%S.%f")[:-3],
-            datetime.fromtimestamp(close_ts, tz=timezone.utc).strftime("%H:%M:%S.%f")[:-3],
-            _offset, opened_at_source, close_ts_source,
-        )
-        order_ref = 0
-        for key in ("id_number", "idNumber", "openOrderId", "ticket"):
-            raw_val = info.get(key)
-            try:
-                if raw_val is not None:
-                    order_ref = int(raw_val)
-                    break
-            except (TypeError, ValueError):
-                continue
-        return True, info.get("id", ""), float(info.get("openPrice", 0)), order_ref, "", opened_at_ts, opened_at_source, close_ts
-
-    log.error(
-        "  Orden rechazada por broker. status=%s info=%s elapsed=%.2fs",
-        status, info, elapsed,
-    )
-    reject_reason = "broker_rejected"
-    if isinstance(info, dict):
-        reject_reason = str(
-            info.get("message")
-            or info.get("reason")
-            or info.get("error")
-            or reject_reason
-        )
-    elif info is not None:
-        reject_reason = str(info)
-
-    if looks_like_connection_issue(reject_reason):
-        log.warning("  ↻ Rechazo de conexión detectado (%s); reintentando una vez...", reject_reason)
-        ok_reconnect, reconnect_reason = await _force_reconnect("reintento")
-        if not ok_reconnect:
-            log.error("  Reconexión de reintento fallida: %s", reconnect_reason)
-            return False, "", 0.0, 0, f"{reject_reason} | {reconnect_reason}", 0.0, "", 0.0
-
-        await _log_pre_buy()
-        t0_retry = time.time()
-        try:
-            status_retry, info_retry = await asyncio.wait_for(
-                client.buy(
-                    amount=amount,
-                    asset=asset,
-                    direction=direction,
-                    duration=duration,
-                ),
-                timeout=30.0,
-            )
-        except asyncio.TimeoutError:
-            elapsed_retry = time.time() - t0_retry
-            log.warning(
-                "  ⏱ buy() reintento sin respuesta en 30s (elapsed=%.1fs)",
-                elapsed_retry,
-            )
-            try:
-                _api = client.api
-                if _api is not None:
-                    _api.state.ssl_Mutual_exclusion = False
-                    _api.state.ssl_Mutual_exclusion_write = False
-            except Exception:
-                pass
-            return False, "", 0.0, 0, "buy_timeout_30s_retry", 0.0, "", 0.0
-        except Exception as retry_exc:
-            elapsed_retry = time.time() - t0_retry
-            retry_reason = f"buy_exception_retry:{retry_exc}"
-            log.error("  Excepción en buy() reintento elapsed=%.2fs: %s", elapsed_retry, retry_exc)
-            return False, "", 0.0, 0, retry_reason, 0.0, "", 0.0
-
-        elapsed_retry = time.time() - t0_retry
-        if status_retry and isinstance(info_retry, dict):
-            log.info("  ✅ Reintento exitoso en broker (%.2fs)", elapsed_retry)
-            try:
-                _ticket_now_retry = float(now_ts_fn()) if now_ts_fn is not None else time.time()
-            except Exception:
-                _ticket_now_retry = time.time()
-            opened_at_ts, opened_at_source = _extract_ticket_opened_at_with_source(info_retry, _ticket_now_retry)
-            close_ts, close_ts_source = _extract_ticket_close_ts_with_source(info_retry, opened_at_ts, duration)
-            _offset = opened_at_ts - _ticket_now_retry
-            log.info(
-                "  ⏱ Ticket: open=%s  close=%s  offset_vs_local=%+.3fs  (src_open=%s  src_close=%s)",
-                datetime.fromtimestamp(opened_at_ts, tz=timezone.utc).strftime("%H:%M:%S.%f")[:-3],
-                datetime.fromtimestamp(close_ts, tz=timezone.utc).strftime("%H:%M:%S.%f")[:-3],
-                _offset, opened_at_source, close_ts_source,
-            )
-            order_ref = 0
-            for key in ("id_number", "idNumber", "openOrderId", "ticket"):
-                raw_val = info_retry.get(key)
-                try:
-                    if raw_val is not None:
-                        order_ref = int(raw_val)
-                        break
-                except (TypeError, ValueError):
-                    continue
-            return True, info_retry.get("id", ""), float(info_retry.get("openPrice", 0)), order_ref, "", opened_at_ts, opened_at_source, close_ts
-
-        retry_reason = "broker_rejected_retry"
-        if isinstance(info_retry, dict):
-            retry_reason = str(
-                info_retry.get("message")
-                or info_retry.get("reason")
-                or info_retry.get("error")
-                or retry_reason
-            )
-        elif info_retry is not None:
-            retry_reason = str(info_retry)
-        return False, "", 0.0, 0, retry_reason, 0.0, "", 0.0
+        if PIPELINE_VALIDATOR:
+            log.warning("[PV-BUY-RETRY-FAILED] reason=%s", reject_reason2)
+        return False, "", 0.0, 0, reject_reason2, 0.0, "", 0.0
 
     return False, "", 0.0, 0, reject_reason, 0.0, "", 0.0
 
@@ -1356,6 +1405,10 @@ class ConsolidationBot:
             "phase2_rejected_candle_pattern": 0,
             "phase2_rejected_zone_age": 0,
             "phase2_rejected_zone_memory": 0,
+            "audit_phase2_spike_1m_bypass": 0,
+            "audit_select_best": 0,
+            "audit_timing_window_rejected": 0,
+            "audit_pre_validate_passed": 0,
         }
         # Estado de compensación: si la última operación cerró LOSS,
         # la próxima entrada usará monto dinámico de compensación para cubrir esa pérdida.
@@ -1446,6 +1499,8 @@ class ConsolidationBot:
         self.shadow_dead_watchdog_minutes: float = float(SHADOW_DEAD_WATCHDOG_MINUTES)
         self.shadow_session_id: str = str(SHADOW_SESSION_ID)
         self._shadow_dead_alerted: bool = False
+        self._shadow_idle_alerted: bool = False
+        self._shadow_candidate_seen: bool = False
         self._shadow_metrics_started_at: float = time.perf_counter()
         self._shadow_last_hash_by_asset: dict[str, str] = {}
         self._shadow_metrics: dict[str, float] = {
@@ -1555,6 +1610,13 @@ class ConsolidationBot:
         self._hub_balance_refresh_min_interval_sec: float = 3.0
         if greylist_assets is not None:
             self.greylist_assets = {a.strip() for a in greylist_assets if a and a.strip()}
+        
+        # ── Observable Candle Fetcher (sin cambiar fetch_candles_with_retry original) ──
+        self._candle_fetcher_observable = ObservableCandleFetcher(
+            fetch_candles_with_retry_fn=fetch_candles_with_retry,
+            max_retries_on_empty=3,
+            backoff_sec=(0.5, 1.0, 1.5),
+        )
 
     @staticmethod
     def _serialize_candles(candles: List[Candle]) -> list[dict[str, float | int]]:
@@ -3114,13 +3176,38 @@ class ConsolidationBot:
             await asyncio.sleep(MARTIN_MONITOR_INTERVAL_SEC)
 
     async def _resolve_trade_after_expiry(self, asset: str, trade: TradeState) -> None:
-        wait_sec = max(0.0, trade.duration_sec + MARTIN_RESOLVE_GRACE_SEC - (self._broker_now_ts() - trade.opened_at))
-        if wait_sec > 0:
-            if wait_sec > 1.0:
-                await sleep_with_inline_countdown(wait_sec, "Entrada sincronizada 1m")
-            else:
-                await asyncio.sleep(wait_sec)
-        await self._resolve_trade(trade, asset)
+        try:
+            wait_sec = max(0.0, trade.duration_sec + MARTIN_RESOLVE_GRACE_SEC - (self._broker_now_ts() - trade.opened_at))
+            if wait_sec > 0:
+                if wait_sec > 1.0:
+                    await sleep_with_inline_countdown(wait_sec, "Entrada sincronizada 1m")
+                else:
+                    await asyncio.sleep(wait_sec)
+            await self._resolve_trade(trade, asset)
+        finally:
+            if PIPELINE_VALIDATOR:
+                log.warning(
+                    "[PV-CLEANUP-START] asset=%s active_trades=%d cooldown_assets=%d lock=%s structure_locks=%d",
+                    asset,
+                    len(self.trades),
+                    len(self.failed_assets),
+                    self._entry_lock.locked(),
+                    len(self.structure_entry_locks),
+                )
+
+            self.pending_martin.pop(asset, None)
+            if self.trades.get(asset) is trade:
+                self.trades.pop(asset, None)
+
+            if PIPELINE_VALIDATOR:
+                log.warning(
+                    "[PV-CLEANUP-END] asset=%s active_trades=%d cooldown_assets=%d lock=%s structure_locks=%d",
+                    asset,
+                    len(self.trades),
+                    len(self.failed_assets),
+                    self._entry_lock.locked(),
+                    len(self.structure_entry_locks),
+                )
 
     async def _process_pending_martin(
         self,
@@ -4209,8 +4296,26 @@ class ConsolidationBot:
 
         if not assets:
             debug_print("[DEBUG-SCAN] 7. No assets available, returning")
-            log.warning("No se obtuvieron activos OTC disponibles.")
-            return
+            if PIPELINE_VALIDATOR:
+                assets = [(sym, 80) for sym in PV_ASSETS]
+                log.warning(
+                    "[PV-SCAN-START] PIPELINE_VALIDATOR activado — %d activos fijos: %s",
+                    len(assets), [s for s, _ in assets],
+                )
+            else:
+                log.warning("No se obtuvieron activos OTC disponibles.")
+                return
+
+        # ── PIPELINE VALIDATOR: override activos a lista fija ─────────────────
+        if PIPELINE_VALIDATOR:
+            _pv_available = [(sym, payout) for sym, payout in assets if sym in PV_ASSETS]
+            if not _pv_available:
+                _pv_available = [(sym, 80) for sym in PV_ASSETS]
+            assets = _pv_available
+            log.warning(
+                "[PV-SCAN-START] PIPELINE_VALIDATOR activado — %d activos fijos: %s",
+                len(assets), [s for s, _ in assets],
+            )
 
         debug_print("[DEBUG-SCAN] 8. Got %d assets, continuing..." % len(assets))
 
@@ -4305,13 +4410,16 @@ class ConsolidationBot:
         async def _fetch_5m_limited(symbol: str) -> List[Candle]:
             try:
                 async with fetch_sem:
-                    return await fetch_candles_with_retry(
+                    # Usar fetcher observable con retry para empty arrays
+                    result = await self._candle_fetcher_observable.fetch_with_observability(
                         self.client,
                         symbol,
                         TF_5M,
                         CANDLES_LOOKBACK,
                         timeout_sec=CANDLE_FETCH_TIMEOUT_SEC,
+                        retries=FETCH_RETRIES,
                     )
+                    return result.candles
             except (KeyboardInterrupt, asyncio.CancelledError):
                 raise asyncio.CancelledError()
             except Exception as exc:
@@ -4321,7 +4429,8 @@ class ConsolidationBot:
         async def _fetch_1m_limited(symbol: str) -> List[Candle]:
             try:
                 async with fetch_sem:
-                    result = await fetch_candles_with_retry(
+                    # Usar fetcher observable con retry para empty arrays
+                    result = await self._candle_fetcher_observable.fetch_with_observability(
                         self.client,
                         symbol,
                         60,
@@ -4329,12 +4438,13 @@ class ConsolidationBot:
                         timeout_sec=CANDLE_FETCH_1M_TIMEOUT_SEC,
                         retries=1,
                     )
-                    if len(result) < 20:
+                    candles = result.candles
+                    if len(candles) < 20:
                         log.debug(
                             "STRAT-B DEBUG: %s devolvió %d velas 1m (mínimo=20, timeout=%.0fs)",
-                            symbol, len(result), CANDLE_FETCH_1M_TIMEOUT_SEC,
+                            symbol, len(candles), CANDLE_FETCH_1M_TIMEOUT_SEC,
                         )
-                    return result
+                    return candles
             except (KeyboardInterrupt, asyncio.CancelledError):
                 raise asyncio.CancelledError()
             except Exception as exc:
@@ -4344,13 +4454,16 @@ class ConsolidationBot:
         async def _fetch_h1_limited(symbol: str) -> List[Candle]:
             try:
                 async with h1_fetch_sem:
-                    return await fetch_candles_with_retry(
+                    # Usar fetcher observable con retry para empty arrays
+                    result = await self._candle_fetcher_observable.fetch_with_observability(
                         self.client,
                         symbol,
                         H1_TF_SEC,
                         H1_CANDLES_LOOKBACK,
                         timeout_sec=H1_FETCH_TIMEOUT_SEC,
+                        retries=FETCH_RETRIES,
                     )
+                    return result.candles
             except (KeyboardInterrupt, asyncio.CancelledError):
                 raise asyncio.CancelledError()
             except Exception as exc:
@@ -4360,7 +4473,8 @@ class ConsolidationBot:
         async def _fetch_ob_limited(symbol: str) -> List[Candle]:
             try:
                 async with ob_fetch_sem:
-                    return await fetch_candles_with_retry(
+                    # Usar fetcher observable con retry para empty arrays
+                    result = await self._candle_fetcher_observable.fetch_with_observability(
                         self.client,
                         symbol,
                         ORDER_BLOCK_TF_SEC,
@@ -4368,6 +4482,7 @@ class ConsolidationBot:
                         timeout_sec=CANDLE_FETCH_TIMEOUT_SEC,
                         retries=1,
                     )
+                    return result.candles
             except (KeyboardInterrupt, asyncio.CancelledError):
                 raise asyncio.CancelledError()
             except Exception as exc:
@@ -4858,13 +4973,15 @@ class ConsolidationBot:
                 # STRAT-A requiere historial 5m mínimo para consolidación y MA.
                 # MIN_CANDLES_FOR_FULL_SCAN = MA_SLOW_PERIOD (50 velas = ~250 min).
                 # Con menos historia las MAs son parciales y la zona puede ser espuria.
-                if len(candles) < MIN_CANDLES_FOR_FULL_SCAN:
+                if not PIPELINE_VALIDATOR and len(candles) < MIN_CANDLES_FOR_FULL_SCAN:
                     log.debug(
                         "⏭ %s: historia insuficiente (%d velas < %d requeridas) — skip",
                         sym, len(candles), MIN_CANDLES_FOR_FULL_SCAN,
                     )
                     self.stats["skipped"] += 1
                     continue
+                elif PIPELINE_VALIDATOR and candles and len(candles) < MIN_CANDLES_FOR_FULL_SCAN:
+                    log.warning("[PV] %s: %d velas (< %d requeridas) — continuando en modo PV", sym, len(candles), MIN_CANDLES_FOR_FULL_SCAN)
 
                 dynamic_max_range = MAX_RANGE_PCT
                 atr_pct = 0.0
@@ -5288,11 +5405,13 @@ class ConsolidationBot:
                 if H1_CONFIRM_ENABLED:
                     h1_candles = await _fetch_h1_limited(sym)
                     h1_trend = infer_h1_trend(h1_candles)
-                    if (direction == "put" and h1_trend == "bullish") or (
+                    if not PIPELINE_VALIDATOR and ((direction == "put" and h1_trend == "bullish") or (
                         direction == "call" and h1_trend == "bearish"
-                    ):
+                    )):
                         self.stats["filtered_sensor"] += 1
                         continue
+                    elif PIPELINE_VALIDATOR and H1_CONFIRM_ENABLED:
+                        log.warning("[PV] %s: HTF filter bypass (h1_trend=%s dir=%s)", sym, h1_trend, direction)
                 else:
                     h1_candles = await _fetch_h1_limited(sym)
 
@@ -5472,6 +5591,59 @@ class ConsolidationBot:
         prev_threshold = self.current_score_threshold
         session_threshold = self._update_dynamic_threshold()
         window_accepts = sum(self.accepted_scans_window)
+
+        # ── PIPELINE VALIDATOR: inyectar candidato forzado si no hay ninguno ─
+        if PIPELINE_VALIDATOR and not candidates:
+            log.warning("[PV-FORCE] No surgieron candidatos naturales — inyectando candidato forzado")
+            for _pv_sym in PV_ASSETS:
+                _pv_candles = list(self._last_asset_candles.get(_pv_sym) or [])
+                if not _pv_candles:
+                    continue
+                _pv_last = _pv_candles[-1]
+                _pv_price = _pv_last.close
+                _pv_sample = [c.close for c in _pv_candles[-20:]] if len(_pv_candles) >= 20 else [c.close for c in _pv_candles]
+                _pv_ema = sum(_pv_sample) / len(_pv_sample) if _pv_sample else _pv_price
+                _pv_dir = "call" if _pv_price > _pv_ema else "put"
+                _pv_zone = ConsolidationZone(
+                    asset=_pv_sym,
+                    ceiling=_pv_price * 1.002,
+                    floor=_pv_price * 0.998,
+                    bars_inside=5,
+                    detected_at=time.time() - 1800.0,  # zona de 30 min → supera gate zone_age=20min
+                    range_pct=0.004,
+                )
+                _pv_candidate = CandidateEntry(
+                    asset=_pv_sym,
+                    payout=80,
+                    zone=_pv_zone,
+                    direction=_pv_dir,
+                    candles=_pv_candles,
+                    score=100.0,
+                    score_breakdown={"pv_forced": 100.0},
+                    reversal_pattern="hammer",
+                    reversal_strength=1.0,
+                    reversal_confirms=True,
+                )
+                setattr(_pv_candidate, "_stage", "initial")
+                setattr(_pv_candidate, "_pipeline_stage", "pv_forced")
+                setattr(_pv_candidate, "_reversal_pattern", "hammer")
+                setattr(_pv_candidate, "_reversal_confirms", True)
+                setattr(_pv_candidate, "_reversal_strength", 1.0)
+                setattr(_pv_candidate, "_amount", PV_AMOUNT)
+                setattr(_pv_candidate, "_signal_ts_1m", _pv_last.ts)
+                log.warning(
+                    "[PV-CANDIDATE] FORCED: %s %s price=%.5f ema20=%.5f score=100",
+                    _pv_dir.upper(), _pv_sym, _pv_price, _pv_ema,
+                )
+                candidates.append(_pv_candidate)
+                break
+            if not candidates:
+                log.warning("[PV-FORCE] Sin velas cacheadas para ningún activo PV — scan sin candidato")
+
+        # ── PIPELINE VALIDATOR: umbral forzado a 0 ────────────────────────────
+        if PIPELINE_VALIDATOR:
+            session_threshold = 0
+            log.warning("[PV] session_threshold forzado a 0")
         if prev_threshold != session_threshold:
             reason = self._threshold_change_reason(window_accepts)
             log.warning(
@@ -5494,6 +5666,8 @@ class ConsolidationBot:
             self._record_scan_acceptances(0)
             self._record_hub_scan_cycle(total_assets_available)
             return
+
+        self._shadow_candidate_seen = True
 
         log.info(
             "[SCORE] Umbral dinámico sesión=%d (ventana=%d scans, accepted=%d)",
@@ -5545,6 +5719,21 @@ class ConsolidationBot:
 
         # 4) Seleccionar mejores
         selected, rejected = select_best(candidates, threshold=session_threshold)
+        self.stats["audit_select_best"] += len(selected)
+        if candidates:
+            min_score = min(float(getattr(c, "score", 0.0) or 0.0) for c in candidates)
+            max_score = max(float(getattr(c, "score", 0.0) or 0.0) for c in candidates)
+            avg_score = sum(float(getattr(c, "score", 0.0) or 0.0) for c in candidates) / max(1, len(candidates))
+            log.warning(
+                "[AUDIT-SCORE-GATE] candidates=%d selected=%d rejected=%d threshold=%d score[min/avg/max]=%.1f/%.1f/%.1f",
+                len(candidates),
+                len(selected),
+                len(rejected),
+                int(session_threshold),
+                float(min_score),
+                float(avg_score),
+                float(max_score),
+            )
         for c in selected:
             setattr(c, "_pipeline_stage", "selected")
         for c in rejected:
@@ -5620,7 +5809,8 @@ class ConsolidationBot:
         moved_away: list[CandidateEntry] = []
         for c in selected:
             if (
-                bool(getattr(c, "_force_execute", False))
+                PIPELINE_VALIDATOR  # PV: siempre pasar
+                or bool(getattr(c, "_force_execute", False))
                 or bool(getattr(c, "_direct_pattern_trigger", False))
                 or self._is_candidate_near_trigger(c)
             ):
@@ -5629,15 +5819,29 @@ class ConsolidationBot:
                 moved_away.append(c)
 
         if moved_away:
-            for c in moved_away:
+            self.stats["audit_timing_window_rejected"] += len(moved_away)
+            log.warning(
+                "[AUDIT-TIMING-WINDOW] Rejected %d candidates (max_tolerance=%.4f%%):",
+                len(moved_away),
+                HUB_NEAR_ENTRY_TOLERANCE_PCT * 100,
+            )
+            for i, c in enumerate(moved_away[:5], 1):
                 distance = self._candidate_trigger_distance_pct(c)
-                dist_txt = f"{distance * 100:.3f}%" if distance is not None else "n/a"
+                dist_txt = f"{distance * 100:.4f}%" if distance is not None else "n/a"
                 setattr(c, "_pipeline_stage", "rejected_window")
-                log.info(
-                    "⏭ %s %s fuera de ventana de disparo (%s) — se pospone.",
+                log.warning(
+                    "  [%d] %s %s | distance=%s | max=%.4f%% | stage=%s",
+                    i,
                     c.direction.upper(),
                     c.asset,
                     dist_txt,
+                    HUB_NEAR_ENTRY_TOLERANCE_PCT * 100,
+                    getattr(c, "_stage", "unknown"),
+                )
+            if len(moved_away) > 5:
+                log.warning(
+                    "  ... and %d more candidates rejected by timing window",
+                    len(moved_away) - 5,
                 )
                 journal.log_candidate(
                     c,
@@ -5654,7 +5858,7 @@ class ConsolidationBot:
 
         # Registrar rechazados por score
         for c in rejected:
-            journal.log_candidate(
+            cid = journal.log_candidate(
                 c,
                 decision="REJECTED_SCORE",
                 reject_reason=f"score={c.score:.1f} < umbral dinámico {session_threshold}",
@@ -5662,6 +5866,26 @@ class ConsolidationBot:
                 stage=getattr(c, "_stage", "initial"),
                 strategy=self._strategy_snapshot(),
             )
+            if self.shadow_mode_enabled:
+                rej_context = {
+                    "stage": str(getattr(c, "_stage", "initial")),
+                    "amount": float(getattr(c, "_amount", 0.0) or 0.0),
+                    "payout": int(getattr(c, "payout", 0) or 0),
+                    "score_threshold": int(session_threshold),
+                    "phase2_profile": "strict",
+                    "candles_1m": list(candles_1m_collected.get(c.asset, []) or []),
+                    "candles_5m": list(getattr(c, "candles", []) or []),
+                    "strategy_origin": "STRAT-A",
+                }
+                self._run_shadow_observation(
+                    c,
+                    rej_context,
+                    old_decision="REJECTED_SCORE",
+                    old_reason=f"score={c.score:.1f} < umbral dinámico {session_threshold}",
+                    old_filter="score",
+                    candidate_id=int(cid) if int(cid or 0) > 0 else None,
+                    strategy_origin="STRAT-A",
+                )
             # Telemetría de antigüedad de zona
             age_penalty = abs(c.score_breakdown.get("age_penalty", 0.0))
             if age_penalty > 0 and c.zone.age_minutes > 120:
@@ -5754,6 +5978,8 @@ class ConsolidationBot:
                 "score_threshold": session_threshold,
                 "phase2_profile": "strict",
                 "candles_1m": list(candles_1m_collected.get(winner.asset, []) or []),
+                "candles_1m_source": "scan_buffer",
+                "candles_1m_retry_count": 1,
                 "candles_5m": list(winner.candles or []),
                 "strategy_origin": "STRAT-A",
             }
@@ -5761,6 +5987,7 @@ class ConsolidationBot:
             if not await self._pre_validate_entry(winner, phase2_context):
                 setattr(winner, "_pipeline_stage", "phase2_rejected")
                 continue
+            self.stats["audit_pre_validate_passed"] += 1
             # Si hay compensación pendiente por LOSS anterior, escalar el monto
             if self.compensation_pending and stage == "initial":
                 amount, exp_profit = self._compute_compensation_amount(winner.payout, self.last_closed_amount)
@@ -6063,8 +6290,25 @@ class ConsolidationBot:
         profit  = 0.0
         close_price: Optional[float] = None
         result_payload: Optional[dict[str, Any]] = None
+        if PIPELINE_VALIDATOR:
+            log.warning(
+                "[PV-WATCHER-OPEN] asset=%s order_id=%s order_ref=%s duration=%ss",
+                sym,
+                order_id,
+                trade.order_ref,
+                trade.duration_sec,
+            )
         if has_id or has_ref:
             for attempt in range(1, MARTIN_RESOLVE_MAX_ATTEMPTS + 1):
+                if PIPELINE_VALIDATOR:
+                    log.warning(
+                        "[PV-WATCHER-POLL] asset=%s attempt=%d/%d order_id=%s order_ref=%s",
+                        sym,
+                        attempt,
+                        MARTIN_RESOLVE_MAX_ATTEMPTS,
+                        order_id,
+                        trade.order_ref,
+                    )
                 try:
                     if has_ref:
                         win_val = await asyncio.wait_for(
@@ -6074,10 +6318,14 @@ class ConsolidationBot:
                         if isinstance(win_val, bool):
                             outcome = "WIN" if win_val else "LOSS"
                             profit = trade.amount * 0.8 if win_val else -abs(trade.amount)
+                            if PIPELINE_VALIDATOR:
+                                log.warning("[PV-WATCHER-RESULT] asset=%s via=check_win(bool) value=%s", sym, win_val)
                             break
                         if isinstance(win_val, (int, float)):
                             profit = float(win_val)
                             outcome = "WIN" if profit > 0 else "LOSS"
+                            if PIPELINE_VALIDATOR:
+                                log.warning("[PV-WATCHER-RESULT] asset=%s via=check_win(number) value=%.4f", sym, profit)
                             break
                     elif has_id:
                         status, payload = await asyncio.wait_for(
@@ -6090,6 +6338,8 @@ class ConsolidationBot:
                             outcome = "WIN"
                             if isinstance(payload, dict):
                                 profit = float(payload.get("profitAmount", 0) or 0)
+                            if PIPELINE_VALIDATOR:
+                                log.warning("[PV-WATCHER-RESULT] asset=%s via=get_result status=%s", sym, status)
                             break
                         if status == "loss":
                             outcome = "LOSS"
@@ -6097,6 +6347,8 @@ class ConsolidationBot:
                                 profit = float(payload.get("profitAmount", 0) or 0)
                             if profit == 0:
                                 profit = -abs(trade.amount)
+                            if PIPELINE_VALIDATOR:
+                                log.warning("[PV-WATCHER-RESULT] asset=%s via=get_result status=%s", sym, status)
                             break
                 except asyncio.TimeoutError:
                     log.debug("%s: check_win timeout intento %d/%d", sym, attempt, MARTIN_RESOLVE_MAX_ATTEMPTS)
@@ -6187,6 +6439,13 @@ class ConsolidationBot:
         await self.refresh_balance_and_risk()
         balance_now = self.current_balance if self.current_balance is not None else 0.0
         log.info("🏁 %s %s $%.2f | saldo: $%.2f", sym, outcome, profit, balance_now)
+        if PIPELINE_VALIDATOR:
+            log.warning("[PV-WATCHER-CLOSED] asset=%s outcome=%s profit=%.2f", sym, outcome, profit)
+        if PIPELINE_VALIDATOR:
+            log.warning(
+                "[PV-RESULT-%s] %s profit=%.2f saldo=%.2f | [PV-PIPELINE-COMPLETE] ciclo end-to-end OK ✓",
+                outcome, sym, profit, balance_now,
+            )
         self._update_cycle_after_result(outcome=outcome, profit=profit)
 
         # ── Procesar con Masaniello Engine ──
@@ -6702,10 +6961,33 @@ class ConsolidationBot:
         candles_1m = list(ctx.get("candles_1m") or [])
         candles_15m = list(ctx.get("candles_15m") or [])
         had_15m_in_context = bool(candles_15m)
+        htf_source = "context" if had_15m_in_context else "none"
+        htf_cache_age_sec = float("inf")
+        htf_cache_ttl_sec = 0.0
+        htf_scanner_ready = False
+        htf_library_size = 0
         if not candles_15m:
             htf_scanner = getattr(self, "htf_scanner", None)
             if htf_scanner is not None:
                 candles_15m = list(htf_scanner.get_candles_15m(candidate.asset) or [])
+                htf_source = "scanner_cache" if candles_15m else "scanner_cache_empty"
+                try:
+                    htf_cache_age_sec = float(htf_scanner.cache_age_sec(candidate.asset))
+                except Exception:
+                    htf_cache_age_sec = float("inf")
+                try:
+                    htf_cache_ttl_sec = float(htf_scanner.cache_ttl_sec())
+                except Exception:
+                    htf_cache_ttl_sec = 0.0
+                try:
+                    htf_library_size = int(htf_scanner.library_size())
+                except Exception:
+                    htf_library_size = 0
+                try:
+                    eligible_assets = list(htf_scanner.get_eligible_assets(max_age_sec=240.0) or [])
+                    htf_scanner_ready = any(str(sym) == str(candidate.asset) for sym, _payout in eligible_assets)
+                except Exception:
+                    htf_scanner_ready = False
 
         snapshot_ts = str(
             ctx.get("context_snapshot_ts")
@@ -6732,6 +7014,12 @@ class ConsolidationBot:
         ctx["candles_1m"] = candles_1m
         ctx["candles_5m"] = candles_5m
         ctx["candles_15m"] = candles_15m
+        ctx["candles_15m_source"] = str(ctx.get("candles_15m_source") or htf_source)
+        ctx["candles_15m_cache_age_sec"] = float(ctx.get("candles_15m_cache_age_sec") or htf_cache_age_sec)
+        ctx["candles_15m_cache_ttl_sec"] = float(ctx.get("candles_15m_cache_ttl_sec") or htf_cache_ttl_sec)
+        ctx["candles_15m_required"] = int(ctx.get("candles_15m_required") or 10)
+        ctx["htf_scanner_ready"] = bool(ctx.get("htf_scanner_ready") if "htf_scanner_ready" in ctx else htf_scanner_ready)
+        ctx["htf_library_size"] = int(ctx.get("htf_library_size") or htf_library_size)
         ctx["context_snapshot_ts"] = snapshot_ts
         ctx["context_hash"] = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
         if metrics_enabled:
@@ -6958,7 +7246,7 @@ class ConsolidationBot:
         stage = str(context.get("stage", getattr(candidate, "_stage", "initial")))
         amount = float(context.get("amount", getattr(candidate, "_amount", 0.0)) or 0.0)
         strategy_payload = dict(context.get("strategy") or {})
-        strategy_payload["phase2_gate"] = {
+        phase2_gate_payload = {
             "filter_name": filter_name,
             "reason": reason,
             "stage": stage,
@@ -6968,10 +7256,21 @@ class ConsolidationBot:
             "direction": str(getattr(candidate, "direction", "")).lower(),
             "asset": str(getattr(candidate, "asset", "")),
         }
+        strategy_payload["phase2_gate"] = phase2_gate_payload
 
         cid = 0
         try:
             journal = get_journal()
+            self._emit_phase2_persist_log(
+                candidate=candidate,
+                filter_name=filter_name,
+                decision=decision,
+                reason=reason,
+                stage=stage,
+                phase2_gate_payload=phase2_gate_payload,
+                candidate_id=0,
+                status="pre_db",
+            )
             cid = int(journal.log_candidate(
                 candidate,
                 decision=decision,
@@ -6982,6 +7281,16 @@ class ConsolidationBot:
                 strategy=strategy_payload,
             ) or 0)
             setattr(candidate, "_journal_cid", cid)
+            self._emit_phase2_persist_log(
+                candidate=candidate,
+                filter_name=filter_name,
+                decision=decision,
+                reason=reason,
+                stage=stage,
+                phase2_gate_payload=phase2_gate_payload,
+                candidate_id=cid,
+                status="post_db",
+            )
             self._run_shadow_observation(
                 candidate,
                 context,
@@ -6997,6 +7306,100 @@ class ConsolidationBot:
         self.stats[self._phase2_reject_stat_key(filter_name)] = self.stats.get(self._phase2_reject_stat_key(filter_name), 0) + 1
         self.stats["skipped"] += 1
         return cid
+
+    def _flush_phase2_handlers(self) -> None:
+        seen: set[int] = set()
+        for logger_obj in (log, logging.getLogger()):
+            for handler in list(getattr(logger_obj, "handlers", []) or []):
+                hid = id(handler)
+                if hid in seen:
+                    continue
+                seen.add(hid)
+                try:
+                    handler.flush()
+                except Exception:
+                    pass
+
+    def _emit_phase2_persist_log(
+        self,
+        *,
+        candidate: CandidateEntry,
+        filter_name: str,
+        decision: str,
+        reason: str,
+        stage: str,
+        phase2_gate_payload: dict[str, Any],
+        candidate_id: int,
+        status: str,
+    ) -> None:
+        marker = "[PHASE2-HTF]" if str(filter_name) == "htf_alignment" else "[PHASE2-GATE]"
+        payload_json = json.dumps(phase2_gate_payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+        try:
+            log.warning(
+                "%s phase2_persist=%s candidate_id=%d asset=%s gate=%s decision=%s reason=%s payload=%s",
+                marker,
+                status,
+                int(candidate_id),
+                str(getattr(candidate, "asset", "")),
+                str(filter_name),
+                str(decision),
+                str(reason),
+                payload_json,
+            )
+            self._flush_phase2_handlers()
+        except Exception as exc:
+            try:
+                sys.stderr.write(
+                    f"{marker} phase2_persist_fallback={status} candidate_id={int(candidate_id)} "
+                    f"asset={str(getattr(candidate, 'asset', ''))} gate={str(filter_name)} "
+                    f"decision={str(decision)} reason={str(reason)} error={exc} payload={payload_json}\n"
+                )
+                sys.stderr.flush()
+            except Exception:
+                pass
+
+    def _log_phase2_gate(self, candidate: CandidateEntry, *, gate_name: str, reason: str, context: dict[str, Any]) -> None:
+        candles_1m = list(context.get("candles_1m") or [])
+        candles_5m = list(context.get("candles_5m") or getattr(candidate, "candles", []) or [])
+        candles_15m = list(context.get("candles_15m") or [])
+        stage = str(context.get("stage", getattr(candidate, "_stage", "initial")))
+        force_execute = bool(getattr(candidate, "_force_execute", False))
+        fetch_latency_ms = context.get("candles_1m_fetch_latency_ms")
+        retry_count = int(context.get("candles_1m_retry_count", 0) or 0)
+        source = str(context.get("candles_1m_source", "unknown"))
+        latency_txt = "n/a" if fetch_latency_ms is None else f"{float(fetch_latency_ms):.1f}"
+        c15_source = str(context.get("candles_15m_source", "unknown"))
+        c15_required = int(context.get("candles_15m_required", 10) or 10)
+        c15_age = context.get("candles_15m_cache_age_sec")
+        c15_ttl = context.get("candles_15m_cache_ttl_sec")
+        c15_age_txt = "n/a" if c15_age is None else f"{float(c15_age):.1f}"
+        c15_ttl_txt = "n/a" if c15_ttl is None else f"{float(c15_ttl):.1f}"
+        htf_trend = str(context.get("htf_trend", "n/a"))
+        htf_alignment = str(context.get("htf_alignment", "n/a"))
+        htf_scanner_ready = bool(context.get("htf_scanner_ready", False))
+        marker = "[PHASE2-HTF]" if str(gate_name) == "htf_alignment" else "[PHASE2-GATE]"
+        log.warning(
+            "%s asset=%s gate=%s reason=%s candles1m=%d candles5m=%d candles15m=%d/%d c15_age_s=%s c15_ttl_s=%s c15_source=%s htf_trend=%s htf_alignment=%s scanner_ready=%s force_execute=%s stage=%s latency_ms=%s retries=%d source=%s",
+            marker,
+            candidate.asset,
+            gate_name,
+            reason,
+            len(candles_1m),
+            len(candles_5m),
+            len(candles_15m),
+            c15_required,
+            c15_age_txt,
+            c15_ttl_txt,
+            c15_source,
+            htf_trend,
+            htf_alignment,
+            "ON" if htf_scanner_ready else "OFF",
+            "ON" if force_execute else "OFF",
+            stage,
+            latency_txt,
+            retry_count,
+            source,
+        )
 
     def _shadow_failfast_watchdog(self, elapsed_min: float) -> None:
         if not self.shadow_mode_enabled:
@@ -7022,6 +7425,19 @@ class ConsolidationBot:
                 row2 = journal._conn.execute("SELECT COUNT(*) FROM shadow_decision_audit").fetchone()
                 shadow_rows = int(row2[0] if row2 else 0)
 
+            # Evita falso positivo cuando el mercado no produce candidatos aún.
+            if not self._shadow_candidate_seen:
+                if not self._shadow_idle_alerted and self.shadow_audit_mode:
+                    self._shadow_idle_alerted = True
+                    log.warning(
+                        "[SHADOW-IDLE] sid=%s elapsed_min=%.1f table_exists=%d shadow_rows=%d reason=no_candidates_seen_yet",
+                        self.shadow_session_id,
+                        elapsed_min,
+                        table_exists,
+                        shadow_rows,
+                    )
+                return
+
             if table_exists == 0 or shadow_rows <= 0:
                 self._shadow_dead_alerted = True
                 log.critical(
@@ -7041,9 +7457,29 @@ class ConsolidationBot:
             log.error("[SHADOW-WATCHDOG-ERROR] sid=%s error=%s", self.shadow_session_id, exc)
 
     async def _pre_validate_entry(self, candidate: CandidateEntry, context: dict[str, Any]) -> bool:
+        # ── PIPELINE VALIDATOR: bypass total de gates de calidad ─────────────
+        if PIPELINE_VALIDATOR:
+            log.warning(
+                "[PV-PRE-VALIDATE] BYPASS gates para %s %s score=%.1f — solo verifica trades activos",
+                candidate.direction.upper(), candidate.asset,
+                float(getattr(candidate, "score", 0.0) or 0.0),
+            )
+            # Solo bloquear si ya hay trade activo (evitar órdenes duplicadas)
+            if len(self.trades) > 0 or self._gale_order_active:
+                reason = "gale activo" if self._gale_order_active else f"trades abiertos={len(self.trades)}/{MAX_CONCURRENT_TRADES}"
+                self._journal_phase2_rejection(candidate, filter_name="active_operation", reason=reason, context=context)
+                return False
+            return True
         stage = str(context.get("stage", getattr(candidate, "_stage", "initial")))
         phase2_profile = str(context.get("phase2_profile", "strict" if stage != "martin" else "recovery"))
         enforce_quality = phase2_profile != "recovery"
+        force_execute = bool(getattr(candidate, "_force_execute", False))
+        spike_1m_audit_bypass = bool(
+            self.shadow_audit_mode
+            and force_execute
+            and stage.startswith("breakout")
+            and str(os.environ.get("SHADOW_AUDIT_BYPASS_SPIKE_1M_ON_FORCE_EXECUTE", "true")).strip().lower() in {"1", "true", "yes", "on"}
+        )
 
         if not getattr(candidate, "candles", None):
             extra_candles = list(context.get("candles_5m") or self._last_asset_candles.get(candidate.asset) or [])
@@ -7090,6 +7526,12 @@ class ConsolidationBot:
         if enforce_quality:
             score_threshold = max(int(self.current_score_threshold), int(ADAPTIVE_THRESHOLD_BASE), int(context.get("score_threshold", 0) or 0))
             if float(getattr(candidate, "score", 0.0) or 0.0) < float(score_threshold):
+                self._log_phase2_gate(
+                    candidate,
+                    gate_name="score",
+                    reason=f"score={getattr(candidate, 'score', 0.0):.1f} < umbral {score_threshold}",
+                    context=context,
+                )
                 self._journal_phase2_rejection(
                     candidate,
                     filter_name="score",
@@ -7099,36 +7541,66 @@ class ConsolidationBot:
                 return False
 
             if not candles_1m:
-                self._journal_phase2_rejection(
-                    candidate,
-                    filter_name="spike_1m",
-                    reason="velas 1m no disponibles para validar spike",
-                    context=context,
-                )
-                return False
+                if spike_1m_audit_bypass:
+                    self.stats["audit_phase2_spike_1m_bypass"] = self.stats.get("audit_phase2_spike_1m_bypass", 0) + 1
+                    log.warning(
+                        "[AUDIT-BYPASS] asset=%s gate=spike_1m reason=no_1m_candles force_execute=ON stage=%s profile=%s",
+                        candidate.asset,
+                        stage,
+                        phase2_profile,
+                    )
+                else:
+                    self._log_phase2_gate(
+                        candidate,
+                        gate_name="spike_1m",
+                        reason="velas 1m no disponibles para validar spike",
+                        context=context,
+                    )
+                    self._journal_phase2_rejection(
+                        candidate,
+                        filter_name="spike_1m",
+                        reason="velas 1m no disponibles para validar spike",
+                        context=context,
+                    )
+                    return False
 
-            spike_1m = detect_spike_anomaly(candles_1m or candidate.candles)
-            if spike_1m.is_anomalous and spike_1m.event is not None:
-                self._journal_phase2_rejection(
-                    candidate,
-                    filter_name="spike_1m",
-                    reason=(
+            if candles_1m:
+                spike_1m = detect_spike_anomaly(candles_1m or candidate.candles)
+                if spike_1m.is_anomalous and spike_1m.event is not None:
+                    spike_reason = (
                         f"gap={spike_1m.event.gap_pct*100:.2f}% body_mult={spike_1m.event.body_mult:.2f} "
                         f"ts={spike_1m.event.ts}"
-                    ),
-                    context=context,
-                )
-                return False
+                    )
+                    self._log_phase2_gate(
+                        candidate,
+                        gate_name="spike_1m",
+                        reason=spike_reason,
+                        context=context,
+                    )
+                    self._journal_phase2_rejection(
+                        candidate,
+                        filter_name="spike_1m",
+                        reason=spike_reason,
+                        context=context,
+                    )
+                    return False
 
             spike_5m = detect_spike_anomaly(candles_5m)
             if spike_5m.is_anomalous and spike_5m.event is not None:
+                spike_reason = (
+                    f"gap={spike_5m.event.gap_pct*100:.2f}% body_mult={spike_5m.event.body_mult:.2f} "
+                    f"ts={spike_5m.event.ts}"
+                )
+                self._log_phase2_gate(
+                    candidate,
+                    gate_name="spike_5m",
+                    reason=spike_reason,
+                    context=context,
+                )
                 self._journal_phase2_rejection(
                     candidate,
                     filter_name="spike_5m",
-                    reason=(
-                        f"gap={spike_5m.event.gap_pct*100:.2f}% body_mult={spike_5m.event.body_mult:.2f} "
-                        f"ts={spike_5m.event.ts}"
-                    ),
+                    reason=spike_reason,
                     context=context,
                 )
                 return False
@@ -7137,7 +7609,17 @@ class ConsolidationBot:
             candles_15m: Sequence[Candle] = list(context.get("candles_15m") or [])
             if not candles_15m and htf_scanner is not None:
                 candles_15m = htf_scanner.get_candles_15m(candidate.asset) or ()
+            context["candles_15m"] = list(candles_15m)
+            context["candles_15m_required"] = int(context.get("candles_15m_required") or 10)
             if len(candles_15m) < 10:
+                context["htf_trend"] = "n/a"
+                context["htf_alignment"] = "insufficient_data"
+                self._log_phase2_gate(
+                    candidate,
+                    gate_name="htf_alignment",
+                    reason="HTF 15m no disponible o insuficiente",
+                    context=context,
+                )
                 self._journal_phase2_rejection(
                     candidate,
                     filter_name="htf_alignment",
@@ -7147,8 +7629,16 @@ class ConsolidationBot:
                 return False
 
             htf_trend = infer_h1_trend(list(candles_15m))
+            context["htf_trend"] = str(htf_trend)
             direction = str(candidate.direction).lower()
             if (direction == "call" and htf_trend == "bearish") or (direction == "put" and htf_trend == "bullish") or htf_trend == "flat":
+                context["htf_alignment"] = "contra"
+                self._log_phase2_gate(
+                    candidate,
+                    gate_name="htf_alignment",
+                    reason=f"HTF {htf_trend} contra {direction.upper()}",
+                    context=context,
+                )
                 self._journal_phase2_rejection(
                     candidate,
                     filter_name="htf_alignment",
@@ -7156,10 +7646,17 @@ class ConsolidationBot:
                     context=context,
                 )
                 return False
+            context["htf_alignment"] = "ok"
 
             pattern_name = str(getattr(candidate, "_reversal_pattern", getattr(candidate, "reversal_pattern", "none")) or "none")
             pattern_confirms = bool(getattr(candidate, "_reversal_confirms", getattr(candidate, "reversal_confirms", False)))
             if pattern_name == "none" or not pattern_confirms:
+                self._log_phase2_gate(
+                    candidate,
+                    gate_name="candle_pattern",
+                    reason=f"patrón no confirmado ({pattern_name}, confirms={pattern_confirms})",
+                    context=context,
+                )
                 self._journal_phase2_rejection(
                     candidate,
                     filter_name="candle_pattern",
@@ -7170,6 +7667,12 @@ class ConsolidationBot:
 
             pattern_strength = float(getattr(candidate, "_reversal_strength", getattr(candidate, "reversal_strength", 0.0)) or 0.0)
             if pattern_strength < 0.55:
+                self._log_phase2_gate(
+                    candidate,
+                    gate_name="candle_pattern",
+                    reason=f"fortaleza de patrón={pattern_strength:.2f} < mínimo 0.55",
+                    context=context,
+                )
                 self._journal_phase2_rejection(
                     candidate,
                     filter_name="candle_pattern",
@@ -7276,6 +7779,8 @@ class ConsolidationBot:
                 "score_threshold": self.current_score_threshold,
                 "phase2_profile": "recovery" if stage == "martin" else "strict",
                 "candles_1m": list(candles_1m or []),
+                "candles_1m_source": "enter_arg",
+                "candles_1m_retry_count": 0,
                 "candles_5m": list(candles_5m or phase2_candidate.candles or []),
                 "strategy_origin": strategy_origin,
             }
@@ -7320,7 +7825,7 @@ class ConsolidationBot:
                 )
 
                 can_enter_asset, same_asset_reason = self._can_enter_asset_now(sym, stage)
-                if not can_enter_asset:
+                if not can_enter_asset and not PIPELINE_VALIDATOR:
                     self.stats["rejected_same_asset_limit"] += 1
                     if "cooldown mismo activo" in same_asset_reason:
                         self.stats["rejected_same_asset_cooldown"] += 1
@@ -7350,7 +7855,7 @@ class ConsolidationBot:
                     return False
 
                 can_enter_structure, structure_reason = self._can_enter_structure_now(sym, zone)
-                if not can_enter_structure:
+                if not can_enter_structure and not PIPELINE_VALIDATOR:
                     self.stats["rejected_same_structure"] += 1
                     log.info("⏭ %s: entrada bloqueada — %s", sym, structure_reason)
                     if journal_cid:
@@ -7395,7 +7900,7 @@ class ConsolidationBot:
                         )
 
                 if stage in ("initial", "martin", "pattern_immediate"):
-                    if not timing.ok:
+                    if not timing.ok and not PIPELINE_VALIDATOR:
                         if journal_cid:
                             reject_reason = f"timing 1m inválido: lag +{timing.lag_sec:.2f}s"
                             _j = get_journal()
@@ -7426,7 +7931,7 @@ class ConsolidationBot:
                         duration_sec = timing.duration_sec
 
                 payout_now = await self._get_asset_payout(sym, payout)
-                if payout_now < MIN_PAYOUT:
+                if not PIPELINE_VALIDATOR and payout_now < MIN_PAYOUT:
                     reject_reason = (
                         f"payout actual insuficiente: {payout_now}% < mínimo {MIN_PAYOUT}%"
                     )
@@ -7460,6 +7965,11 @@ class ConsolidationBot:
                 icon = "🟢" if direction == "call" else "🔴"
                 log.info("[%s] %s ENTRADA[%s] %s  %s  $%.2f  %ds  | %s",
                          strategy_origin, icon, stage, direction.upper(), sym, amount, duration_sec, reason)
+                if PIPELINE_VALIDATOR:
+                    log.warning(
+                        "[PV-ORDER-SENT] %s %s amount=$%.2f duration=%ds — enviando al broker",
+                        direction.upper(), sym, amount, duration_sec,
+                    )
 
                 ok, oid, open_price, order_ref, reject_reason, ticket_opened_at_ts, ticket_opened_at_source, ticket_close_ts = await place_order(
                     self.client,
@@ -7498,6 +8008,11 @@ class ConsolidationBot:
                     return False
 
                 self._register_successful_entry_asset(sym, zone)
+                if PIPELINE_VALIDATOR:
+                    log.warning(
+                        "[PV-ORDER-OPEN] %s %s order_id=%s open_price=%.5f — orden abierta, esperando resultado",
+                        direction.upper(), sym, oid or f"REF-{order_ref}", open_price,
+                    )
 
                 black_box_order_key = oid if oid else f"REF-{order_ref}" if order_ref else "BROKER_NO_ID"
                 self.trades[sym] = TradeState(
@@ -7641,6 +8156,27 @@ class ConsolidationBot:
             pass
         return True
 
+    def _log_candle_fetch_stats(self) -> None:
+        """Loguea resumido de estadísticas de fetch observable sin alterar pipeline."""
+        if not self._candle_fetcher_observable:
+            return
+        
+        summary = self._candle_fetcher_observable.summary_stats()
+        if summary.get("total_attempts", 0) == 0:
+            return
+        
+        # Log compacto
+        log.info(
+            "📊 CANDLE-FETCH | assets:%d  attempts:%d  success:%.1f%%  "
+            "retry_recoveries:%d (%.1f%%)  avg_ms:%.1f",
+            summary.get("total_assets", 0),
+            summary.get("total_attempts", 0),
+            summary.get("success_rate_pct", 0.0),
+            summary.get("retry_recoveries", 0),
+            summary.get("recovery_rate_pct", 0.0),
+            summary.get("avg_duration_per_fetch_ms", 0.0),
+        )
+
     def log_stats(self) -> None:
         risk_txt = ""
         if self.session_start_balance and self.current_balance:
@@ -7667,6 +8203,10 @@ class ConsolidationBot:
             self.stats.get("martin_wins", 0),
             self.stats.get("martin_losses", 0),
         )
+        
+        # Log de métricas de candle fetch observable
+        self._log_candle_fetch_stats()
+        
         rej_age   = self.stats.get("score_rejected_age", 0)
         rej_score = self.stats.get("score_rejected_score", 0)
         rej_young = self.stats.get("rejected_young_zone", 0)
@@ -7693,6 +8233,9 @@ class ConsolidationBot:
         phase2_counts = [f"{label}:{self.stats.get(f'phase2_rejected_{key}', 0)}" for key, label in phase2_keys]
         if any(count != f"{label}:0" for (key, label), count in zip(phase2_keys, phase2_counts)):
             log.info("📊 FASE2 | %s", "  ".join(phase2_counts))
+        audit_spike_1m_bypass = int(self.stats.get("audit_phase2_spike_1m_bypass", 0))
+        if audit_spike_1m_bypass > 0:
+            log.info("📊 AUDIT-PHASE2 | spike1m_bypass=%d", audit_spike_1m_bypass)
         if self.shadow_mode_enabled and self.shadow_runtime_metrics_enabled:
             m = self._shadow_metrics
             elapsed_min = max((time.perf_counter() - self._shadow_metrics_started_at) / 60.0, 1e-6)
@@ -7737,6 +8280,19 @@ class ConsolidationBot:
                 int(m["link_updates"]),
                 int(m["resolved_updates"]),
                 int(m["candidate_id_missing"]),
+            )
+        # ── AUDITORÍA PIPELINE: diagnóstico de cuello de botella ──
+        audit_select_best = int(self.stats.get("audit_select_best", 0))
+        audit_timing_window = int(self.stats.get("audit_timing_window_rejected", 0))
+        audit_pre_validate = int(self.stats.get("audit_pre_validate_passed", 0))
+        if audit_select_best > 0 or audit_timing_window > 0 or audit_pre_validate > 0:
+            timing_pct = round((100.0 * audit_timing_window / max(1, audit_select_best + audit_timing_window)), 1)
+            log.info(
+                "[AUDIT-PIPELINE] select_best=%d timing_window_rejected=%d(%.1f%%) pre_validate_passed=%d",
+                audit_select_best,
+                audit_timing_window,
+                timing_pct,
+                audit_pre_validate,
             )
 
 
